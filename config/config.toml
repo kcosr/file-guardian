@@ -1,0 +1,74 @@
+schema_version = "1"
+
+[scan]
+# Glob patterns for directories to scan
+directories = ["/home/*"]
+
+# Scan interval in seconds (default: 1 hour)
+interval_secs = 3600
+
+# Maximum file size to scan (10 MiB default, skips larger files)
+max_file_size = 10485760
+
+# Write summary files after each scan
+write_summaries = true
+
+# Directory to store scan summaries
+summary_dir = "/var/log/file-guardian/summaries"
+
+# Patterns to exclude from scanning
+exclude_patterns = [
+    "*.git*",
+    "node_modules",
+    ".cache",
+]
+
+[policy]
+# Default action when a rule doesn't specify one: warn, remove, replace, recover
+default_action = "warn"
+
+# Directory for recovered files (used with 'recover' action)
+recovery_dir = "/var/lib/file-guardian/recovered"
+
+# Message to write when using 'replace' action
+replace_message = """
+This file has been removed by file-guardian due to policy violation.
+Contact your system administrator for more information.
+"""
+
+[rules]
+# Directory containing .rules files (one rule per line)
+rules_d = "/etc/file-guardian/rules.d"
+
+# Inline rules defined in this config file
+[[rules.inline]]
+name = "no-exe"
+filename_glob = "*.exe"
+action = "warn"
+
+[[rules.inline]]
+name = "no-dll"
+filename_glob = "*.dll"
+action = "warn"
+
+[[rules.inline]]
+name = "hardcoded-passwords"
+content_regex = "(?i)password\\s*=\\s*[\"'][^\"']+[\"']"
+action = "warn"
+
+[[rules.inline]]
+name = "aws-keys"
+content_regex = "AKIA[0-9A-Z]{16}"
+action = "warn"
+
+[[rules.inline]]
+name = "private-keys"
+content_regex = "-----BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----"
+action = "warn"
+
+[logging]
+level = "info"
+directory = "/var/log/file-guardian"
+max_bytes = 104857600
+max_files = 5
+console = false

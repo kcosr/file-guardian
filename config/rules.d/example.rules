@@ -1,0 +1,21 @@
+# Example rules file for file-guardian
+# Format: name:type:pattern[:action]
+#   type: glob (for filename matching) or regex (for content matching)
+#   action: warn, remove, replace, recover (optional, uses default if omitted)
+
+# Block Windows executables
+no-exe:glob:*.exe:remove
+no-dll:glob:*.dll:remove
+no-msi:glob:*.msi:remove
+no-bat:glob:*.bat:warn
+no-cmd:glob:*.cmd:warn
+
+# Block potentially dangerous scripts
+no-ps1:glob:*.ps1:warn
+no-vbs:glob:*.vbs:remove
+
+# Detect secrets in files
+passwords:regex:(?i)password\s*[:=]\s*["'][^"']{4,}["']:warn
+api-keys:regex:(?i)(api[_-]?key|apikey)\s*[:=]\s*["'][^"']{8,}["']:warn
+aws-access-key:regex:AKIA[0-9A-Z]{16}:recover
+private-ssh-key:regex:-----BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----:recover

@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
+.release-notes-tmp.md
+.idea/
+.vscode/
