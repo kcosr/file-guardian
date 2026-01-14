@@ -2,6 +2,8 @@
 
 A Rust service that scans directories for disallowed files based on configurable rules. Designed to run as root to monitor and enforce file policies across user directories.
 
+> **⚠️ Important:** This tool provides best-effort detection of unapproved files in agent working directories, primarily to help prevent proprietary or sensitive data from being exfiltrated to model providers. Because it relies on periodic scanning rather than intercepting file operations, files may be read by an agent between scans. For comprehensive protection, use solutions that hook agent file access at the system or application level.
+
 ## Features
 
 - **Periodic scanning** of directories matching glob patterns (e.g., `/home/*`)

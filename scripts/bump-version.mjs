@@ -2,7 +2,7 @@
 /**
  * bump-version.mjs
  *
- * Updates the VERSION file with a new semantic version.
+ * Updates the version in Cargo.toml with a new semantic version.
  *
  * Usage:
  *   node scripts/bump-version.mjs patch     # 1.0.0 -> 1.0.1
@@ -18,16 +18,17 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
-const versionFilePath = join(ROOT, "VERSION");
 const cargoTomlPath = join(ROOT, "Cargo.toml");
 const cargoLockPath = join(ROOT, "Cargo.lock");
 
 function readVersion() {
-	try {
-		return readFileSync(versionFilePath, "utf8").trim();
-	} catch {
-		return "0.0.0";
+	const content = readFileSync(cargoTomlPath, "utf8");
+	const match = content.match(/\[package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/);
+	if (!match) {
+		console.error("Could not find version in Cargo.toml [package] section");
+		process.exit(1);
 	}
+	return match[1];
 }
 
 function parseVersion(version) {
@@ -88,7 +89,7 @@ if (!arg) {
 
 const parts = parseVersion(currentVersion);
 if (!parts) {
-	console.error(`Current VERSION "${currentVersion}" is not valid semver (X.Y.Z)`);
+	console.error(`Current version "${currentVersion}" is not valid semver (X.Y.Z)`);
 	process.exit(1);
 }
 
@@ -123,7 +124,6 @@ switch (arg.toLowerCase()) {
 		newVersion = arg;
 }
 
-writeFileSync(versionFilePath, `${newVersion}\n`, "utf8");
 updateCargoTomlVersion(newVersion);
 updateCargoLockVersion(newVersion);
 console.log(`Version updated: ${currentVersion} -> ${newVersion}`);
