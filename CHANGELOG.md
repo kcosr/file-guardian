@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.1] - 2026-01-14
 
 ### Added
 - Rule-based file scanning with per-rule actions (log/remove/recover/replace).
