@@ -2,11 +2,11 @@
 
 ## [Unreleased]
 
-### Added
-- Configurable scan summary layout (`scan.summary_layout`) with flat/daily/hourly buckets.
+### Breaking Changes
+- Summary outputs now write `<run_id>.json` under the selected layout and default to `flat` (no per-run `summary.json` directory). ([#2](https://github.com/kcosr/file-guardian/pull/2))
 
-### Changed
-- Summary files now use the run timestamp as the filename and default to flat layout.
+### Added
+- Configurable scan summary layout (`scan.summary_layout`) with flat/daily/hourly buckets. ([#2](https://github.com/kcosr/file-guardian/pull/2))
 
 ## [0.0.1] - 2026-01-14
 
