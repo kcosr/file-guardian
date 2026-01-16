@@ -148,6 +148,15 @@ fn default_schema_version() -> String {
     DEFAULT_SCHEMA_VERSION.to_string()
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SummaryLayout {
+    #[default]
+    Flat,
+    Daily,
+    Hourly,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanConfig {
     #[serde(default = "default_directories")]
@@ -161,6 +170,9 @@ pub struct ScanConfig {
 
     #[serde(default = "default_summary_dir", alias = "results_dir")]
     pub summary_dir: PathBuf,
+
+    #[serde(default = "default_summary_layout")]
+    pub summary_layout: SummaryLayout,
 
     #[serde(default = "default_write_summaries")]
     pub write_summaries: bool,
@@ -176,6 +188,7 @@ impl Default for ScanConfig {
             interval_secs: default_interval_secs(),
             max_file_size: default_max_file_size(),
             summary_dir: default_summary_dir(),
+            summary_layout: default_summary_layout(),
             write_summaries: default_write_summaries(),
             exclude_patterns: Vec::new(),
         }
@@ -196,6 +209,10 @@ fn default_max_file_size() -> u64 {
 
 fn default_summary_dir() -> PathBuf {
     PathBuf::from("/var/log/file-guardian/summaries")
+}
+
+fn default_summary_layout() -> SummaryLayout {
+    SummaryLayout::Flat
 }
 
 fn default_write_summaries() -> bool {

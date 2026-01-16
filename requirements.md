@@ -118,6 +118,9 @@ write_summaries = true
 # Directory to store scan summaries
 summary_dir = "/var/log/file-guardian/summaries"
 
+# Layout for summary files: flat, daily, hourly
+summary_layout = "flat"
+
 # Patterns to exclude from scanning (glob syntax)
 exclude_patterns = [
     "*.git*",
@@ -275,13 +278,15 @@ Fields logged:
 ## Scan Summaries
 
 When `scan.write_summaries = true`, each scan writes a summary file to
-`scan.summary_dir` using a timestamped
-subdirectory:
+`scan.summary_dir`. The filename uses the run timestamp (for example,
+`2026-01-14T10-36-40.json`), and the parent directory is controlled by
+`scan.summary_layout` (`flat`, `daily`, or `hourly`). For example, `daily`
+layout produces:
 
 ```
 /var/log/file-guardian/summaries/
-└── 2026-01-14T10-36-40/
-    └── summary.json
+└── 2026-01-14/
+    └── 2026-01-14T10-36-40.json
 ```
 
 The summary contains counts, timestamps, and a list of violations (with action errors, if any).

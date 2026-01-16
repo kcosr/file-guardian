@@ -16,6 +16,9 @@ write_summaries = true
 # Directory to store scan summaries
 summary_dir = "/var/log/file-guardian/summaries"
 
+# Layout for summary files: flat, daily, hourly
+summary_layout = "flat"
+
 # Patterns to exclude from scanning
 exclude_patterns = [
     "*.git*",
