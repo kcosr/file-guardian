@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Breaking Changes
+- Remove `replace` as a primary action; use `policy.replacement` with `remove`/`recover` instead. ([#3](https://github.com/kcosr/file-guardian/pull/3))
+
+### Added
+- Optional replacement stubs via `policy.replacement` with marker-based suppression. ([#3](https://github.com/kcosr/file-guardian/pull/3))
 
 ## [0.0.2] - 2026-01-16
 
