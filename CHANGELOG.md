@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Configurable scan summary layout (`scan.summary_layout`) with flat/daily/hourly buckets.
+
+### Changed
+- Summary files now use the run timestamp as the filename and default to flat layout.
 
 ## [0.0.1] - 2026-01-14
 

@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio::signal;
 use tokio::time;
 
-use file_guardian::config::Config;
+use file_guardian::config::{Config, SummaryLayout};
 use file_guardian::logging::LoggingSettings;
 use file_guardian::rules::load_rules;
 use file_guardian::scanner::{format_violation, ScanError, Scanner, Violation};
@@ -168,15 +168,15 @@ fn run_scan(scanner: &Scanner, config: &Config) {
     let duration_ms = started.elapsed().as_millis() as u64;
     let summary = build_summary(
         &run_id,
-        started_at,
-        finished_at,
+        &started_at,
+        &finished_at,
         duration_ms,
         &results,
         &action_errors,
     );
 
     if config.scan.write_summaries {
-        match write_summary(config, &run_id, &summary) {
+        match write_summary(config, &run_id, &started_at, &summary) {
             Ok(path) => {
                 tracing::info!("wrote scan summary to {}", path.display());
             }
@@ -240,8 +240,8 @@ impl ViolationSummary {
 
 fn build_summary(
     run_id: &str,
-    started_at: chrono::DateTime<chrono::Local>,
-    finished_at: chrono::DateTime<chrono::Local>,
+    started_at: &chrono::DateTime<chrono::Local>,
+    finished_at: &chrono::DateTime<chrono::Local>,
     duration_ms: u64,
     results: &[Result<Violation, ScanError>],
     action_errors: &HashMap<PathBuf, String>,
@@ -274,12 +274,32 @@ fn build_summary(
     }
 }
 
-fn write_summary(config: &Config, run_id: &str, summary: &ScanSummary) -> Result<PathBuf, String> {
-    let dir = config.scan.summary_dir.join(run_id);
-    fs::create_dir_all(&dir)
-        .map_err(|err| format!("create results dir {}: {err}", dir.display()))?;
+fn summary_parent_dir(config: &Config, started_at: &chrono::DateTime<chrono::Local>) -> PathBuf {
+    match config.scan.summary_layout {
+        SummaryLayout::Flat => config.scan.summary_dir.clone(),
+        SummaryLayout::Daily => {
+            let day = started_at.format("%Y-%m-%d").to_string();
+            config.scan.summary_dir.join(day)
+        }
+        SummaryLayout::Hourly => {
+            let day = started_at.format("%Y-%m-%d").to_string();
+            let hour = started_at.format("%H").to_string();
+            config.scan.summary_dir.join(day).join(hour)
+        }
+    }
+}
 
-    let path = dir.join("summary.json");
+fn write_summary(
+    config: &Config,
+    run_id: &str,
+    started_at: &chrono::DateTime<chrono::Local>,
+    summary: &ScanSummary,
+) -> Result<PathBuf, String> {
+    let dir = summary_parent_dir(config, started_at);
+    fs::create_dir_all(&dir)
+        .map_err(|err| format!("create summary dir {}: {err}", dir.display()))?;
+
+    let path = dir.join(format!("{run_id}.json"));
     let payload =
         serde_json::to_string_pretty(summary).map_err(|err| format!("serialize summary: {err}"))?;
     fs::write(&path, payload).map_err(|err| format!("write summary {}: {err}", path.display()))?;
@@ -299,10 +319,16 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
-    fn test_config(root: &Path, summary_dir: &Path, write_summaries: bool) -> Config {
+    fn test_config(
+        root: &Path,
+        summary_dir: &Path,
+        write_summaries: bool,
+        summary_layout: SummaryLayout,
+    ) -> Config {
         let scan = ScanConfig {
             directories: vec![format!("{}/{}", root.display(), "*")],
             summary_dir: summary_dir.to_path_buf(),
+            summary_layout,
             write_summaries,
             ..ScanConfig::default()
         };
@@ -323,7 +349,7 @@ mod tests {
         fs::write(&file_path, "bad").unwrap();
 
         let summary_dir = dir.path().join("summaries");
-        let config = test_config(dir.path(), &summary_dir, true);
+        let config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Flat);
         let rules = vec![CompiledRule {
             name: "all-txt".to_string(),
             filename_glob: Some(Pattern::new("*.txt").unwrap()),
@@ -341,13 +367,20 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
 
-        let summary_path = entries[0].path().join("summary.json");
-        assert!(summary_path.exists());
+        let summary_path = entries[0].path();
+        assert!(summary_path.is_file());
 
         let payload = fs::read_to_string(&summary_path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["violation_count"].as_u64(), Some(1));
         assert_eq!(value["scan_error_count"].as_u64(), Some(0));
+        let run_id = value["run_id"].as_str().unwrap();
+        let summary_name = summary_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(summary_name, format!("{run_id}.json"));
     }
 
     #[test]
@@ -357,7 +390,7 @@ mod tests {
         fs::write(&file_path, "bad").unwrap();
 
         let summary_dir = dir.path().join("summaries");
-        let config = test_config(dir.path(), &summary_dir, false);
+        let config = test_config(dir.path(), &summary_dir, false, SummaryLayout::Flat);
         let rules = vec![CompiledRule {
             name: "all-txt".to_string(),
             filename_glob: Some(Pattern::new("*.txt").unwrap()),
@@ -384,7 +417,7 @@ mod tests {
         fs::set_permissions(&file_path, perms).unwrap();
 
         let summary_dir = dir.path().join("summaries");
-        let mut config = test_config(dir.path(), &summary_dir, true);
+        let mut config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Flat);
         config.policy.replace_message = "new".to_string();
 
         let rules = vec![CompiledRule {
@@ -404,10 +437,64 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
 
-        let summary_path = entries[0].path().join("summary.json");
+        let summary_path = entries[0].path();
         let payload = fs::read_to_string(&summary_path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["action_error_count"].as_u64(), Some(1));
         assert!(value["violations"][0]["action_error"].as_str().is_some());
+    }
+
+    #[test]
+    fn write_summary_uses_daily_layout() {
+        let dir = tempdir().unwrap();
+        let summary_dir = dir.path().join("summaries");
+        let config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Daily);
+
+        let started_at = Local::now();
+        let run_id = started_at.format("%Y-%m-%dT%H-%M-%S").to_string();
+        let summary = ScanSummary {
+            run_id: run_id.clone(),
+            started_at: started_at.to_rfc3339(),
+            finished_at: started_at.to_rfc3339(),
+            duration_ms: 0,
+            violation_count: 0,
+            scan_error_count: 0,
+            action_error_count: 0,
+            violations: Vec::new(),
+            scan_errors: Vec::new(),
+        };
+
+        let path = write_summary(&config, &run_id, &started_at, &summary).unwrap();
+
+        let expected_dir = summary_dir.join(started_at.format("%Y-%m-%d").to_string());
+        assert_eq!(path, expected_dir.join(format!("{run_id}.json")));
+    }
+
+    #[test]
+    fn write_summary_uses_hourly_layout() {
+        let dir = tempdir().unwrap();
+        let summary_dir = dir.path().join("summaries");
+        let config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Hourly);
+
+        let started_at = Local::now();
+        let run_id = started_at.format("%Y-%m-%dT%H-%M-%S").to_string();
+        let summary = ScanSummary {
+            run_id: run_id.clone(),
+            started_at: started_at.to_rfc3339(),
+            finished_at: started_at.to_rfc3339(),
+            duration_ms: 0,
+            violation_count: 0,
+            scan_error_count: 0,
+            action_error_count: 0,
+            violations: Vec::new(),
+            scan_errors: Vec::new(),
+        };
+
+        let path = write_summary(&config, &run_id, &started_at, &summary).unwrap();
+
+        let expected_dir = summary_dir
+            .join(started_at.format("%Y-%m-%d").to_string())
+            .join(started_at.format("%H").to_string());
+        assert_eq!(path, expected_dir.join(format!("{run_id}.json")));
     }
 }
