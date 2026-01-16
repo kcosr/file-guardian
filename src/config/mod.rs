@@ -225,7 +225,6 @@ pub enum PolicyAction {
     #[default]
     Warn,
     Remove,
-    Replace,
     Recover,
 }
 
@@ -234,8 +233,29 @@ impl std::fmt::Display for PolicyAction {
         match self {
             Self::Warn => write!(f, "warn"),
             Self::Remove => write!(f, "remove"),
-            Self::Replace => write!(f, "replace"),
             Self::Recover => write!(f, "recover"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplacementConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_replacement_content")]
+    pub content: String,
+
+    #[serde(default)]
+    pub marker: Option<String>,
+}
+
+impl Default for ReplacementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            content: default_replacement_content(),
+            marker: None,
         }
     }
 }
@@ -248,8 +268,8 @@ pub struct PolicyConfig {
     #[serde(default = "default_recovery_dir")]
     pub recovery_dir: PathBuf,
 
-    #[serde(default = "default_replace_message")]
-    pub replace_message: String,
+    #[serde(default)]
+    pub replacement: ReplacementConfig,
 }
 
 impl Default for PolicyConfig {
@@ -257,7 +277,7 @@ impl Default for PolicyConfig {
         Self {
             default_action: PolicyAction::default(),
             recovery_dir: default_recovery_dir(),
-            replace_message: default_replace_message(),
+            replacement: ReplacementConfig::default(),
         }
     }
 }
@@ -266,7 +286,7 @@ fn default_recovery_dir() -> PathBuf {
     PathBuf::from("/var/lib/file-guardian/recovered")
 }
 
-fn default_replace_message() -> String {
+fn default_replacement_content() -> String {
     "This file has been removed by file-guardian due to policy violation.\n".to_string()
 }
 

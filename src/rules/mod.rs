@@ -169,7 +169,7 @@ fn load_rules_from_directory(dir: &Path) -> Result<Vec<CompiledRule>, RulesError
 ///   - Empty lines are ignored
 ///   - Format: `name:type:pattern[:action]`
 ///     - type: `glob` (filename) or `regex` (content)
-///     - action: optional, one of `warn`, `remove`, `replace`, `recover`
+///     - action: optional, one of `warn`, `remove`, `recover`
 ///
 /// Examples:
 ///   no-exe:glob:*.exe:remove
@@ -281,10 +281,9 @@ fn parse_action(s: &str) -> Result<PolicyAction, String> {
     match s.to_lowercase().as_str() {
         "warn" => Ok(PolicyAction::Warn),
         "remove" => Ok(PolicyAction::Remove),
-        "replace" => Ok(PolicyAction::Replace),
         "recover" => Ok(PolicyAction::Recover),
         _ => Err(format!(
-            "unknown action '{s}', expected: warn, remove, replace, recover"
+            "unknown action '{s}', expected: warn, remove, recover"
         )),
     }
 }

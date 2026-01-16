@@ -35,7 +35,7 @@ Key patterns to follow:
 
 - Enforce file policies across user directories (e.g., no executables, no hardcoded secrets)
 - Detect sensitive content that shouldn't be stored in plaintext
-- Provide configurable remediation: warn, remove, replace content, or recover files
+- Provide configurable remediation: warn, remove, recover files, with optional replacement stubs
 - Run as a system service with periodic scanning
 
 ## Environment
@@ -64,7 +64,6 @@ Key patterns to follow:
 │                                        │ Actions         │  │
 │                                        │  - warn         │  │
 │                                        │  - remove       │  │
-│                                        │  - replace      │  │
 │                                        │  - recover      │  │
 │                                        └─────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
@@ -129,17 +128,24 @@ exclude_patterns = [
 ]
 
 [policy]
-# Default action when a rule doesn't specify one: warn, remove, replace, recover
+# Default action when a rule doesn't specify one: warn, remove, recover
 default_action = "warn"
 
 # Directory for recovered files (used with 'recover' action)
 recovery_dir = "/var/lib/file-guardian/recovered"
 
-# Message to write when using 'replace' action
-replace_message = """
+[policy.replacement]
+# Apply a replacement stub after remove/recover actions
+enabled = false
+
+# Replacement content to write
+content = """
 This file has been removed by file-guardian due to policy violation.
 Contact your system administrator for more information.
 """
+
+# Optional marker used to suppress violations on replacement files
+# marker = "FILE_GUARDIAN_REPLACEMENT"
 
 [rules]
 # Directory containing .rules files (one rule per line)
@@ -191,7 +197,7 @@ name:type:pattern[:action]
 - `name` - Unique identifier for the rule
 - `type` - `glob` (filename matching) or `regex` (content matching)
 - `pattern` - The glob or regex pattern
-- `action` - Optional, one of: `warn`, `remove`, `replace`, `recover`
+- `action` - Optional, one of: `warn`, `remove`, `recover`
 
 **Example file:** `/etc/file-guardian/rules.d/security.rules`
 
@@ -234,8 +240,14 @@ Uses Rust regex syntax (similar to PCRE). Content scanning:
 |--------|-------------|
 | `warn` | Log the violation, take no other action |
 | `remove` | Delete the file |
-| `replace` | Replace file content with `policy.replace_message` |
 | `recover` | Move file to recovery directory with timestamped path |
+
+### Replacement Stubs
+
+If `policy.replacement.enabled = true`, a replacement file is written after
+`remove` or `recover` actions. Replacement is skipped for `warn` actions and
+binary files. If a file's content exactly matches the replacement marker (or
+content when `marker` is unset), the scanner suppresses the violation.
 
 ### Recovery Directory Structure
 
