@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.2] - 2026-01-16
 
 ### Breaking Changes
 - Summary outputs now write `<run_id>.json` under the selected layout and default to `flat` (no per-run `summary.json` directory). ([#2](https://github.com/kcosr/file-guardian/pull/2))
