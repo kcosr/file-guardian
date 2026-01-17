@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.3] - 2026-01-17
 
 ### Breaking Changes
 - Remove `replace` as a primary action; use `policy.replacement` with `remove`/`recover` instead. ([#3](https://github.com/kcosr/file-guardian/pull/3))
