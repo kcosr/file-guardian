@@ -314,8 +314,6 @@ mod tests {
     use file_guardian::rules::{CompiledRule, RuleSource};
     use glob::Pattern;
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -412,19 +410,17 @@ mod tests {
         let file_path = dir.path().join("bad.txt");
         fs::write(&file_path, "bad").unwrap();
 
-        let mut perms = fs::metadata(&file_path).unwrap().permissions();
-        perms.set_mode(0o444);
-        fs::set_permissions(&file_path, perms).unwrap();
-
         let summary_dir = dir.path().join("summaries");
         let mut config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Flat);
-        config.policy.replace_message = "new".to_string();
+        let recovery_target = dir.path().join("recovery-target");
+        fs::write(&recovery_target, "not a directory").unwrap();
+        config.policy.recovery_dir = recovery_target;
 
         let rules = vec![CompiledRule {
-            name: "replace".to_string(),
+            name: "recover".to_string(),
             filename_glob: Some(Pattern::new("*.txt").unwrap()),
             content_regex: None,
-            action: Some(file_guardian::config::PolicyAction::Replace),
+            action: Some(file_guardian::config::PolicyAction::Recover),
             source: RuleSource::Inline,
         }];
 

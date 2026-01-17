@@ -13,8 +13,8 @@ A Rust service that scans directories for disallowed files based on configurable
 - **Configurable actions**:
   - `warn` - log the violation only
   - `remove` - delete the file
-  - `replace` - replace file content with a policy message
   - `recover` - move file to a timestamped recovery directory
+- **Replacement stubs** - optional replacement content after remove/recover actions
 - **Dry-run mode** - test rules without modifying files
 - **Scan summaries** - optional JSON report per scan
 - **Rules from multiple sources** - inline in TOML config or from `.rules` files
@@ -88,14 +88,21 @@ summary_layout = "flat"
 exclude_patterns = ["*.git*", "node_modules"]
 
 [policy]
-# Default action: warn, remove, replace, recover
+# Default action: warn, remove, recover
 default_action = "warn"
 
 # Recovery directory for 'recover' action
 recovery_dir = "/var/lib/file-guardian/recovered"
 
-# Message for 'replace' action
-replace_message = "This file was removed due to policy violation.\n"
+[policy.replacement]
+# Apply a replacement stub after remove/recover actions
+enabled = false
+
+# Replacement content to write
+content = "This file was removed due to policy violation.\n"
+
+# Optional marker used to suppress violations on replacement files
+# marker = "FILE_GUARDIAN_REPLACEMENT"
 
 [rules]
 # Directory containing .rules files
@@ -120,6 +127,10 @@ max_files = 5
 console = false
 ```
 
+When replacement stubs are enabled, files whose content exactly matches the
+replacement marker (or content when `marker` is unset) are suppressed from
+violation reporting. Binary files are never suppressed this way.
+
 ## Rules Files
 
 Rules can be defined in `.rules` files in the `rules.d` directory. Format:
@@ -132,7 +143,7 @@ name:type:pattern[:action]
 - `name` - unique identifier for the rule
 - `type` - `glob` (filename) or `regex` (content)
 - `pattern` - the glob or regex pattern
-- `action` - optional, one of: `warn`, `remove`, `replace`, `recover`
+- `action` - optional, one of: `warn`, `remove`, `recover`
 
 ### Example rules file
 

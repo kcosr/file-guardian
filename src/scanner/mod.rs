@@ -318,6 +318,26 @@ impl Scanner {
         let mut content: Option<String> = None;
         let mut content_unavailable = false;
 
+        if let Some(marker) = self.replacement_marker() {
+            if self.is_likely_binary(path) {
+                content_unavailable = true;
+            } else {
+                match self.read_file_content(path) {
+                    Ok(data) => {
+                        if data == marker {
+                            tracing::debug!("skipping replacement marker file: {}", path.display());
+                            return;
+                        }
+                        content = Some(data);
+                    }
+                    Err(err) => {
+                        tracing::debug!("cannot read {}: {err}", path.display());
+                        content_unavailable = true;
+                    }
+                }
+            }
+        }
+
         for rule in &self.rules {
             if rule.matches_filename(filename) {
                 let action = rule.action.unwrap_or(self.config.policy.default_action);
@@ -438,6 +458,46 @@ impl Scanner {
         })
     }
 
+    fn replacement_marker(&self) -> Option<&str> {
+        if !self.config.policy.replacement.enabled {
+            return None;
+        }
+
+        if let Some(ref marker) = self.config.policy.replacement.marker {
+            Some(marker.as_str())
+        } else {
+            Some(self.config.policy.replacement.content.as_str())
+        }
+    }
+
+    fn should_apply_replacement(&self, violation: &Violation) -> bool {
+        if !self.config.policy.replacement.enabled {
+            return false;
+        }
+
+        if !matches!(
+            violation.action,
+            PolicyAction::Remove | PolicyAction::Recover
+        ) {
+            return false;
+        }
+
+        if self.is_likely_binary(&violation.path) {
+            return false;
+        }
+
+        true
+    }
+
+    fn write_replacement(&self, path: &Path) -> Result<(), ScanError> {
+        fs::write(path, &self.config.policy.replacement.content).map_err(|source| {
+            ScanError::WriteFile {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    }
+
     /// Execute the action for a violation.
     pub fn execute_action(&self, violation: &Violation) -> Result<(), ScanError> {
         if self.dry_run {
@@ -449,6 +509,8 @@ impl Scanner {
             return Ok(());
         }
 
+        let should_replace = self.should_apply_replacement(violation);
+
         match violation.action {
             PolicyAction::Warn => {
                 // No action needed, just logging
@@ -459,18 +521,23 @@ impl Scanner {
                 fs::remove_file(&violation.path).map_err(|source| ScanError::RemoveFile {
                     path: violation.path.clone(),
                     source,
-                })
+                })?;
+
+                if should_replace {
+                    self.write_replacement(&violation.path)?;
+                }
+
+                Ok(())
             }
-            PolicyAction::Replace => {
-                tracing::info!("replacing file content: {}", violation.path.display());
-                fs::write(&violation.path, &self.config.policy.replace_message).map_err(|source| {
-                    ScanError::WriteFile {
-                        path: violation.path.clone(),
-                        source,
-                    }
-                })
+            PolicyAction::Recover => {
+                self.recover_file(&violation.path)?;
+
+                if should_replace {
+                    self.write_replacement(&violation.path)?;
+                }
+
+                Ok(())
             }
-            PolicyAction::Recover => self.recover_file(&violation.path),
         }
     }
 
@@ -731,32 +798,6 @@ mod tests {
     }
 
     #[test]
-    fn execute_action_replace_overwrites_file() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("replace.txt");
-        fs::write(&file_path, "old").unwrap();
-
-        let mut config = base_config(dir.path());
-        config.policy.replace_message = "new".to_string();
-
-        let scanner = Scanner::new(config, Vec::new(), false).unwrap();
-        let meta = fs::metadata(&file_path).unwrap();
-        let violation = Violation {
-            path: file_path.clone(),
-            rule_name: "replace".to_string(),
-            match_type: MatchType::Filename,
-            content_snippet: None,
-            file_info: FileInfo::from_metadata(&meta),
-            action: PolicyAction::Replace,
-            dry_run: false,
-        };
-
-        scanner.execute_action(&violation).unwrap();
-        let content = fs::read_to_string(&file_path).unwrap();
-        assert_eq!(content, "new");
-    }
-
-    #[test]
     fn execute_action_recover_moves_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("recover.txt");
@@ -791,5 +832,147 @@ mod tests {
         assert!(recovered_path.exists());
         let content = fs::read_to_string(recovered_path).unwrap();
         assert_eq!(content, "recover");
+    }
+
+    #[test]
+    fn execute_action_remove_writes_replacement_when_enabled() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("replace.txt");
+        fs::write(&file_path, "old").unwrap();
+
+        let mut config = base_config(dir.path());
+        config.policy.replacement.enabled = true;
+        config.policy.replacement.content = "new".to_string();
+
+        let scanner = Scanner::new(config, Vec::new(), false).unwrap();
+        let meta = fs::metadata(&file_path).unwrap();
+        let violation = Violation {
+            path: file_path.clone(),
+            rule_name: "remove".to_string(),
+            match_type: MatchType::Filename,
+            content_snippet: None,
+            file_info: FileInfo::from_metadata(&meta),
+            action: PolicyAction::Remove,
+            dry_run: false,
+        };
+
+        scanner.execute_action(&violation).unwrap();
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "new");
+    }
+
+    #[test]
+    fn execute_action_recover_writes_replacement_when_enabled() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("recover.txt");
+        fs::write(&file_path, "recover").unwrap();
+
+        let recovery_dir = dir.path().join("recovered");
+        let mut config = base_config_with_recovery(dir.path(), &recovery_dir);
+        config.policy.replacement.enabled = true;
+        config.policy.replacement.content = "stub".to_string();
+
+        let scanner = Scanner::new(config, Vec::new(), false).unwrap();
+        let meta = fs::metadata(&file_path).unwrap();
+        let violation = Violation {
+            path: file_path.clone(),
+            rule_name: "recover".to_string(),
+            match_type: MatchType::Filename,
+            content_snippet: None,
+            file_info: FileInfo::from_metadata(&meta),
+            action: PolicyAction::Recover,
+            dry_run: false,
+        };
+
+        scanner.execute_action(&violation).unwrap();
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "stub");
+
+        let dirs: Vec<_> = fs::read_dir(&recovery_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(dirs.len(), 1);
+
+        let recovered_dir = dirs[0].path();
+        let encoded = file_path.to_string_lossy().replace('/', "--");
+        let recovered_path = recovered_dir.join(encoded);
+        assert!(recovered_path.exists());
+        let recovered_content = fs::read_to_string(recovered_path).unwrap();
+        assert_eq!(recovered_content, "recover");
+    }
+
+    #[test]
+    fn execute_action_warn_skips_replacement() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("warn.txt");
+        fs::write(&file_path, "keep").unwrap();
+
+        let mut config = base_config(dir.path());
+        config.policy.replacement.enabled = true;
+        config.policy.replacement.content = "stub".to_string();
+
+        let scanner = Scanner::new(config, Vec::new(), false).unwrap();
+        let meta = fs::metadata(&file_path).unwrap();
+        let violation = Violation {
+            path: file_path.clone(),
+            rule_name: "warn".to_string(),
+            match_type: MatchType::Filename,
+            content_snippet: None,
+            file_info: FileInfo::from_metadata(&meta),
+            action: PolicyAction::Warn,
+            dry_run: false,
+        };
+
+        scanner.execute_action(&violation).unwrap();
+        let content = fs::read_to_string(&file_path).unwrap();
+        assert_eq!(content, "keep");
+    }
+
+    #[test]
+    fn scanner_skips_replacement_marker() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("marker.txt");
+        fs::write(&file_path, "marker").unwrap();
+
+        let mut config = base_config(dir.path());
+        config.policy.replacement.enabled = true;
+        config.policy.replacement.content = "replacement".to_string();
+        config.policy.replacement.marker = Some("marker".to_string());
+
+        let rules = vec![CompiledRule {
+            name: "all-txt".to_string(),
+            filename_glob: Some(Pattern::new("*.txt").unwrap()),
+            content_regex: None,
+            action: Some(PolicyAction::Remove),
+            source: RuleSource::Inline,
+        }];
+
+        let scanner = Scanner::new(config, rules, true).unwrap();
+        let results = scanner.scan();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn scanner_does_not_skip_binary_files_for_replacement_marker() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("marker.bin");
+        fs::write(&file_path, b"\0marker").unwrap();
+
+        let mut config = base_config(dir.path());
+        config.policy.replacement.enabled = true;
+        config.policy.replacement.content = "marker".to_string();
+
+        let rules = vec![CompiledRule {
+            name: "all-bin".to_string(),
+            filename_glob: Some(Pattern::new("*.bin").unwrap()),
+            content_regex: None,
+            action: Some(PolicyAction::Warn),
+            source: RuleSource::Inline,
+        }];
+
+        let scanner = Scanner::new(config, rules, true).unwrap();
+        let results = scanner.scan();
+        assert_eq!(results.len(), 1);
     }
 }

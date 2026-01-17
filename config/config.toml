@@ -27,17 +27,24 @@ exclude_patterns = [
 ]
 
 [policy]
-# Default action when a rule doesn't specify one: warn, remove, replace, recover
+# Default action when a rule doesn't specify one: warn, remove, recover
 default_action = "warn"
 
 # Directory for recovered files (used with 'recover' action)
 recovery_dir = "/var/lib/file-guardian/recovered"
 
-# Message to write when using 'replace' action
-replace_message = """
+[policy.replacement]
+# Apply a replacement stub after remove/recover actions
+enabled = false
+
+# Replacement content to write
+content = """
 This file has been removed by file-guardian due to policy violation.
 Contact your system administrator for more information.
 """
+
+# Optional marker used to suppress violations on replacement files
+# marker = "FILE_GUARDIAN_REPLACEMENT"
 
 [rules]
 # Directory containing .rules files (one rule per line)
