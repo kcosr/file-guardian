@@ -19,20 +19,39 @@ A Rust service that scans directories for disallowed files based on configurable
 - **Scan summaries** - optional JSON report per scan
 - **Rules from multiple sources** - inline in TOML config or from `.rules` files
 
-## Installation
+## Install
+
+Download the latest archive for your platform from GitHub Releases:
+
+```text
+https://github.com/kcosr/file-guardian/releases
+```
+
+Supported release platforms are currently:
+
+- `linux-x86_64`
+- `macos-arm64`
+
+Extract the archive on the host that will run `file-guardian`. The archive
+contains the optimized binary, sample config, rule examples, and project
+documentation.
 
 ```bash
-cargo build --release
-sudo cp target/release/file-guardian /usr/local/bin/
+RELEASE_ROOT=/path/to/file-guardian-VERSION-PLATFORM
+
+sudo install -m 0755 "$RELEASE_ROOT/bin/file-guardian" /usr/local/bin/file-guardian
 sudo mkdir -p /etc/file-guardian/rules.d
-sudo cp config/config.toml /etc/file-guardian/
-sudo cp config/rules.d/*.rules /etc/file-guardian/rules.d/
+sudo cp "$RELEASE_ROOT/config/config.toml" /etc/file-guardian/
+sudo cp "$RELEASE_ROOT/config/rules.d/"*.rules /etc/file-guardian/rules.d/
 sudo mkdir -p /var/log/file-guardian
 # Optional if scan.write_summaries = true
 sudo mkdir -p /var/log/file-guardian/summaries
 # Optional if recover action is used
 sudo mkdir -p /var/lib/file-guardian/recovered
 ```
+
+For unsupported platforms or local development, build from source in the
+[Development](#development) section.
 
 ## Usage
 
@@ -225,6 +244,90 @@ Enable and start:
 sudo systemctl daemon-reload
 sudo systemctl enable file-guardian
 sudo systemctl start file-guardian
+```
+
+## Development
+
+Use source builds for local development or unsupported release platforms. Run
+build commands from the cloned repository root.
+
+```bash
+cargo build --release
+```
+
+The release binary is:
+
+```text
+target/release/file-guardian
+```
+
+For substantial code changes, run:
+
+```bash
+cargo fmt
+cargo clippy
+cargo test
+cargo build --release
+```
+
+## Release
+
+Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
+Use `current` when `Cargo.toml` already has the intended release version, use
+`patch`, `minor`, or `major`, or pass an explicit version:
+
+```bash
+node scripts/release.mjs current
+node scripts/release.mjs patch
+node scripts/release.mjs minor
+node scripts/release.mjs major
+node scripts/release.mjs 0.1.0
+```
+
+The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
+matching git tag, creates a GitHub release with notes from the changelog,
+then commits a fresh `Unreleased` section for the next cycle.
+
+If GitHub release creation fails after the commit and tag are pushed, recover
+by creating the release manually for the existing tag instead of rerunning the
+script. Then add a fresh `## [Unreleased]` section with the standard
+`_No unreleased changes._` placeholder, commit it as
+`Prepare for next release`, and push `main`.
+
+Release binaries are packaged separately after the target-platform binary has
+been built by the release operator. Build Linux x86_64 on Linux, and build
+macOS ARM64 natively on Apple Silicon. Supported release archives currently use
+these names:
+
+```text
+file-guardian-VERSION-linux-x86_64.tar.gz
+file-guardian-VERSION-macos-arm64.tar.gz
+```
+
+Each archive should contain one top-level directory named
+`file-guardian-VERSION-PLATFORM` with:
+
+- `bin/file-guardian` - policy scanner binary.
+- `README.md`
+- `LICENSE`
+- `CHANGELOG.md`
+- `config/`
+- `requirements.md`
+
+Example packaging flow:
+
+```bash
+VERSION=$(sed -n '/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+PLATFORM=linux-x86_64 # or macos-arm64
+OUT=/tmp/file-guardian-release-${VERSION}
+ROOT="file-guardian-${VERSION}-${PLATFORM}"
+
+rm -rf "$OUT/$ROOT" "$OUT/${ROOT}.tar.gz"
+mkdir -p "$OUT/$ROOT/bin"
+install -m 755 target/release/file-guardian "$OUT/$ROOT/bin/file-guardian"
+cp README.md LICENSE CHANGELOG.md requirements.md "$OUT/$ROOT/"
+cp -R config "$OUT/$ROOT/"
+tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 ```
 
 ## License

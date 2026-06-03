@@ -2,7 +2,14 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+- Release automation now creates normal GitHub releases. ([#4](https://github.com/kcosr/file-guardian/pull/4))
+- Release version bumping is now handled inside the single release script, matching sibling Rust release tooling. ([#4](https://github.com/kcosr/file-guardian/pull/4))
+- Release script now supports `current` and explicit stable version arguments, with clean-main, origin/main sync, authenticated GitHub CLI, and free-tag preconditions. ([#4](https://github.com/kcosr/file-guardian/pull/4))
+- Hardened release version validation, local and remote tag checks, release recovery instructions, and release-script cleanup paths. ([#4](https://github.com/kcosr/file-guardian/pull/4))
+- Documented release download/install guidance and Linux x86_64 plus macOS ARM64 archive
+  packaging, with source builds moved to the development workflow. ([#4](https://github.com/kcosr/file-guardian/pull/4))
 
 ## [0.0.3] - 2026-01-17
 
