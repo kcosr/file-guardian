@@ -32,8 +32,8 @@ Supported release platforms are currently:
 - `linux-x86_64`
 
 Extract the archive on the host that will run `file-guardian`. The archive
-contains the optimized binary, sample config, rule examples, release tooling,
-and project documentation.
+contains the optimized binary, sample config, rule examples, and project
+documentation.
 
 ```bash
 RELEASE_ROOT=/path/to/file-guardian-VERSION-linux-x86_64
@@ -309,7 +309,6 @@ Each archive should contain one top-level directory named
 - `LICENSE`
 - `CHANGELOG.md`
 - `config/`
-- `scripts/`
 - `requirements.md`
 
 Example packaging flow:
@@ -324,7 +323,7 @@ rm -rf "$OUT/$ROOT" "$OUT/${ROOT}.tar.gz"
 mkdir -p "$OUT/$ROOT/bin"
 install -m 755 target/release/file-guardian "$OUT/$ROOT/bin/file-guardian"
 cp README.md LICENSE CHANGELOG.md requirements.md "$OUT/$ROOT/"
-cp -R config scripts "$OUT/$ROOT/"
+cp -R config "$OUT/$ROOT/"
 tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 ```
 
