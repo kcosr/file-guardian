@@ -289,7 +289,9 @@ then commits a fresh `Unreleased` section for the next cycle.
 
 If GitHub release creation fails after the commit and tag are pushed, recover
 by creating the release manually for the existing tag instead of rerunning the
-script.
+script. Then add a fresh `## [Unreleased]` section with the standard
+`_No unreleased changes._` placeholder, commit it as
+`Prepare for next release`, and push `main`.
 
 Release binaries are packaged separately after the Linux x86_64 binary has
 been built by the release operator. Supported release archives currently use
