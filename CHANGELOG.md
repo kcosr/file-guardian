@@ -4,9 +4,9 @@
 
 ### Changed
 
-- Release automation now creates normal GitHub releases.
+- Release automation now creates normal GitHub releases. ([#4](https://github.com/kcosr/file-guardian/pull/4))
 - Documented release download/install guidance and Linux x86_64 archive
-  packaging, with source builds moved to the development workflow.
+  packaging, with source builds moved to the development workflow. ([#4](https://github.com/kcosr/file-guardian/pull/4))
 
 ## [0.0.3] - 2026-01-17
 
