@@ -22,6 +22,29 @@ const FILE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK);
+
+// An ancestry walk only needs search access. Requesting read access here would
+// incorrectly reject inputs below execute/search-only directories even though
+// the input itself can be opened and captured safely.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const ANCESTRY_DIRECTORY_FLAGS: OFlags = OFlags::PATH
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC)
+    .union(OFlags::NOFOLLOW);
+
+// Darwin exposes O_SEARCH as O_EXEC | O_DIRECTORY. rustix intentionally does
+// not expose those access modes, so retain the Darwin O_EXEC bit explicitly
+// while continuing to use rustix's descriptor-relative openat wrapper.
+#[cfg(target_vendor = "apple")]
+const ANCESTRY_DIRECTORY_FLAGS: OFlags = OFlags::from_bits_retain(0x4000_0000)
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::CLOEXEC)
+    .union(OFlags::NOFOLLOW);
+
+// The supported release platforms use the search-only variants above. Keep a
+// conservative compile-time fallback for other Unix targets.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+const ANCESTRY_DIRECTORY_FLAGS: OFlags = DIRECTORY_FLAGS;
 const MAX_ANCESTOR_DIRECTORIES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,7 +129,7 @@ impl<'a> Snapshotter<'a> {
                     .parent()
                     .filter(|parent| !parent.as_os_str().is_empty())
                     .unwrap_or_else(|| Path::new("."));
-                let parent = fs::open(parent_path, DIRECTORY_FLAGS, Mode::empty())
+                let parent = fs::open(parent_path, ANCESTRY_DIRECTORY_FLAGS, Mode::empty())
                     .map_err(|error| CaptureError::InputUnavailable(error.kind()))?;
                 reject_workspace_ancestry(self.workspace, &parent)?;
                 let parent_entry = fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
@@ -165,7 +188,7 @@ fn reject_workspace_ancestry(
             return Err(CaptureError::WorkspaceTraversalRejected);
         }
 
-        let parent = fs::openat(&current, "..", DIRECTORY_FLAGS, Mode::empty())
+        let parent = open_ancestry_parent(&current)
             .map_err(|_| CaptureError::WorkspaceAncestryUnavailable)?;
         let parent_stat =
             fs::fstat(&parent).map_err(|_| CaptureError::WorkspaceAncestryUnavailable)?;
@@ -179,6 +202,10 @@ fn reject_workspace_ancestry(
     Err(CaptureError::WorkspaceAncestryLimitExceeded {
         limit: MAX_ANCESTOR_DIRECTORIES,
     })
+}
+
+fn open_ancestry_parent(directory: &OwnedFd) -> rustix::io::Result<OwnedFd> {
+    fs::openat(directory, "..", ANCESTRY_DIRECTORY_FLAGS, Mode::empty())
 }
 
 struct CaptureState<'a> {
@@ -728,6 +755,51 @@ mod tests {
             snapshot.manifest.subjects()[0].relative_path.to_string(),
             "input"
         );
+    }
+
+    #[test]
+    fn captures_beneath_a_search_only_ancestor() {
+        let fixture = Fixture::new("search-only-ancestor");
+        let ancestor = fixture.root.path().join("search-only");
+        let input = ancestor.join("leaf/input");
+        let literal_file = ancestor.join("literal.txt");
+        stdfs::create_dir_all(&input).unwrap();
+        stdfs::write(input.join("artifact.txt"), b"capturable").unwrap();
+        stdfs::write(&literal_file, b"literal file").unwrap();
+        stdfs::set_permissions(&ancestor, stdfs::Permissions::from_mode(0o111)).unwrap();
+
+        let input_fd = fs::open(&input, DIRECTORY_FLAGS, Mode::empty()).unwrap();
+        let leaf_fd = open_ancestry_parent(&input_fd).unwrap();
+        let ancestor_fd = open_ancestry_parent(&leaf_fd).unwrap();
+        let ancestor_identity =
+            FilesystemIdentity::from_stat(&fs::fstat(&ancestor_fd).unwrap()).unwrap();
+        let expected_identity = FilesystemIdentity::from_stat(
+            &fs::statat(fs::CWD, &ancestor, AtFlags::SYMLINK_NOFOLLOW).unwrap(),
+        )
+        .unwrap();
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let used_search_only_flag = fs::fcntl_getfl(&ancestor_fd)
+            .unwrap()
+            .contains(OFlags::PATH);
+        #[cfg(target_vendor = "apple")]
+        let used_search_only_flag = fs::fcntl_getfl(&ancestor_fd)
+            .unwrap()
+            .contains(OFlags::from_bits_retain(0x4000_0000));
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        let used_search_only_flag = true;
+
+        let capture =
+            Snapshotter::new(&fixture.workspace, CaptureLimits::default()).capture(&input);
+        let literal_capture =
+            Snapshotter::new(&fixture.workspace, CaptureLimits::default()).capture(&literal_file);
+        stdfs::set_permissions(&ancestor, stdfs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(ancestor_identity, expected_identity);
+        assert!(used_search_only_flag);
+        let snapshot = capture.unwrap();
+        assert_eq!(snapshot.manifest.artifacts().len(), 1);
+        assert_eq!(literal_capture.unwrap().manifest.artifacts().len(), 1);
     }
 
     #[test]

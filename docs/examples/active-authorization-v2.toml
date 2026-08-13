@@ -100,7 +100,7 @@ required = true
 scope = "tree"
 
 [analyzers.pi]
-executable = "/home/kevin/.local/bin/pi"
+executable = "/usr/local/bin/pi"
 expected_version = "0.83.0"
 provider = "internal-provider"
 model = "internal-classification-model"
