@@ -186,6 +186,12 @@ Coverage records the inspection phase and eligible, assigned, completed, and
 excluded candidate counts. An analyzer's inability to inspect an assigned
 candidate is incomplete coverage, not an exclusion.
 
+The counters are disjoint: `completed` counts assigned artifacts the analyzer
+inspected, while `excluded` counts assigned artifacts made explicitly
+inapplicable by policy. Coverage is complete exactly when
+`completed + excluded == assigned`; excluded artifacts never also increment
+`completed`.
+
 ## Built-in rules
 
 Existing filename glob and content regex matching becomes the first analyzer.

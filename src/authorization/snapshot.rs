@@ -466,7 +466,7 @@ pub enum CaptureError {
     InputUnstable,
     #[error("filesystem metadata cannot be represented safely")]
     InvalidFileMetadata,
-    #[error("the input traverses the workspace root or invocation run directory")]
+    #[error("the input traverses the workspace root, invocation run directory, or fixed layout")]
     WorkspaceTraversalRejected,
     #[error("directory enumeration failed")]
     EnumerationFailure,
@@ -601,9 +601,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_workspace_root_and_run_directory_as_inputs() {
+    fn rejects_workspace_root_run_and_fixed_layout_directories_as_inputs() {
         let fixture = Fixture::new("self-capture");
         let workspace_root = fixture.root.path().join("workspaces");
+        let run_path = workspace_root.join("run_self-capture");
         let snapshotter = Snapshotter::new(&fixture.workspace, CaptureLimits::default());
 
         assert!(matches!(
@@ -611,9 +612,23 @@ mod tests {
             Err(CaptureError::WorkspaceTraversalRejected)
         ));
         assert!(matches!(
-            snapshotter.capture(&workspace_root.join("run_self-capture")),
+            snapshotter.capture(&run_path),
             Err(CaptureError::WorkspaceTraversalRejected)
         ));
+        for name in [
+            "manifest",
+            "objects",
+            "analyzer-views",
+            "archive-work",
+            "action-journal",
+            "quarantine",
+            "tmp",
+        ] {
+            assert!(matches!(
+                snapshotter.capture(&run_path.join(name)),
+                Err(CaptureError::WorkspaceTraversalRejected)
+            ));
+        }
     }
 
     #[test]

@@ -206,6 +206,7 @@ impl BuiltinRulesAnalyzer {
             }
 
             let mut artifact_complete = true;
+            let mut artifact_excluded = false;
             if filename_required {
                 match filename(artifact) {
                     Some(filename) => {
@@ -266,7 +267,7 @@ impl BuiltinRulesAnalyzer {
                             ));
                             artifact_complete = false;
                         }
-                        UnsupportedContentPolicy::Exclude => excluded += 1,
+                        UnsupportedContentPolicy::Exclude => artifact_excluded = true,
                     }
                 } else {
                     match reader.read_object(&artifact.object_id, self.limits.max_content_bytes) {
@@ -316,7 +317,7 @@ impl BuiltinRulesAnalyzer {
                                     ));
                                     artifact_complete = false;
                                 }
-                                UnsupportedContentPolicy::Exclude => excluded += 1,
+                                UnsupportedContentPolicy::Exclude => artifact_excluded = true,
                             },
                             Ok(content) => {
                                 for rule in &self.rules {
@@ -360,7 +361,11 @@ impl BuiltinRulesAnalyzer {
             }
 
             if artifact_complete {
-                completed += 1;
+                if artifact_excluded {
+                    excluded += 1;
+                } else {
+                    completed += 1;
+                }
             }
         }
 
@@ -393,7 +398,7 @@ impl BuiltinRulesAnalyzer {
                 })
             })
             .collect();
-        let status = if completed == assigned {
+        let status = if completed + excluded == assigned {
             CoverageStatus::Complete
         } else {
             CoverageStatus::Incomplete
@@ -737,7 +742,7 @@ mod tests {
         let result = analyzer.analyze(InspectionPhase::Initial, &manifest, &reader);
 
         assert!(result.coverage.is_complete());
-        assert_eq!(result.coverage.completed, 2);
+        assert_eq!(result.coverage.completed, 0);
         assert_eq!(result.coverage.excluded, 2);
         assert!(result.issues.is_empty());
         assert_eq!(result.observations.len(), 2);

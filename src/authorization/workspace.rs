@@ -20,6 +20,7 @@ pub struct InvocationWorkspace {
     _run_dir: OwnedFd,
     root_identity: FilesystemIdentity,
     run_identity: FilesystemIdentity,
+    layout_identities: Vec<FilesystemIdentity>,
     objects: ObjectStore,
 }
 
@@ -49,7 +50,7 @@ impl InvocationWorkspace {
                 .map_err(WorkspaceError::OpenRun)?;
             let run_stat = fs::fstat(&run_dir).map_err(WorkspaceError::InspectRun)?;
             let run_identity = FilesystemIdentity::from_stat(&run_stat)?;
-            for name in [
+            let layout_names = [
                 "manifest",
                 "objects",
                 "analyzer-views",
@@ -57,9 +58,15 @@ impl InvocationWorkspace {
                 "action-journal",
                 "quarantine",
                 "tmp",
-            ] {
+            ];
+            let mut layout_identities = Vec::with_capacity(layout_names.len());
+            for name in layout_names {
                 fs::mkdirat(&run_dir, name, Mode::from_raw_mode(0o700))
                     .map_err(WorkspaceError::CreateLayout)?;
+                let layout_dir = fs::openat(&run_dir, name, DIRECTORY_FLAGS, Mode::empty())
+                    .map_err(WorkspaceError::OpenLayout)?;
+                let layout_stat = fs::fstat(&layout_dir).map_err(WorkspaceError::InspectLayout)?;
+                layout_identities.push(FilesystemIdentity::from_stat(&layout_stat)?);
             }
             let object_dir = fs::openat(&run_dir, "objects", DIRECTORY_FLAGS, Mode::empty())
                 .map_err(WorkspaceError::OpenLayout)?;
@@ -70,6 +77,7 @@ impl InvocationWorkspace {
                 _run_dir: run_dir,
                 root_identity,
                 run_identity,
+                layout_identities,
                 objects: ObjectStore {
                     object_dir,
                     tmp_dir,
@@ -90,7 +98,9 @@ impl InvocationWorkspace {
     }
 
     pub(super) fn contains_identity(&self, identity: FilesystemIdentity) -> bool {
-        identity == self.root_identity || identity == self.run_identity
+        identity == self.root_identity
+            || identity == self.run_identity
+            || self.layout_identities.contains(&identity)
     }
 
     /// Deletes this invocation's private state. Secure erasure is not claimed.
@@ -257,6 +267,8 @@ pub enum WorkspaceError {
     CreateLayout(rustix::io::Errno),
     #[error("could not open invocation workspace layout: {0}")]
     OpenLayout(rustix::io::Errno),
+    #[error("could not inspect invocation workspace layout: {0}")]
+    InspectLayout(rustix::io::Errno),
     #[error("could not remove invocation workspace: {0}")]
     RemoveRun(io::Error),
     #[error("could not create temporary object: {0}")]

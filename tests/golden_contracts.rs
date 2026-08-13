@@ -55,6 +55,24 @@ fn golden_reports_match_typed_domain_contracts_and_exit_invariants() {
 }
 
 #[test]
+fn golden_coverage_round_trips_as_the_exact_canonical_json_shape() {
+    for source in [
+        include_str!("../docs/examples/reports/allow.json"),
+        include_str!("../docs/examples/reports/deny.json"),
+        include_str!("../docs/examples/reports/error.json"),
+    ] {
+        let report: Value = serde_json::from_str(source).expect("valid golden report JSON");
+        let expected = report.get("coverage").expect("golden coverage").clone();
+        let coverage: RunCoverage =
+            serde_json::from_value(expected.clone()).expect("valid typed coverage");
+        assert_eq!(
+            serde_json::to_value(coverage).expect("serializable coverage"),
+            expected
+        );
+    }
+}
+
+#[test]
 fn checked_in_configuration_and_classifier_examples_parse() {
     let _: toml::Value = include_str!("../docs/examples/active-authorization-v2.toml")
         .parse()
