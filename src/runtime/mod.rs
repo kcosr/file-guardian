@@ -268,10 +268,24 @@ fn compile_policy_bindings(
         .iter()
         .map(|(analyzer, rule)| (analyzer.as_str(), rule.as_str()))
         .collect::<BTreeSet<_>>();
+    let builtin_rule_analyzers = config
+        .analyzers
+        .iter()
+        .filter_map(|analyzer| {
+            matches!(&analyzer.kind, AnalyzerKind::BuiltinRules { .. })
+                .then_some(analyzer.id.as_str())
+        })
+        .collect::<BTreeSet<_>>();
     for binding in &configured {
         let Some(rule) = binding.rule.as_deref() else {
             continue;
         };
+        // Built-in selectors can be checked against the rules loaded above.
+        // Delegate rule identifiers belong to the delegate's native protocol
+        // namespace and are validated when its typed output is received.
+        if !builtin_rule_analyzers.contains(binding.analyzer.as_str()) {
+            continue;
+        }
         let analyzer_has_rules = known_rule_set
             .iter()
             .any(|(analyzer, _)| *analyzer == binding.analyzer);

@@ -70,18 +70,11 @@ filename_glob = "*.blocked"
         fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
 
         let rules = self._temp.path().join("rules.toml");
-        let builtin_and_binding = format!(
+        let builtin = format!(
             r#"[[analyzers]]
 id = "rules"
 kind = "builtin_rules"
-rule_files = ["{}"]
-
-[[policy_bindings]]
-id = "blocked"
-profile = "publication"
-analyzer = "rules"
-rule = "*"
-directive = "deny""#,
+rule_files = ["{}"]"#,
             rules.display()
         );
         let external = format!(
@@ -94,7 +87,7 @@ sandbox = "required""#,
             adapter.display()
         );
         let current = fs::read_to_string(&self.config).unwrap();
-        let updated = current.replace(&builtin_and_binding, &external);
+        let updated = current.replace(&builtin, &external);
         assert_ne!(
             updated, current,
             "test fixture analyzer block must be replaced"
@@ -206,7 +199,7 @@ fn authorize_denies_matching_input_with_exit_twenty() {
 }
 
 #[test]
-fn selected_unimplemented_external_analyzer_fails_closed_with_runtime_coverage() {
+fn rule_bound_unimplemented_external_analyzer_fails_closed_with_runtime_coverage() {
     let fixture = Fixture::new("deny", "safe.txt");
     let invocation_marker = fixture.select_unsupported_external_analyzer();
 
