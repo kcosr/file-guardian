@@ -52,6 +52,7 @@ impl ArtifactReader for crate::authorization::ObjectStore {
 pub struct BuiltinAnalyzerLimits {
     pub max_content_bytes: u64,
     pub max_findings: usize,
+    pub content_applicability: BuiltinContentApplicability,
 }
 
 impl Default for BuiltinAnalyzerLimits {
@@ -59,8 +60,29 @@ impl Default for BuiltinAnalyzerLimits {
         Self {
             max_content_bytes: 16 * 1024 * 1024,
             max_findings: 10_000,
+            content_applicability: BuiltinContentApplicability::default(),
         }
     }
+}
+
+/// Compiled policy for content that the built-in regex engine cannot inspect.
+///
+/// Exclusion explicitly declares that content rules do not apply to an
+/// artifact. It is counted in coverage; it is not a successful content scan.
+/// Filename rules still run for an excluded artifact.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BuiltinContentApplicability {
+    pub invalid_utf8: UnsupportedContentPolicy,
+    pub over_max_bytes: UnsupportedContentPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnsupportedContentPolicy {
+    /// Fail closed with an issue and incomplete coverage.
+    #[default]
+    Fail,
+    /// Declare content rules inapplicable and record an explicit exclusion.
+    Exclude,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -168,6 +190,7 @@ impl BuiltinRulesAnalyzer {
         let mut findings = Vec::new();
         let mut issues = Vec::new();
         let mut completed = 0_u64;
+        let mut excluded = 0_u64;
         let mut limit_reached = false;
 
         let mut artifacts: Vec<_> = manifest.artifacts().iter().collect();
@@ -205,6 +228,7 @@ impl BuiltinRulesAnalyzer {
                                 )
                             {
                                 issues.push(issue(
+                                    &self.id,
                                     phase,
                                     artifact,
                                     IssueCode::SizeLimitExceeded,
@@ -218,6 +242,7 @@ impl BuiltinRulesAnalyzer {
                     }
                     None => {
                         issues.push(issue(
+                            &self.id,
                             phase,
                             artifact,
                             IssueCode::InvalidAnalyzerOutput,
@@ -230,17 +255,24 @@ impl BuiltinRulesAnalyzer {
 
             if content_required && !limit_reached {
                 if artifact.byte_len > self.limits.max_content_bytes {
-                    issues.push(issue(
-                        phase,
-                        artifact,
-                        IssueCode::SizeLimitExceeded,
-                        "artifact exceeds the built-in content inspection limit",
-                    ));
-                    artifact_complete = false;
+                    match self.limits.content_applicability.over_max_bytes {
+                        UnsupportedContentPolicy::Fail => {
+                            issues.push(issue(
+                                &self.id,
+                                phase,
+                                artifact,
+                                IssueCode::SizeLimitExceeded,
+                                "artifact exceeds the built-in content inspection limit",
+                            ));
+                            artifact_complete = false;
+                        }
+                        UnsupportedContentPolicy::Exclude => excluded += 1,
+                    }
                 } else {
                     match reader.read_object(&artifact.object_id, self.limits.max_content_bytes) {
                         Err(ArtifactReadError::Unavailable) => {
                             issues.push(issue(
+                                &self.id,
                                 phase,
                                 artifact,
                                 IssueCode::AnalyzerFailure,
@@ -250,6 +282,7 @@ impl BuiltinRulesAnalyzer {
                         }
                         Err(ArtifactReadError::LimitExceeded) => {
                             issues.push(issue(
+                                &self.id,
                                 phase,
                                 artifact,
                                 IssueCode::SizeLimitExceeded,
@@ -263,6 +296,7 @@ impl BuiltinRulesAnalyzer {
                                     != artifact.content_digest =>
                         {
                             issues.push(issue(
+                                &self.id,
                                 phase,
                                 artifact,
                                 IssueCode::AnalyzerFailure,
@@ -271,15 +305,19 @@ impl BuiltinRulesAnalyzer {
                             artifact_complete = false;
                         }
                         Ok(bytes) => match std::str::from_utf8(&bytes) {
-                            Err(_) => {
-                                issues.push(issue(
-                                    phase,
-                                    artifact,
-                                    IssueCode::InvalidAnalyzerOutput,
-                                    "built-in content rules require UTF-8 content",
-                                ));
-                                artifact_complete = false;
-                            }
+                            Err(_) => match self.limits.content_applicability.invalid_utf8 {
+                                UnsupportedContentPolicy::Fail => {
+                                    issues.push(issue(
+                                        &self.id,
+                                        phase,
+                                        artifact,
+                                        IssueCode::InvalidAnalyzerOutput,
+                                        "built-in content rules require UTF-8 content",
+                                    ));
+                                    artifact_complete = false;
+                                }
+                                UnsupportedContentPolicy::Exclude => excluded += 1,
+                            },
                             Ok(content) => {
                                 for rule in &self.rules {
                                     let Some(pattern) = &rule.content_regex else {
@@ -300,6 +338,7 @@ impl BuiltinRulesAnalyzer {
                                             },
                                         ) {
                                             issues.push(issue(
+                                                &self.id,
                                                 phase,
                                                 artifact,
                                                 IssueCode::SizeLimitExceeded,
@@ -359,8 +398,16 @@ impl BuiltinRulesAnalyzer {
         } else {
             CoverageStatus::Incomplete
         };
-        let coverage = AnalyzerCoverage::new(phase, assigned, assigned, completed, 0, status)
-            .expect("analyzer coverage counters are internally consistent");
+        let coverage = AnalyzerCoverage::new(
+            self.id.clone(),
+            phase,
+            assigned,
+            assigned,
+            completed,
+            excluded,
+            status,
+        )
+        .expect("analyzer coverage counters are internally consistent");
 
         BuiltinRulesResult {
             observations,
@@ -408,6 +455,7 @@ fn reason(value: &str) -> ReasonCode {
 }
 
 fn issue(
+    analyzer_id: &AnalyzerId,
     phase: InspectionPhase,
     artifact: &Artifact,
     code: IssueCode,
@@ -416,6 +464,7 @@ fn issue(
     InspectionIssue {
         phase,
         code,
+        analyzer_id: Some(analyzer_id.clone()),
         subject_id: Some(artifact.subject_id.clone()),
         artifact_id: Some(artifact.id.clone()),
         message: SanitizedMessage::new(message).expect("static diagnostic is valid"),
@@ -623,13 +672,14 @@ mod tests {
     }
 
     #[test]
-    fn invalid_utf8_oversize_read_and_finding_limits_are_incomplete() {
+    fn unsupported_content_fails_closed_by_default() {
         let analyzer = BuiltinRulesAnalyzer::new(
             "builtin",
             vec![rule("anything", None, Some("."))],
             BuiltinAnalyzerLimits {
                 max_content_bytes: 3,
                 max_findings: 1,
+                content_applicability: BuiltinContentApplicability::default(),
             },
         )
         .unwrap();
@@ -639,6 +689,7 @@ mod tests {
             analyzer.analyze(InspectionPhase::Initial, &invalid_manifest, &invalid_reader);
         assert!(!invalid.coverage.is_complete());
         assert_eq!(invalid.issues[0].code, IssueCode::InvalidAnalyzerOutput);
+        assert_eq!(invalid.issues[0].analyzer_id.as_ref(), Some(analyzer.id()));
 
         let (large_manifest, large_reader) = manifest(&[("large", b"four")]);
         let large = analyzer.analyze(InspectionPhase::Initial, &large_manifest, &large_reader);
@@ -660,6 +711,78 @@ mod tests {
         assert_eq!(limited.observations.len(), 1);
         assert!(!limited.coverage.is_complete());
         assert_eq!(limited.issues[0].code, IssueCode::SizeLimitExceeded);
+    }
+
+    #[test]
+    fn explicit_content_exclusions_are_complete_and_filename_rules_still_run() {
+        let analyzer = BuiltinRulesAnalyzer::new(
+            "builtin",
+            vec![
+                rule("blocked-name", Some("*.secret"), None),
+                rule("content", None, Some(".")),
+            ],
+            BuiltinAnalyzerLimits {
+                max_content_bytes: 3,
+                max_findings: 10,
+                content_applicability: BuiltinContentApplicability {
+                    invalid_utf8: UnsupportedContentPolicy::Exclude,
+                    over_max_bytes: UnsupportedContentPolicy::Exclude,
+                },
+            },
+        )
+        .unwrap();
+        let (manifest, reader) =
+            manifest(&[("invalid.secret", &[0xff]), ("large.secret", b"four")]);
+
+        let result = analyzer.analyze(InspectionPhase::Initial, &manifest, &reader);
+
+        assert!(result.coverage.is_complete());
+        assert_eq!(result.coverage.completed, 2);
+        assert_eq!(result.coverage.excluded, 2);
+        assert!(result.issues.is_empty());
+        assert_eq!(result.observations.len(), 2);
+        assert!(result.observations.iter().all(|observation| matches!(
+            observation,
+            NormalizedObservation::Finding(finding)
+                if finding.category == FindingCategory::Filename
+        )));
+    }
+
+    #[test]
+    fn explicit_applicability_exclusions_do_not_hide_object_or_digest_failures() {
+        let analyzer = BuiltinRulesAnalyzer::new(
+            "builtin",
+            vec![rule("content", None, Some("."))],
+            BuiltinAnalyzerLimits {
+                max_content_bytes: 3,
+                max_findings: 10,
+                content_applicability: BuiltinContentApplicability {
+                    invalid_utf8: UnsupportedContentPolicy::Exclude,
+                    over_max_bytes: UnsupportedContentPolicy::Exclude,
+                },
+            },
+        )
+        .unwrap();
+        let (missing_manifest, _) = manifest(&[("missing", b"one")]);
+
+        let result = analyzer.analyze(
+            InspectionPhase::Initial,
+            &missing_manifest,
+            &MemoryReader::default(),
+        );
+
+        assert!(!result.coverage.is_complete());
+        assert_eq!(result.coverage.excluded, 0);
+        assert_eq!(result.issues[0].code, IssueCode::AnalyzerFailure);
+
+        let (corrupt_manifest, mut corrupt_reader) = manifest(&[("corrupt", b"one")]);
+        let object_id = corrupt_manifest.artifacts()[0].object_id.clone();
+        corrupt_reader.objects.insert(object_id, b"two".to_vec());
+        let corrupt =
+            analyzer.analyze(InspectionPhase::Initial, &corrupt_manifest, &corrupt_reader);
+        assert!(!corrupt.coverage.is_complete());
+        assert_eq!(corrupt.coverage.excluded, 0);
+        assert_eq!(corrupt.issues[0].code, IssueCode::AnalyzerFailure);
     }
 
     #[test]

@@ -47,6 +47,11 @@ id = "publication-rules"
 kind = "builtin_rules"
 required = true
 rule_files = ["/etc/file-guardian/rules.d/publication.toml"]
+max_content_bytes = 16777216
+
+[analyzers.content_applicability]
+invalid_utf8 = "fail"
+over_max_bytes = "fail"
 
 [[analyzers]]
 id = "password-scanner"

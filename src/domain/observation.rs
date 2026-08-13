@@ -177,7 +177,7 @@ pub struct Classification {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NormalizedObservation {
     Finding(Finding),
     Classification(Classification),

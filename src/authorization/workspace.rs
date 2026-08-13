@@ -18,7 +18,15 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
 pub struct InvocationWorkspace {
     run_path: PathBuf,
     _run_dir: OwnedFd,
+    root_identity: FilesystemIdentity,
+    run_identity: FilesystemIdentity,
     objects: ObjectStore,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FilesystemIdentity {
+    pub device: u64,
+    pub inode: u64,
 }
 
 impl InvocationWorkspace {
@@ -28,6 +36,7 @@ impl InvocationWorkspace {
         let root = fs::open(workspace_root, DIRECTORY_FLAGS, Mode::empty())
             .map_err(WorkspaceError::OpenRoot)?;
         let root_stat = fs::fstat(&root).map_err(WorkspaceError::InspectRoot)?;
+        let root_identity = FilesystemIdentity::from_stat(&root_stat)?;
         if root_stat.st_uid != geteuid().as_raw() || root_stat.st_mode & 0o077 != 0 {
             return Err(WorkspaceError::InsecureRoot);
         }
@@ -38,6 +47,8 @@ impl InvocationWorkspace {
         let result = (|| {
             let run_dir = fs::openat(&root, run_id.as_str(), DIRECTORY_FLAGS, Mode::empty())
                 .map_err(WorkspaceError::OpenRun)?;
+            let run_stat = fs::fstat(&run_dir).map_err(WorkspaceError::InspectRun)?;
+            let run_identity = FilesystemIdentity::from_stat(&run_stat)?;
             for name in [
                 "manifest",
                 "objects",
@@ -57,6 +68,8 @@ impl InvocationWorkspace {
             Ok(Self {
                 run_path: run_path.clone(),
                 _run_dir: run_dir,
+                root_identity,
+                run_identity,
                 objects: ObjectStore {
                     object_dir,
                     tmp_dir,
@@ -76,11 +89,30 @@ impl InvocationWorkspace {
         &self.objects
     }
 
+    pub(super) fn contains_identity(&self, identity: FilesystemIdentity) -> bool {
+        identity == self.root_identity || identity == self.run_identity
+    }
+
     /// Deletes this invocation's private state. Secure erasure is not claimed.
     pub fn remove(self) -> Result<(), WorkspaceError> {
         let path = self.run_path.clone();
         drop(self);
         std::fs::remove_dir_all(path).map_err(WorkspaceError::RemoveRun)
+    }
+}
+
+impl FilesystemIdentity {
+    // rustix's platform Stat field aliases vary across Unix targets. The
+    // conversion is checked where it can narrow and intentionally a no-op
+    // where the target already exposes u64.
+    #[allow(clippy::useless_conversion)]
+    pub(super) fn from_stat(stat: &fs::Stat) -> Result<Self, WorkspaceError> {
+        Ok(Self {
+            device: u64::try_from(stat.st_dev)
+                .map_err(|_| WorkspaceError::InvalidFilesystemIdentity)?,
+            inode: u64::try_from(stat.st_ino)
+                .map_err(|_| WorkspaceError::InvalidFilesystemIdentity)?,
+        })
     }
 }
 
@@ -188,7 +220,9 @@ impl ObjectStore {
         )
         .map_err(WorkspaceError::OpenObject)?;
         let stat = fs::fstat(&fd).map_err(WorkspaceError::InspectObject)?;
-        if !fs::FileType::from_raw_mode(stat.st_mode).is_file() || stat.st_nlink != 1 {
+        #[allow(clippy::useless_conversion)]
+        let link_count = u64::try_from(stat.st_nlink).map_err(|_| WorkspaceError::InvalidObject)?;
+        if !fs::FileType::from_raw_mode(stat.st_mode).is_file() || link_count != 1 {
             return Err(WorkspaceError::InvalidObject);
         }
         Ok(File::from(fd))
@@ -207,6 +241,10 @@ pub enum WorkspaceError {
     OpenRoot(rustix::io::Errno),
     #[error("could not inspect workspace root: {0}")]
     InspectRoot(rustix::io::Errno),
+    #[error("could not inspect invocation workspace: {0}")]
+    InspectRun(rustix::io::Errno),
+    #[error("filesystem identity cannot be represented safely")]
+    InvalidFilesystemIdentity,
     #[error(
         "workspace root must be owned by the effective user and inaccessible to group and other"
     )]

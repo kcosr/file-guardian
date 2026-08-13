@@ -6,8 +6,24 @@
   "exit_code": 30,
   "modified": false,
   "coverage": {
-    "initial": "incomplete",
-    "verification": "not_run"
+    "initial": {
+      "status": "incomplete",
+      "analyzers": [
+        {
+          "analyzer_id": "publication-llm",
+          "phase": "initial",
+          "eligible": 12,
+          "assigned": 12,
+          "completed": 0,
+          "excluded": 0,
+          "status": "incomplete"
+        }
+      ]
+    },
+    "verification": {
+      "status": "not_run",
+      "analyzers": []
+    }
   },
   "policy": {
     "profile_id": "publication",

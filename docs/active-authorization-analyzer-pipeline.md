@@ -194,6 +194,13 @@ reports binary, encoding, size, and read applicability explicitly. Existing
 rule-embedded `warn`, `remove`, and `recover` behavior is replaced in schema v2
 by normalized findings plus policy bindings.
 
+Invalid UTF-8 and content larger than `max_content_bytes` fail closed by
+default. A built-in analyzer may explicitly configure either condition as
+`exclude`; such an artifact is counted once in that analyzer's `excluded`
+coverage while its filename rules still run. This is intentional configured
+non-applicability, not a successful content inspection. Object read failures
+and manifest length or digest mismatches are always incomplete coverage.
+
 ## Internal Pi classifier
 
 The Pi analyzer is authorized to send sensitive staged content to the selected

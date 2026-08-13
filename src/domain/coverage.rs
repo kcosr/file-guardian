@@ -1,4 +1,6 @@
+use super::AnalyzerId;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -17,6 +19,7 @@ pub enum CoverageStatus {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AnalyzerCoverage {
+    pub analyzer_id: AnalyzerId,
     pub phase: InspectionPhase,
     pub eligible: u64,
     pub assigned: u64,
@@ -27,6 +30,7 @@ pub struct AnalyzerCoverage {
 
 impl AnalyzerCoverage {
     pub fn new(
+        analyzer_id: AnalyzerId,
         phase: InspectionPhase,
         eligible: u64,
         assigned: u64,
@@ -37,6 +41,9 @@ impl AnalyzerCoverage {
         if assigned > eligible {
             return Err(CoverageError::AssignedExceedsEligible);
         }
+        if excluded > eligible {
+            return Err(CoverageError::ExcludedExceedsEligible);
+        }
         if completed > assigned {
             return Err(CoverageError::CompletedExceedsAssigned);
         }
@@ -44,6 +51,7 @@ impl AnalyzerCoverage {
             return Err(CoverageError::FalseComplete);
         }
         Ok(Self {
+            analyzer_id,
             phase,
             eligible,
             assigned,
@@ -78,15 +86,16 @@ impl PhaseCoverage {
         status: PhaseCoverageStatus,
         mut analyzers: Vec<AnalyzerCoverage>,
     ) -> Result<Self, CoverageError> {
-        analyzers.sort_by_key(|coverage| {
-            (
-                coverage.phase,
-                coverage.eligible,
-                coverage.assigned,
-                coverage.completed,
-                coverage.excluded,
-            )
-        });
+        analyzers.sort_by(|left, right| left.analyzer_id.cmp(&right.analyzer_id));
+        let mut analyzer_ids = BTreeSet::new();
+        if let Some(duplicate) = analyzers
+            .iter()
+            .find(|coverage| !analyzer_ids.insert(coverage.analyzer_id.clone()))
+        {
+            return Err(CoverageError::DuplicateAnalyzer(
+                duplicate.analyzer_id.clone(),
+            ));
+        }
         match status {
             PhaseCoverageStatus::Complete if analyzers.iter().any(|item| !item.is_complete()) => {
                 return Err(CoverageError::FalseComplete)
@@ -108,8 +117,12 @@ pub struct RunCoverage {
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum CoverageError {
+    #[error("coverage contains duplicate analyzer {0}")]
+    DuplicateAnalyzer(AnalyzerId),
     #[error("assigned artifact count exceeds eligible artifact count")]
     AssignedExceedsEligible,
+    #[error("excluded artifact count exceeds eligible artifact count")]
+    ExcludedExceedsEligible,
     #[error("completed artifact count exceeds assigned artifact count")]
     CompletedExceedsAssigned,
     #[error("coverage cannot be complete while assigned work is incomplete")]
@@ -126,6 +139,7 @@ mod tests {
     fn complete_coverage_requires_every_assignment() {
         assert_eq!(
             AnalyzerCoverage::new(
+                AnalyzerId::new("builtin").unwrap(),
                 InspectionPhase::Initial,
                 2,
                 2,
@@ -136,6 +150,7 @@ mod tests {
             Err(CoverageError::FalseComplete)
         );
         assert!(AnalyzerCoverage::new(
+            AnalyzerId::new("builtin").unwrap(),
             InspectionPhase::Initial,
             2,
             2,
@@ -145,5 +160,52 @@ mod tests {
         )
         .unwrap()
         .is_complete());
+    }
+
+    #[test]
+    fn phase_coverage_is_canonical_by_analyzer_id() {
+        let coverage = |id| {
+            AnalyzerCoverage::new(
+                AnalyzerId::new(id).unwrap(),
+                InspectionPhase::Initial,
+                1,
+                1,
+                1,
+                0,
+                CoverageStatus::Complete,
+            )
+            .unwrap()
+        };
+
+        let phase = PhaseCoverage::new(
+            PhaseCoverageStatus::Complete,
+            vec![coverage("zeta"), coverage("alpha")],
+        )
+        .unwrap();
+        assert_eq!(phase.analyzers[0].analyzer_id.as_str(), "alpha");
+        assert_eq!(phase.analyzers[1].analyzer_id.as_str(), "zeta");
+    }
+
+    #[test]
+    fn phase_coverage_rejects_duplicate_analyzers() {
+        let coverage = || {
+            AnalyzerCoverage::new(
+                AnalyzerId::new("builtin").unwrap(),
+                InspectionPhase::Initial,
+                1,
+                1,
+                1,
+                0,
+                CoverageStatus::Complete,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            PhaseCoverage::new(PhaseCoverageStatus::Complete, vec![coverage(), coverage()]),
+            Err(CoverageError::DuplicateAnalyzer(
+                AnalyzerId::new("builtin").unwrap()
+            ))
+        );
     }
 }

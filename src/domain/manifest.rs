@@ -1,13 +1,56 @@
 use super::{Artifact, ArtifactId, ArtifactKind, Digest, PhysicalSubject, Provenance, SubjectId};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ArtifactManifest {
     pub identity: Digest,
     subjects: Vec<PhysicalSubject>,
     artifacts: Vec<Artifact>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedManifest {
+    identity: Digest,
+    subjects: Vec<PhysicalSubject>,
+    artifacts: Vec<Artifact>,
+}
+
+impl<'de> Deserialize<'de> for ArtifactManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let SerializedManifest {
+            identity,
+            subjects,
+            artifacts,
+        } = SerializedManifest::deserialize(deserializer)?;
+        let subjects_are_canonical = subjects.windows(2).all(|pair| {
+            pair[0]
+                .relative_path
+                .cmp(&pair[1].relative_path)
+                .then_with(|| pair[0].id.cmp(&pair[1].id))
+                .is_le()
+        });
+        let artifacts_are_canonical = artifacts.windows(2).all(|pair| pair[0].id <= pair[1].id);
+        if !subjects_are_canonical || !artifacts_are_canonical {
+            return Err(serde::de::Error::custom(
+                "artifact manifest entries are not in canonical order",
+            ));
+        }
+
+        let manifest = Self::new(subjects, artifacts).map_err(serde::de::Error::custom)?;
+        if manifest.identity != identity {
+            return Err(serde::de::Error::custom(
+                "artifact manifest identity does not match its entries",
+            ));
+        }
+
+        Ok(manifest)
+    }
 }
 
 impl ArtifactManifest {
@@ -224,5 +267,40 @@ mod tests {
             ArtifactManifest::new(vec![subject], vec![artifact]),
             Err(ManifestError::PhysicalArtifactMismatch(_))
         ));
+    }
+
+    #[test]
+    fn deserialization_rejects_tampered_identity() {
+        let (subject, artifact) = pair("a", "a.txt", b"a");
+        let manifest = ArtifactManifest::new(vec![subject], vec![artifact]).unwrap();
+        let mut value = serde_json::to_value(manifest).unwrap();
+        value["identity"] = serde_json::to_value(Digest::sha256(b"different")).unwrap();
+
+        assert!(serde_json::from_value::<ArtifactManifest>(value).is_err());
+    }
+
+    #[test]
+    fn deserialization_rejects_duplicate_entries() {
+        let (subject, artifact) = pair("a", "a.txt", b"a");
+        let manifest = ArtifactManifest::new(vec![subject], vec![artifact]).unwrap();
+        let mut value = serde_json::to_value(manifest).unwrap();
+        let duplicate = value["subjects"][0].clone();
+        value["subjects"].as_array_mut().unwrap().push(duplicate);
+
+        assert!(serde_json::from_value::<ArtifactManifest>(value).is_err());
+    }
+
+    #[test]
+    fn deserialization_rejects_noncanonical_order() {
+        let (subject_a, artifact_a) = pair("a", "a.txt", b"a");
+        let (subject_b, artifact_b) = pair("b", "b.txt", b"b");
+        let manifest =
+            ArtifactManifest::new(vec![subject_a, subject_b], vec![artifact_a, artifact_b])
+                .unwrap();
+        let mut value = serde_json::to_value(manifest).unwrap();
+        value["subjects"].as_array_mut().unwrap().reverse();
+        value["artifacts"].as_array_mut().unwrap().reverse();
+
+        assert!(serde_json::from_value::<ArtifactManifest>(value).is_err());
     }
 }

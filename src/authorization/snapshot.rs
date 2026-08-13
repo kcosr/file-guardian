@@ -1,3 +1,4 @@
+use super::workspace::FilesystemIdentity;
 use super::{InvocationWorkspace, StoredObject, WorkspaceError};
 use crate::domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactManifest, FileTimestamp, LogicalPath,
@@ -67,10 +68,14 @@ impl<'a> Snapshotter<'a> {
             return Err(CaptureError::SymlinkRejected);
         }
 
+        let initial_key = StatKey::from_stat(&initial)?;
+        if self.workspace.contains_identity(initial_key.identity()) {
+            return Err(CaptureError::WorkspaceTraversalRejected);
+        }
         let mut state = CaptureState {
             workspace: self.workspace,
             limits: self.limits,
-            root_device: initial.st_dev,
+            root_device: initial_key.device,
             files: 0,
             bytes: 0,
             subjects: Vec::new(),
@@ -149,20 +154,23 @@ impl CaptureState<'_> {
             });
         }
         let before_dir = fs::fstat(directory).map_err(|_| CaptureError::EnumerationFailure)?;
-        if before_dir.st_dev != self.root_device {
+        let before_key = StatKey::from_stat(&before_dir)?;
+        self.reject_workspace_identity(before_key.identity())?;
+        if before_key.device != self.root_device {
             return Err(CaptureError::FilesystemCrossingRejected);
         }
         let entries = enumerate(directory)?;
         for entry in &entries {
             let mut path = parent.to_vec();
             path.push(entry.segment.clone());
-            let kind = FileType::from_raw_mode(entry.stat.mode as _);
+            let kind = entry.stat.file_type;
             if kind.is_symlink() {
                 return Err(CaptureError::SymlinkRejected);
             }
             if entry.stat.device != self.root_device {
                 return Err(CaptureError::FilesystemCrossingRejected);
             }
+            self.reject_workspace_identity(entry.stat.identity())?;
             if kind.is_dir() {
                 let child = fs::openat(
                     directory,
@@ -204,13 +212,17 @@ impl CaptureState<'_> {
         path: Vec<PathSegment>,
         before: Stat,
     ) -> Result<(), CaptureError> {
-        if before.st_dev != self.root_device {
+        let before_key = StatKey::from_stat(&before)?;
+        self.reject_workspace_identity(before_key.identity())?;
+        if before_key.device != self.root_device {
             return Err(CaptureError::FilesystemCrossingRejected);
         }
-        if before.st_nlink != 1 {
+        if before_key.link_count != 1 {
             return Err(CaptureError::HardlinkRejected);
         }
-        if before.st_size < 0 || before.st_size as u64 > self.limits.max_file_bytes {
+        let byte_len =
+            u64::try_from(before_key.byte_len).map_err(|_| CaptureError::InvalidFileMetadata)?;
+        if byte_len > self.limits.max_file_bytes {
             return Err(CaptureError::FileSizeLimitExceeded {
                 limit: self.limits.max_file_bytes,
             });
@@ -220,11 +232,12 @@ impl CaptureState<'_> {
                 limit: self.limits.max_files,
             });
         }
-        let expected_total = self.bytes.checked_add(before.st_size as u64).ok_or(
-            CaptureError::TotalSizeLimitExceeded {
-                limit: self.limits.max_total_bytes,
-            },
-        )?;
+        let expected_total =
+            self.bytes
+                .checked_add(byte_len)
+                .ok_or(CaptureError::TotalSizeLimitExceeded {
+                    limit: self.limits.max_total_bytes,
+                })?;
         if expected_total > self.limits.max_total_bytes {
             return Err(CaptureError::TotalSizeLimitExceeded {
                 limit: self.limits.max_total_bytes,
@@ -242,7 +255,7 @@ impl CaptureState<'_> {
             .store(&mut file, self.limits.max_file_bytes)
             .map_err(map_store_error)?;
         let after = fs::fstat(&fd).map_err(|_| CaptureError::FileUnstable)?;
-        if ensure_stable(&before, &after).is_err() || stored.byte_len != before.st_size as u64 {
+        if ensure_stable(&before, &after).is_err() || stored.byte_len != byte_len {
             self.workspace.objects().remove_if_created(&stored);
             return Err(CaptureError::FileUnstable);
         }
@@ -255,7 +268,7 @@ impl CaptureState<'_> {
         let artifact_id = ArtifactId::from_suffix(format!("{ordinal:016x}"))
             .expect("ordinal is a safe identifier");
         let logical_path = LogicalPath::new(path).expect("enumerated segments form a path");
-        let identity = source_identity(&before, stored.digest);
+        let identity = source_identity(&before_key, stored.digest)?;
         let object_id: ObjectId = stored.id.clone();
         self.subjects.push(PhysicalSubject {
             id: subject_id.clone(),
@@ -280,6 +293,14 @@ impl CaptureState<'_> {
     fn rollback_objects(&self) {
         for object in &self.created_objects {
             self.workspace.objects().remove_if_created(object);
+        }
+    }
+
+    fn reject_workspace_identity(&self, identity: FilesystemIdentity) -> Result<(), CaptureError> {
+        if self.workspace.contains_identity(identity) {
+            Err(CaptureError::WorkspaceTraversalRejected)
+        } else {
+            Ok(())
         }
     }
 }
@@ -307,7 +328,7 @@ fn enumerate(directory: &OwnedFd) -> Result<Vec<Entry>, CaptureError> {
         entries.push(Entry {
             name: name.to_owned(),
             segment,
-            stat: StatKey::from_stat(&stat),
+            stat: StatKey::from_stat(&stat)?,
         });
     }
     entries.sort_by(|left, right| left.segment.cmp(&right.segment));
@@ -325,20 +346,29 @@ struct StatKey {
     modified_nanoseconds: u64,
     changed_seconds: i64,
     changed_nanoseconds: u64,
+    file_type: FileType,
 }
 
 impl StatKey {
-    fn from_stat(stat: &Stat) -> Self {
-        Self {
-            device: stat.st_dev,
-            inode: stat.st_ino,
-            mode: stat.st_mode as u64,
-            byte_len: stat.st_size,
-            link_count: stat.st_nlink,
-            modified_seconds: stat.st_mtime,
-            modified_nanoseconds: stat.st_mtime_nsec,
-            changed_seconds: stat.st_ctime,
-            changed_nanoseconds: stat.st_ctime_nsec,
+    fn from_stat(stat: &Stat) -> Result<Self, CaptureError> {
+        Ok(Self {
+            device: checked_u64(stat.st_dev)?,
+            inode: checked_u64(stat.st_ino)?,
+            mode: checked_u64(stat.st_mode)?,
+            byte_len: checked_i64(stat.st_size)?,
+            link_count: checked_u64(stat.st_nlink)?,
+            modified_seconds: checked_i64(stat.st_mtime)?,
+            modified_nanoseconds: checked_u64(stat.st_mtime_nsec)?,
+            changed_seconds: checked_i64(stat.st_ctime)?,
+            changed_nanoseconds: checked_u64(stat.st_ctime_nsec)?,
+            file_type: FileType::from_raw_mode(stat.st_mode),
+        })
+    }
+
+    fn identity(&self) -> FilesystemIdentity {
+        FilesystemIdentity {
+            device: self.device,
+            inode: self.inode,
         }
     }
 }
@@ -350,10 +380,9 @@ impl Entry {
 }
 
 fn ensure_same_entry(expected: &Stat, actual: &Stat) -> Result<(), ()> {
-    if expected.st_dev == actual.st_dev
-        && expected.st_ino == actual.st_ino
-        && FileType::from_raw_mode(expected.st_mode) == FileType::from_raw_mode(actual.st_mode)
-    {
+    let expected = StatKey::from_stat(expected).map_err(|_| ())?;
+    let actual = StatKey::from_stat(actual).map_err(|_| ())?;
+    if expected.identity() == actual.identity() && expected.file_type == actual.file_type {
         Ok(())
     } else {
         Err(())
@@ -361,10 +390,8 @@ fn ensure_same_entry(expected: &Stat, actual: &Stat) -> Result<(), ()> {
 }
 
 fn ensure_same_entry_key(expected: &StatKey, actual: &Stat) -> Result<(), ()> {
-    if expected.device == actual.st_dev
-        && expected.inode == actual.st_ino
-        && FileType::from_raw_mode(expected.mode as _) == FileType::from_raw_mode(actual.st_mode)
-    {
+    let actual = StatKey::from_stat(actual).map_err(|_| ())?;
+    if expected.identity() == actual.identity() && expected.file_type == actual.file_type {
         Ok(())
     } else {
         Err(())
@@ -372,7 +399,7 @@ fn ensure_same_entry_key(expected: &StatKey, actual: &Stat) -> Result<(), ()> {
 }
 
 fn ensure_stable(expected: &Stat, actual: &Stat) -> Result<(), ()> {
-    (StatKey::from_stat(expected) == StatKey::from_stat(actual))
+    (StatKey::from_stat(expected).map_err(|_| ())? == StatKey::from_stat(actual).map_err(|_| ())?)
         .then_some(())
         .ok_or(())
 }
@@ -383,23 +410,42 @@ fn validate_root_path(input: &Path, initial: &Stat) -> Result<(), CaptureError> 
     ensure_stable(initial, &final_path).map_err(|_| CaptureError::InputUnstable)
 }
 
-fn source_identity(stat: &Stat, digest: crate::domain::Digest) -> SourceIdentity {
-    SourceIdentity {
-        device: stat.st_dev,
-        inode: stat.st_ino,
+fn source_identity(
+    stat: &StatKey,
+    digest: crate::domain::Digest,
+) -> Result<SourceIdentity, CaptureError> {
+    Ok(SourceIdentity {
+        device: stat.device,
+        inode: stat.inode,
         file_type: SourceFileType::RegularFile,
-        byte_len: stat.st_size as u64,
-        link_count: stat.st_nlink,
-        modified: timestamp(stat.st_mtime, stat.st_mtime_nsec),
-        changed: timestamp(stat.st_ctime, stat.st_ctime_nsec),
+        byte_len: u64::try_from(stat.byte_len).map_err(|_| CaptureError::InvalidFileMetadata)?,
+        link_count: stat.link_count,
+        modified: Some(timestamp(stat.modified_seconds, stat.modified_nanoseconds)?),
+        changed: Some(timestamp(stat.changed_seconds, stat.changed_nanoseconds)?),
         content_digest: digest,
-    }
+    })
 }
 
-fn timestamp(seconds: i64, nanoseconds: u64) -> Option<FileTimestamp> {
-    u32::try_from(nanoseconds)
-        .ok()
-        .and_then(|nanoseconds| FileTimestamp::new(seconds, nanoseconds))
+// rustix's platform Stat field aliases vary across Unix targets. This is a
+// checked conversion on narrower/differently-signed targets and a no-op on
+// targets whose libc already uses u64.
+#[allow(clippy::useless_conversion)]
+fn checked_u64<T: TryInto<u64>>(value: T) -> Result<u64, CaptureError> {
+    value
+        .try_into()
+        .map_err(|_| CaptureError::InvalidFileMetadata)
+}
+
+#[allow(clippy::useless_conversion)]
+fn checked_i64<T: TryInto<i64>>(value: T) -> Result<i64, CaptureError> {
+    value
+        .try_into()
+        .map_err(|_| CaptureError::InvalidFileMetadata)
+}
+
+fn timestamp(seconds: i64, nanoseconds: u64) -> Result<FileTimestamp, CaptureError> {
+    let nanoseconds = u32::try_from(nanoseconds).map_err(|_| CaptureError::InvalidFileMetadata)?;
+    FileTimestamp::new(seconds, nanoseconds).ok_or(CaptureError::InvalidFileMetadata)
 }
 
 fn map_store_error(error: WorkspaceError) -> CaptureError {
@@ -418,6 +464,10 @@ pub enum CaptureError {
     InvalidInputName,
     #[error("input changed while it was opened")]
     InputUnstable,
+    #[error("filesystem metadata cannot be represented safely")]
+    InvalidFileMetadata,
+    #[error("the input traverses the workspace root or invocation run directory")]
+    WorkspaceTraversalRejected,
     #[error("directory enumeration failed")]
     EnumerationFailure,
     #[error("an entry changed while it was opened")]
@@ -547,6 +597,22 @@ mod tests {
         assert!(matches!(
             validate_root_path(&input, &initial),
             Err(CaptureError::InputUnstable)
+        ));
+    }
+
+    #[test]
+    fn rejects_workspace_root_and_run_directory_as_inputs() {
+        let fixture = Fixture::new("self-capture");
+        let workspace_root = fixture.root.path().join("workspaces");
+        let snapshotter = Snapshotter::new(&fixture.workspace, CaptureLimits::default());
+
+        assert!(matches!(
+            snapshotter.capture(&workspace_root),
+            Err(CaptureError::WorkspaceTraversalRejected)
+        ));
+        assert!(matches!(
+            snapshotter.capture(&workspace_root.join("run_self-capture")),
+            Err(CaptureError::WorkspaceTraversalRejected)
         ));
     }
 

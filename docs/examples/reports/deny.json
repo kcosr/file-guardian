@@ -6,8 +6,14 @@
   "exit_code": 20,
   "modified": false,
   "coverage": {
-    "initial": "complete",
-    "verification": "not_run"
+    "initial": {
+      "status": "complete",
+      "analyzers": []
+    },
+    "verification": {
+      "status": "not_run",
+      "analyzers": []
+    }
   },
   "policy": {
     "profile_id": "publication",
@@ -36,8 +42,8 @@
       "analyzer_id": "publication-rules",
       "rule_id": "private-key",
       "artifact_id": "a_07",
-      "category": "credential",
-      "severity": "critical",
+      "category": "content_pattern",
+      "severity": "high",
       "location": {
         "kind": "byte_range",
         "start": 0,

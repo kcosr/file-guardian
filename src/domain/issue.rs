@@ -1,4 +1,4 @@
-use super::{ArtifactId, InspectionPhase, SubjectId};
+use super::{AnalyzerId, ArtifactId, InspectionPhase, SubjectId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use thiserror::Error;
@@ -18,6 +18,10 @@ pub enum IssueCode {
     FileDisappeared,
     FileInserted,
     SizeLimitExceeded,
+    RequiredAnalyzerTimeout,
+    RequiredAnalyzerBudgetExceeded,
+    RequiredAnalyzerProcessFailure,
+    RequiredAnalyzerProtocolFailure,
     AnalyzerFailure,
     InvalidAnalyzerOutput,
     IncompleteCoverage,
@@ -29,9 +33,12 @@ pub struct InspectionIssue {
     pub phase: InspectionPhase,
     pub code: IssueCode,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub analyzer_id: Option<AnalyzerId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub subject_id: Option<SubjectId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<ArtifactId>,
+    #[serde(rename = "safe_message")]
     pub message: SanitizedMessage,
 }
 
@@ -99,5 +106,26 @@ mod tests {
         assert!(SanitizedMessage::new("capture failed").is_ok());
         assert!(SanitizedMessage::new("line one\nline two").is_err());
         assert!(SanitizedMessage::new("x".repeat(513)).is_err());
+    }
+
+    #[test]
+    fn issue_uses_safe_message_wire_name() {
+        let issue = InspectionIssue {
+            phase: InspectionPhase::Initial,
+            code: IssueCode::RequiredAnalyzerTimeout,
+            analyzer_id: Some(AnalyzerId::new("semantic-review").unwrap()),
+            subject_id: None,
+            artifact_id: None,
+            message: SanitizedMessage::new("Analyzer exceeded its wall-time budget").unwrap(),
+        };
+
+        let value = serde_json::to_value(issue).unwrap();
+        assert_eq!(value["code"], "required_analyzer_timeout");
+        assert_eq!(value["analyzer_id"], "semantic-review");
+        assert_eq!(
+            value["safe_message"],
+            "Analyzer exceeded its wall-time budget"
+        );
+        assert!(value.get("message").is_none());
     }
 }
