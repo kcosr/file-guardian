@@ -8,11 +8,11 @@ returns a fail-closed decision suitable for an upload, build, or publication
 workflow. Its daemon interface runs explicitly configured policy scans on a
 schedule; daemon operation is not an implicit mode.
 
-Milestone 2 is read-only. It captures immutable artifacts, runs the built-in
-rules analyzer, resolves policy, and reports `allow`, `deny`, or `error` without
-modifying the input. Later milestones add an internal LLM classifier,
-deterministic scanner delegates, verified actions, recursive archives, and
-fingerprint indexes.
+The current implementation is read-only. It captures immutable artifacts,
+executes built-in analyzers through a compiled ordered pipeline, resolves
+policy, and reports `allow`, `deny`, or `error` without modifying the input.
+Later milestones add an internal LLM classifier, deterministic scanner
+delegates, verified actions, recursive archives, and fingerprint indexes.
 
 ## Operating assumptions
 
@@ -48,7 +48,8 @@ Requirements:
   transaction.
 - A configured default profile is used when `--profile` is absent.
 - A CLI action mode may reduce configured authority from `apply` to `evaluate`
-  but must never increase it. Milestone 2 supports only evaluate execution.
+  but must never increase it. The current runtime supports only evaluate
+  execution.
 - Request IDs are bounded, log-safe correlation values; they are not paths,
   credentials, or authorization tokens.
 - Missing subcommands, invalid syntax, and help use conventional CLI behavior,
@@ -81,7 +82,7 @@ Authorization report schema `1` uses these exits:
 | Exit | Outcome | Meaning |
 | ---: | --- | --- |
 | `0` | `allow` | Complete required analysis; input is allowed and unchanged. |
-| `10` | `allow_modified` | Reserved for verified actions; unavailable in Milestone 2. |
+| `10` | `allow_modified` | Reserved for verified actions; currently unavailable. |
 | `20` | `deny` | Complete required analysis; policy rejects the transaction. |
 | `30` | `error` | The authorization result is incomplete or untrustworthy. |
 
@@ -107,6 +108,11 @@ manifest identities, analyzer runs, normalized observations, resolutions,
 centralized actions, typed issues, and bounded statistics. Golden examples live
 under [`docs/examples/reports`](docs/examples/reports).
 
+Report schema `1` remains aggregate: `pipeline_runs` records phase status and
+completed stage/analyzer counts, while per-analyzer coverage and normalized
+observations carry stable evidence. It does not expose task scheduling,
+selector candidate lists, or prior-observation projection payloads.
+
 ## Configuration schema 2
 
 Schema `2` is a strict end-state contract rather than a migration layer.
@@ -117,7 +123,8 @@ all workspace and protected roots must be safe and disjoint.
 The main configuration defines:
 
 - a private authorization workspace and named profiles;
-- ordered pipelines, stages, analyzer references, and execution settings;
+- ordered pipelines, serial or bounded-parallel stages, analyzer references,
+  selectors, bounded prior-observation projections, and execution settings;
 - built-in analyzer applicability and resource ceilings;
 - policy bindings that map observations to directives;
 - explicit `policy_scan` daemon jobs and schedules;
@@ -129,10 +136,11 @@ inside the selected configuration or otherwise change policy, paths, analyzer
 selection, or logging semantics.
 
 The shipped [`config/config.toml`](config/config.toml) is the source of truth
-for the implemented schema-v2 subset. The broader
+for an executable built-in schema-v2 pipeline. The broader
 [`docs/examples/active-authorization-v2.toml`](docs/examples/active-authorization-v2.toml)
-records the planned mature pipeline. A configured analyzer kind that is not yet
-implemented fails validation and is not skipped or reinterpreted.
+records the parse-ready mature pipeline. Pi and external-tool definitions
+validate, but neither kind is executable yet. Selecting one produces incomplete
+required coverage and exit `30`; it is never skipped or reinterpreted.
 
 ## Rule sources and built-in analysis
 
@@ -218,16 +226,17 @@ candidate counts for every analyzer.
 
 ## Explicit daemon operation
 
-The daemon runs only named, configured jobs. Milestone 2 supports
-`policy_scan` jobs with explicit targets, a profile, and an internal schedule.
+The daemon runs only named, configured jobs. It supports `policy_scan` jobs
+with explicit targets, a profile, and an internal schedule.
 Selecting one or more `--job` values limits execution to those jobs; otherwise
 all enabled jobs run.
 
-Each policy scan invokes the same evaluate-only engine used by one-shot
-authorization. It captures each configured target independently, records the
-decision through protected logging, never modifies targets, and treats capture
-or analysis uncertainty as an error. The daemon configuration states what the
-process does; simply starting File Guardian does not imply directory scanning.
+Each policy scan asynchronously invokes the same compiled evaluate-only
+pipeline engine used by one-shot authorization. It captures each configured
+target independently, records the decision through protected logging, never
+modifies targets, and treats capture or analysis uncertainty as an error. The
+daemon configuration states what the process does; simply starting File
+Guardian does not imply directory scanning.
 
 ## Logging and operations
 
@@ -240,13 +249,36 @@ process does; simply starting File Guardian does not imply directory scanning.
   semantics.
 - Unit and integration tests are deterministic and offline.
 
-## Planned analyzer pipeline
+## Analyzer pipeline
 
-The next milestone compiles ordered stages with serial or bounded-parallel
-execution and canonical aggregation. Candidate assignments and safe
-projections of prior observations are frozen before a stage begins. Required
-analyzers fail closed; optional incomplete advisory coverage is allowed only
-when explicitly configured.
+The runtime compiles ordered stages with serial or bounded-parallel execution
+and canonical aggregation. Candidate assignments and safe projections of prior
+observations are frozen before a stage begins. A failed batch stops later
+batches and stages, while aggregation remains in configured analyzer order
+rather than task-completion order.
+
+Analyzer selection is compiled from `include` and `exclude` globs plus
+`artifact_kinds`. Globs match the canonical raw bytes of root-relative logical
+path segments joined by `/`, without lossy UTF-8 conversion; separator matching
+is explicit and exclusions win. An artifact outside the selector is not
+eligible and does not increment `excluded`. The current capture produces
+`physical_file` artifacts; `archive_member` becomes useful when archive
+materialization is implemented.
+
+A stage may choose `prior_observations = "none"`, `"findings_summary"`, or
+`"all_normalized"`. `findings_summary` projects only safe normalized findings;
+`all_normalized` also includes safe normalized classifications. Every
+projection is canonically ordered and bounded by positive
+`prior_limits.max_observations` and `prior_limits.max_serialized_bytes` values.
+Limit or serialization failure stops the stage and makes required analysis
+incomplete.
+
+Schema 2 currently requires every analyzer to have `required = true`; optional
+advisory coverage has not been enabled. Eligible, assigned, completed, and
+excluded counters are explicit and disjoint. Complete coverage requires the
+analyzer to return valid output, no issue, and
+`completed + excluded == assigned`; arithmetic equality alone cannot turn a
+protocol, task, budget, or read failure into success.
 
 ### Internal Pi classifier
 
@@ -310,15 +342,17 @@ hashes detect renamed identical copies, not excerpts or modified copies.
    built-in rules.
 3. Strict schema-v2 read-only `authorize`, JSON/stdout protocol, exits `0`,
    `20`, and `30`, plus explicit evaluate-only daemon jobs.
-4. Ordered pipeline and internal Pi classifier, initially audit-only.
-5. Sandboxed deterministic password and secret scanner adapters.
-6. Centralized delete and invocation quarantine with full verification and
+4. Compiled ordered pipeline, bounded parallelism, selectors, prior-observation
+   projections, and shared one-shot/daemon execution.
+5. Internal Pi classifier, initially audit-only.
+6. Sandboxed deterministic password and secret scanner adapters.
+7. Centralized delete and invocation quarantine with full verification and
    exit `10`.
-7. Bounded recursive archive inspection.
-8. Manual exact fingerprint indexing and authorization matching.
-9. Incremental SQLite index generations, concurrent readers, freshness, and
+8. Bounded recursive archive inspection.
+9. Manual exact fingerprint indexing and authorization matching.
+10. Incremental SQLite index generations, concurrent readers, freshness, and
    optional per-index daemon schedules.
-10. Narrow deterministic redaction, then separately versioned similarity
+11. Narrow deterministic redaction, then separately versioned similarity
     fingerprints.
 
 The normative implementation contract is

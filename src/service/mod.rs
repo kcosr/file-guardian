@@ -5,49 +5,18 @@
 //! store; the live input path is retained here solely for capture and final
 //! revalidation.
 
-use crate::analyzers::BuiltinRulesAnalyzer;
 use crate::authorization::{
     CaptureError, CaptureLimits, InvocationWorkspace, Snapshot, SnapshotInputKind, Snapshotter,
 };
 use crate::domain::{
-    AnalyzerCoverage, AnalyzerId, ArtifactManifest, CoverageStatus, InspectionIssue,
-    InspectionPhase, IssueCode, NormalizedObservation, PhaseCoverage, PhaseCoverageStatus,
-    RunCoverage, RunId, SanitizedMessage,
+    AnalyzerCoverage, AnalyzerId, ArtifactManifest, InspectionIssue, InspectionPhase, IssueCode,
+    NormalizedObservation, PhaseCoverage, PhaseCoverageStatus, RunCoverage, RunId,
+    SanitizedMessage,
 };
+use crate::pipeline::{CompiledPipeline, PipelineExecution, PipelineExecutor};
 use crate::policy::{self, EvaluationDecision, PolicyBinding, PolicyResolution};
-use std::collections::BTreeSet;
 use std::path::PathBuf;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum UnsupportedAnalyzerKind {
-    External,
-    Pi,
-}
-
-#[derive(Clone, Debug)]
-pub enum AuthorizationAnalyzer {
-    Builtin(BuiltinRulesAnalyzer),
-    /// Parse-ready analyzer configuration which this milestone deliberately
-    /// refuses to execute. There is no permissive or unsandboxed fallback.
-    Unsupported {
-        id: AnalyzerId,
-        kind: UnsupportedAnalyzerKind,
-    },
-}
-
-impl AuthorizationAnalyzer {
-    fn id(&self) -> &AnalyzerId {
-        match self {
-            Self::Builtin(analyzer) => analyzer.id(),
-            Self::Unsupported { id, .. } => id,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct AuthorizationStage {
-    pub analyzers: Vec<AuthorizationAnalyzer>,
-}
+use std::sync::Arc;
 
 /// Fully compiled inputs for one authorization invocation.
 ///
@@ -60,7 +29,7 @@ pub struct AuthorizationRequest {
     pub workspace_root: PathBuf,
     pub input: PathBuf,
     pub capture_limits: CaptureLimits,
-    pub stages: Vec<AuthorizationStage>,
+    pub pipeline: CompiledPipeline,
     pub policy_bindings: Vec<PolicyBinding>,
 }
 
@@ -69,12 +38,9 @@ impl AuthorizationRequest {
         if !self.workspace_root.is_absolute() {
             return Err(RequestError::RelativeWorkspaceRoot);
         }
-        if self.stages.is_empty() || self.stages.iter().any(|stage| stage.analyzers.is_empty()) {
-            return Err(RequestError::EmptyPipeline);
-        }
-        if let Some(analyzer_id) = duplicate_analyzer(&self.stages) {
-            return Err(RequestError::DuplicateAnalyzer(analyzer_id));
-        }
+        self.pipeline
+            .validate()
+            .map_err(|_| RequestError::InvalidPipeline)?;
         Ok(())
     }
 }
@@ -83,10 +49,8 @@ impl AuthorizationRequest {
 pub enum RequestError {
     #[error("workspace root must be absolute")]
     RelativeWorkspaceRoot,
-    #[error("authorization pipeline and each stage must contain at least one analyzer")]
-    EmptyPipeline,
-    #[error("authorization pipeline contains duplicate analyzer {0}")]
-    DuplicateAnalyzer(AnalyzerId),
+    #[error("compiled authorization pipeline is invalid")]
+    InvalidPipeline,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,12 +68,6 @@ impl ServiceOutcome {
             Self::Error => 30,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PipelineExecution {
-    pub stages_completed: u64,
-    pub analyzers_completed: u64,
 }
 
 /// Safe, report-construction data returned after the private workspace has
@@ -130,12 +88,12 @@ pub struct AuthorizationResult {
 pub struct AuthorizationService;
 
 impl AuthorizationService {
-    pub fn authorize(request: AuthorizationRequest) -> AuthorizationResult {
-        authorize_with_revalidation_hook(request, || {})
+    pub async fn authorize(request: AuthorizationRequest) -> AuthorizationResult {
+        authorize_with_revalidation_hook(request, || {}).await
     }
 }
 
-fn authorize_with_revalidation_hook<F>(
+async fn authorize_with_revalidation_hook<F>(
     request: AuthorizationRequest,
     before_revalidation: F,
 ) -> AuthorizationResult
@@ -161,27 +119,42 @@ where
         }
     };
 
-    let mut result = execute_in_workspace(&request, &workspace, before_revalidation);
-    if workspace.remove().is_err() {
-        result.outcome = ServiceOutcome::Error;
-        result.issues.push(issue(
-            IssueCode::WorkspaceFailure,
-            None,
-            "invocation workspace could not be removed",
-        ));
+    let workspace = Arc::new(workspace);
+    let mut result =
+        execute_in_workspace(&request, Arc::clone(&workspace), before_revalidation).await;
+    match Arc::try_unwrap(workspace) {
+        Ok(workspace) => {
+            if workspace.remove().is_err() {
+                result.outcome = ServiceOutcome::Error;
+                result.issues.push(issue(
+                    IssueCode::WorkspaceFailure,
+                    None,
+                    "invocation workspace could not be removed",
+                ));
+            }
+        }
+        Err(_) => {
+            result.outcome = ServiceOutcome::Error;
+            result.issues.push(issue(
+                IssueCode::InternalFailure,
+                None,
+                "analyzer retained the invocation workspace after completion",
+            ));
+        }
     }
     result
 }
 
-fn execute_in_workspace<F>(
+async fn execute_in_workspace<F>(
     request: &AuthorizationRequest,
-    workspace: &InvocationWorkspace,
+    workspace: Arc<InvocationWorkspace>,
     before_revalidation: F,
 ) -> AuthorizationResult
 where
     F: FnOnce(),
 {
-    let initial = match Snapshotter::new(workspace, request.capture_limits).capture(&request.input)
+    let initial = match Snapshotter::new(workspace.as_ref(), request.capture_limits)
+        .capture(&request.input)
     {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -202,74 +175,17 @@ where
         }
     };
 
-    let mut observations = Vec::new();
-    let mut issues = Vec::new();
-    let mut coverage_rows = Vec::new();
-    let mut pipeline = PipelineExecution {
-        stages_completed: 0,
-        analyzers_completed: 0,
-    };
-    let assigned = initial.manifest.artifacts().len() as u64;
-    let mut pipeline_complete = true;
-
-    'stages: for (stage_index, stage) in request.stages.iter().enumerate() {
-        for (analyzer_index, analyzer) in stage.analyzers.iter().enumerate() {
-            match analyzer {
-                AuthorizationAnalyzer::Builtin(analyzer) => {
-                    let analysis = analyzer.analyze(
-                        InspectionPhase::Initial,
-                        &initial.manifest,
-                        workspace.objects(),
-                    );
-                    let complete = analysis.coverage.is_complete() && analysis.issues.is_empty();
-                    observations.extend(analysis.observations);
-                    issues.extend(analysis.issues);
-                    coverage_rows.push(analysis.coverage);
-                    if complete {
-                        pipeline.analyzers_completed += 1;
-                    } else {
-                        pipeline_complete = false;
-                        append_unrun_coverage(
-                            request,
-                            stage_index,
-                            analyzer_index + 1,
-                            assigned,
-                            &mut coverage_rows,
-                        );
-                        break 'stages;
-                    }
-                }
-                AuthorizationAnalyzer::Unsupported { id, kind } => {
-                    pipeline_complete = false;
-                    coverage_rows.push(incomplete_coverage(id.clone(), assigned));
-                    issues.push(issue(
-                        IssueCode::RequiredAnalyzerProcessFailure,
-                        Some(id.clone()),
-                        match kind {
-                            UnsupportedAnalyzerKind::External => {
-                                "selected external analyzer is not implemented"
-                            }
-                            UnsupportedAnalyzerKind::Pi => {
-                                "selected Pi analyzer is not implemented"
-                            }
-                        },
-                    ));
-                    append_unrun_coverage(
-                        request,
-                        stage_index,
-                        analyzer_index + 1,
-                        assigned,
-                        &mut coverage_rows,
-                    );
-                    break 'stages;
-                }
-            }
-        }
-        pipeline.stages_completed += 1;
-    }
-
-    observations.sort_by(|left, right| observation_id(left).cmp(observation_id(right)));
-    if !pipeline_complete || !issues.is_empty() {
+    let pipeline_result = PipelineExecutor::execute(
+        &request.pipeline,
+        Arc::new(initial.manifest.clone()),
+        Arc::clone(&workspace),
+    )
+    .await;
+    let observations = pipeline_result.observations;
+    let mut issues = pipeline_result.issues;
+    let coverage_rows = pipeline_result.coverage;
+    let pipeline = pipeline_result.execution;
+    if !pipeline_result.complete || !issues.is_empty() {
         return error_result(ErrorParts {
             input_kind: Some(initial.input_kind),
             initial_manifest: Some(initial.manifest),
@@ -306,24 +222,25 @@ where
     };
 
     before_revalidation();
-    let final_snapshot =
-        match Snapshotter::new(workspace, request.capture_limits).capture(&request.input) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                issues.push(capture_issue(&error, InspectionPhase::Initial));
-                return error_result(ErrorParts {
-                    input_kind: Some(initial.input_kind),
-                    initial_manifest: Some(initial.manifest),
-                    final_manifest: None,
-                    observations,
-                    resolutions: evaluation.resolutions,
-                    issues,
-                    coverage_rows,
-                    initial_status: PhaseCoverageStatus::Complete,
-                    pipeline,
-                });
-            }
-        };
+    let final_snapshot = match Snapshotter::new(workspace.as_ref(), request.capture_limits)
+        .capture(&request.input)
+    {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            issues.push(capture_issue(&error, InspectionPhase::Initial));
+            return error_result(ErrorParts {
+                input_kind: Some(initial.input_kind),
+                initial_manifest: Some(initial.manifest),
+                final_manifest: None,
+                observations,
+                resolutions: evaluation.resolutions,
+                issues,
+                coverage_rows,
+                initial_status: PhaseCoverageStatus::Complete,
+                pipeline,
+            });
+        }
+    };
 
     if final_snapshot.input_kind != initial.input_kind
         || final_snapshot.manifest != initial.manifest
@@ -359,52 +276,6 @@ where
             EvaluationDecision::Deny => ServiceOutcome::Deny,
         },
     )
-}
-
-fn append_unrun_coverage(
-    request: &AuthorizationRequest,
-    failed_stage: usize,
-    next_analyzer: usize,
-    assigned: u64,
-    rows: &mut Vec<AnalyzerCoverage>,
-) {
-    for (stage_index, stage) in request.stages.iter().enumerate().skip(failed_stage) {
-        let start = if stage_index == failed_stage {
-            next_analyzer
-        } else {
-            0
-        };
-        rows.extend(
-            stage
-                .analyzers
-                .iter()
-                .skip(start)
-                .map(|analyzer| incomplete_coverage(analyzer.id().clone(), assigned)),
-        );
-    }
-}
-
-fn incomplete_coverage(analyzer_id: AnalyzerId, assigned: u64) -> AnalyzerCoverage {
-    AnalyzerCoverage::new(
-        analyzer_id,
-        InspectionPhase::Initial,
-        assigned,
-        assigned,
-        0,
-        0,
-        CoverageStatus::Incomplete,
-    )
-    .expect("zero completed coverage is valid")
-}
-
-fn duplicate_analyzer(stages: &[AuthorizationStage]) -> Option<AnalyzerId> {
-    let mut ids = BTreeSet::new();
-    stages
-        .iter()
-        .flat_map(|stage| &stage.analyzers)
-        .map(AuthorizationAnalyzer::id)
-        .find(|id| !ids.insert((*id).clone()))
-        .cloned()
 }
 
 fn successful_result(
@@ -544,20 +415,18 @@ fn issue_for_phase(
     }
 }
 
-fn observation_id(observation: &NormalizedObservation) -> &crate::domain::ObservationId {
-    match observation {
-        NormalizedObservation::Finding(finding) => &finding.id,
-        NormalizedObservation::Classification(classification) => &classification.id,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::analyzers::{
-        BuiltinAnalyzerLimits, BuiltinContentApplicability, UnsupportedContentPolicy,
+        BuiltinAnalyzerLimits, BuiltinContentApplicability, BuiltinRulesAnalyzer,
+        UnsupportedContentPolicy,
     };
-    use crate::domain::{FindingCategory, RuleId};
+    use crate::domain::{ArtifactKind, FindingCategory, RuleId};
+    use crate::pipeline::{
+        AnalyzerImplementation, CompiledAnalyzer, CompiledStage, EligibilitySelector,
+        PriorObservationMode, ProjectionLimits, StageExecution, StageId, UnsupportedAnalyzerKind,
+    };
     use crate::policy::{BindingId, ObservationSelector, PolicyDirective};
     use crate::rules::load_rule_file;
     use std::fs;
@@ -586,15 +455,38 @@ mod tests {
             }
         }
 
-        fn request(&self, suffix: &str, analyzer: AuthorizationAnalyzer) -> AuthorizationRequest {
+        fn request(
+            &self,
+            suffix: &str,
+            analyzer_id: &str,
+            implementation: AnalyzerImplementation,
+        ) -> AuthorizationRequest {
+            let analyzer_id = AnalyzerId::new(analyzer_id).unwrap();
+            let analyzer = CompiledAnalyzer::new(
+                analyzer_id,
+                true,
+                EligibilitySelector::compile(
+                    &["**".to_string()],
+                    &[],
+                    [ArtifactKind::PhysicalFile],
+                )
+                .unwrap(),
+                implementation,
+            );
             AuthorizationRequest {
                 run_id: RunId::from_suffix(suffix).unwrap(),
                 workspace_root: self.workspace_root.clone(),
                 input: self.input.clone(),
                 capture_limits: CaptureLimits::default(),
-                stages: vec![AuthorizationStage {
-                    analyzers: vec![analyzer],
-                }],
+                pipeline: CompiledPipeline::new(vec![CompiledStage::new(
+                    StageId::new("scan").unwrap(),
+                    StageExecution::Serial,
+                    vec![analyzer],
+                    PriorObservationMode::None,
+                    ProjectionLimits::new(100, 16_384).unwrap(),
+                )
+                .unwrap()])
+                .unwrap(),
                 policy_bindings: vec![PolicyBinding {
                     id: BindingId::new("deny-secret").unwrap(),
                     selector: ObservationSelector::Finding {
@@ -609,7 +501,7 @@ mod tests {
         }
     }
 
-    fn builtin() -> AuthorizationAnalyzer {
+    fn builtin() -> AnalyzerImplementation {
         let mut rules = tempfile::NamedTempFile::new().unwrap();
         rules
             .write_all(
@@ -620,7 +512,7 @@ content_regex = "SECRET"
 "#,
             )
             .unwrap();
-        AuthorizationAnalyzer::Builtin(
+        AnalyzerImplementation::Builtin(
             BuiltinRulesAnalyzer::new(
                 "builtin",
                 load_rule_file(rules.path()).unwrap(),
@@ -637,11 +529,12 @@ content_regex = "SECRET"
         )
     }
 
-    #[test]
-    fn complete_clean_scan_allows_and_removes_workspace() {
+    #[tokio::test]
+    async fn complete_clean_scan_allows_and_removes_workspace() {
         let fixture = Fixture::new();
         fs::write(fixture.input.join("safe.txt"), "safe").unwrap();
-        let result = AuthorizationService::authorize(fixture.request("allow", builtin()));
+        let result =
+            AuthorizationService::authorize(fixture.request("allow", "builtin", builtin())).await;
         assert_eq!(result.outcome, ServiceOutcome::Allow);
         assert_eq!(result.outcome.exit_code(), 0);
         assert_eq!(
@@ -653,31 +546,32 @@ content_regex = "SECRET"
         assert!(fixture.root.path().exists());
     }
 
-    #[test]
-    fn matching_observation_is_denied_without_modifying_input() {
+    #[tokio::test]
+    async fn matching_observation_is_denied_without_modifying_input() {
         let fixture = Fixture::new();
         let target = fixture.input.join("secret.txt");
         fs::write(&target, "SECRET=value").unwrap();
         let before = fs::read(&target).unwrap();
-        let result = AuthorizationService::authorize(fixture.request("deny", builtin()));
+        let result =
+            AuthorizationService::authorize(fixture.request("deny", "builtin", builtin())).await;
         assert_eq!(result.outcome, ServiceOutcome::Deny);
         assert_eq!(result.outcome.exit_code(), 20);
         assert_eq!(result.observations.len(), 1);
         assert_eq!(fs::read(target).unwrap(), before);
     }
 
-    #[test]
-    fn unsupported_required_analyzer_fails_closed_with_incomplete_coverage() {
+    #[tokio::test]
+    async fn unsupported_required_analyzer_fails_closed_with_incomplete_coverage() {
         let fixture = Fixture::new();
         fs::write(fixture.input.join("safe.txt"), "safe").unwrap();
         let request = fixture.request(
             "unsupported",
-            AuthorizationAnalyzer::Unsupported {
-                id: AnalyzerId::new("pi").unwrap(),
+            "pi",
+            AnalyzerImplementation::Unsupported {
                 kind: UnsupportedAnalyzerKind::Pi,
             },
         );
-        let result = AuthorizationService::authorize(request);
+        let result = AuthorizationService::authorize(request).await;
         assert_eq!(result.outcome, ServiceOutcome::Error);
         assert_eq!(result.outcome.exit_code(), 30);
         assert_eq!(
@@ -692,30 +586,87 @@ content_regex = "SECRET"
         );
     }
 
-    #[test]
-    fn unbound_observation_is_an_error_not_a_deny() {
+    #[tokio::test]
+    async fn required_failure_records_every_unrun_analyzer_across_later_stages() {
+        let fixture = Fixture::new();
+        fs::write(fixture.input.join("safe.txt"), "safe").unwrap();
+        let mut request = fixture.request("later-unrun", "builtin", builtin());
+        let first_stage = request.pipeline.stages[0].clone();
+        let unsupported = |id: &str| {
+            CompiledAnalyzer::new(
+                AnalyzerId::new(id).unwrap(),
+                true,
+                EligibilitySelector::compile(
+                    &["**".to_string()],
+                    &[],
+                    [ArtifactKind::PhysicalFile],
+                )
+                .unwrap(),
+                AnalyzerImplementation::Unsupported {
+                    kind: UnsupportedAnalyzerKind::External,
+                },
+            )
+        };
+        request.pipeline = CompiledPipeline::new(vec![
+            first_stage,
+            CompiledStage::new(
+                StageId::new("failing").unwrap(),
+                StageExecution::Serial,
+                vec![unsupported("failed"), unsupported("same-stage-unrun")],
+                PriorObservationMode::None,
+                ProjectionLimits::new(100, 16_384).unwrap(),
+            )
+            .unwrap(),
+            CompiledStage::new(
+                StageId::new("later").unwrap(),
+                StageExecution::Serial,
+                vec![unsupported("later-unrun")],
+                PriorObservationMode::None,
+                ProjectionLimits::new(100, 16_384).unwrap(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+
+        let result = AuthorizationService::authorize(request).await;
+
+        assert_eq!(result.outcome, ServiceOutcome::Error);
+        assert_eq!(result.pipeline.stages_completed, 1);
+        assert_eq!(result.pipeline.analyzers_completed, 1);
+        assert_eq!(result.coverage.initial.analyzers.len(), 4);
+        assert!(result
+            .coverage
+            .initial
+            .analyzers
+            .iter()
+            .filter(|row| row.analyzer_id.as_str() != "builtin")
+            .all(|row| row.assigned == 1 && row.completed == 0));
+    }
+
+    #[tokio::test]
+    async fn unbound_observation_is_an_error_not_a_deny() {
         let fixture = Fixture::new();
         fs::write(fixture.input.join("secret.txt"), "SECRET").unwrap();
-        let mut request = fixture.request("unbound", builtin());
+        let mut request = fixture.request("unbound", "builtin", builtin());
         request.policy_bindings.clear();
-        let result = AuthorizationService::authorize(request);
+        let result = AuthorizationService::authorize(request).await;
         assert_eq!(result.outcome, ServiceOutcome::Error);
         assert!(result.resolutions.is_empty());
         assert_eq!(result.issues[0].code, IssueCode::PolicyResolutionFailure);
     }
 
-    #[test]
-    fn invalid_pipeline_is_rejected_before_workspace_creation() {
+    #[tokio::test]
+    async fn invalid_pipeline_is_rejected_before_workspace_creation() {
         let fixture = Fixture::new();
         let request = AuthorizationRequest {
             run_id: RunId::from_suffix("empty").unwrap(),
             workspace_root: fixture.workspace_root.clone(),
             input: fixture.input.clone(),
             capture_limits: CaptureLimits::default(),
-            stages: Vec::new(),
+            pipeline: CompiledPipeline { stages: Vec::new() },
             policy_bindings: Vec::new(),
         };
-        let result = AuthorizationService::authorize(request);
+        let result = AuthorizationService::authorize(request).await;
         assert_eq!(result.outcome, ServiceOutcome::Error);
         assert_eq!(result.issues[0].code, IssueCode::ConfigurationFailure);
         assert!(fs::read_dir(&fixture.workspace_root)
@@ -724,16 +675,17 @@ content_regex = "SECRET"
             .is_none());
     }
 
-    #[test]
-    fn evaluate_revalidation_failure_remains_in_initial_lifecycle_phase() {
+    #[tokio::test]
+    async fn evaluate_revalidation_failure_remains_in_initial_lifecycle_phase() {
         let fixture = Fixture::new();
         let target = fixture.input.join("changing.txt");
         fs::write(&target, "before").unwrap();
-        let request = fixture.request("revalidation-change", builtin());
+        let request = fixture.request("revalidation-change", "builtin", builtin());
 
         let result = authorize_with_revalidation_hook(request, || {
             fs::write(&target, "after").unwrap();
-        });
+        })
+        .await;
 
         assert_eq!(result.outcome, ServiceOutcome::Error);
         assert_eq!(

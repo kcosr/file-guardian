@@ -26,12 +26,14 @@ use tokio::sync::{mpsc, watch};
 async fn main() -> ExitCode {
     let args = Args::parse();
     match args.command {
-        Command::Authorize(authorize) => run_authorize_command(args.config.as_deref(), authorize),
+        Command::Authorize(authorize) => {
+            run_authorize_command(args.config.as_deref(), authorize).await
+        }
         Command::Daemon(daemon) => run_daemon_command(args.config.as_deref(), daemon).await,
     }
 }
 
-fn run_authorize_command(config_path: Option<&Path>, args: AuthorizeArgs) -> ExitCode {
+async fn run_authorize_command(config_path: Option<&Path>, args: AuthorizeArgs) -> ExitCode {
     let run_id = match secure_run_id() {
         Ok(run_id) => run_id,
         Err(error) => {
@@ -68,7 +70,7 @@ fn run_authorize_command(config_path: Option<&Path>, args: AuthorizeArgs) -> Exi
             ));
         }
     };
-    match authorize_with_config(&config, &args, run_id) {
+    match authorize_with_config(&config, &args, run_id).await {
         Ok(report) => emit_report(&report),
         Err((run_id, message)) => {
             eprintln!("authorization could not start: {message}");
@@ -82,7 +84,7 @@ fn run_authorize_command(config_path: Option<&Path>, args: AuthorizeArgs) -> Exi
     }
 }
 
-fn authorize_with_config(
+async fn authorize_with_config(
     config: &Config,
     args: &AuthorizeArgs,
     run_id: RunId,
@@ -99,7 +101,7 @@ fn authorize_with_config(
         args.path.clone(),
     )
     .map_err(|error| (run_id.clone(), error.to_string()))?;
-    let result = AuthorizationService::authorize(compiled.request);
+    let result = AuthorizationService::authorize(compiled.request).await;
     report_from_result(
         ReportContext {
             run_id: run_id.clone(),
@@ -243,15 +245,7 @@ async fn run_daemon_loop(
     if *shutdown.borrow() {
         return;
     }
-    if *run_on_start
-        && !run_daemon_scan_blocking(
-            Arc::clone(&config),
-            job.id.clone(),
-            profile.clone(),
-            target.clone(),
-        )
-        .await
-    {
+    if *run_on_start && !run_daemon_scan(&config, &job.id, profile, target).await {
         let _ = failed.send(job.id).await;
         return;
     }
@@ -271,38 +265,19 @@ async fn run_daemon_loop(
         if *shutdown.borrow() {
             return;
         }
-        if !run_daemon_scan_blocking(
-            Arc::clone(&config),
-            job.id.clone(),
-            profile.clone(),
-            target.clone(),
-        )
-        .await
-        {
+        if !run_daemon_scan(&config, &job.id, profile, target).await {
             let _ = failed.send(job.id).await;
             return;
         }
     }
 }
 
-async fn run_daemon_scan_blocking(
-    config: Arc<Config>,
-    job_id: String,
-    profile: String,
-    target: DaemonTarget,
+async fn run_daemon_scan(
+    config: &Config,
+    job_id: &str,
+    profile: &str,
+    target: &DaemonTarget,
 ) -> bool {
-    match tokio::task::spawn_blocking(move || run_daemon_scan(&config, &job_id, &profile, &target))
-        .await
-    {
-        Ok(healthy) => healthy,
-        Err(error) => {
-            tracing::error!("daemon policy scan task failed: {error}");
-            false
-        }
-    }
-}
-
-fn run_daemon_scan(config: &Config, job_id: &str, profile: &str, target: &DaemonTarget) -> bool {
     let targets = match resolve_targets(target) {
         Ok(targets) if !targets.is_empty() => targets,
         Ok(_) => {
@@ -331,7 +306,7 @@ fn run_daemon_scan(config: &Config, job_id: &str, profile: &str, target: &Daemon
             action_mode: Some(ActionMode::Evaluate),
             path,
         };
-        let report = match authorize_with_config(config, &args, run_id) {
+        let report = match authorize_with_config(config, &args, run_id).await {
             Ok(report) => report,
             Err((_, error)) => {
                 tracing::error!(job_id, "daemon authorization could not start: {error}");

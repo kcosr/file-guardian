@@ -8,16 +8,19 @@ Authorization report schema: `1`
 
 ## Purpose
 
-File Guardian will support an active, one-shot authorization workflow in
-addition to passive monitoring. A caller prepares a private staging tree,
+File Guardian supports an active, one-shot authorization workflow in addition
+to explicit scheduled policy scans. A caller prepares a private staging tree,
 invokes File Guardian, and publishes that exact tree only when the process exit
 status and the JSON report both say it is allowed.
 
-The first implementation milestone covers phases 0 through 3: the contract,
-immutable inspection, read-only authorization, and an internal Pi-based LLM
-classifier. Deterministic password and secret scanners are the next pipeline
-extension. Safe actions, archives, and fingerprint indexes follow without
-changing the core pipeline or report meanings.
+The implemented foundation includes the contract, immutable inspection,
+read-only authorization, and the generic Phase 3 pipeline engine: compiled
+ordered stages, bounded parallelism, immutable artifact selection, bounded
+prior-observation projections, and shared one-shot/daemon execution. The
+internal Pi-based LLM classifier is the next milestone, followed by
+deterministic password and secret scanners. Safe actions, archives, and
+fingerprint indexes follow without changing the core pipeline or report
+meanings.
 
 ## Caller contract
 
@@ -89,6 +92,12 @@ Report schema `1` contains these top-level fields:
 - `pipeline_runs`, normalized `observations`, policy `resolutions`, centralized
   `actions`, typed `issues`, and bounded `statistics`.
 
+Schema `1` deliberately remains an aggregate authorization report. Its
+`pipeline_runs` entries summarize phase status and completed stage/analyzer
+counts; it does not expose internal task scheduling, selector candidates, or
+prior-observation projection payloads. Per-analyzer coverage and normalized
+observations remain the stable evidence surfaces.
+
 Issues discovered before capture or analyzer execution use the `initial` phase;
 the typed issue code distinguishes configuration, input, workspace, policy, and
 pipeline failures. This keeps the two-phase report vocabulary closed while
@@ -144,7 +153,8 @@ explicit policy and otherwise become typed coverage failures.
 
 All analyzers read the same captured objects. They never reopen live staging.
 Artifact IDs are host-generated; logical paths are root-relative segment arrays
-for reporting only and are never reused as unchecked operating-system paths.
+for selector matching and reporting and are never reused as unchecked
+operating-system paths.
 
 ## Domain separation
 
@@ -181,15 +191,43 @@ immutable manifest
 Initial stage rules:
 
 - Each analyzer appears at most once.
-- Applicability is compiled from configuration, not analyzer output.
+- Applicability is compiled from configuration, not analyzer output. Each
+  analyzer has include/exclude globs and artifact-kind selectors.
 - Candidate assignments and prior-observation projections are frozen before a
   stage starts.
 - Parallel completion order never changes report order or policy resolution.
-- `required = true` is the default. A required failure stops the pipeline and
-  yields `30` before actions.
-- Optional analyzers are advisory only when configuration explicitly permits
-  incomplete advisory coverage.
-- Every required analyzer reruns during post-action verification.
+- Serial stages execute one analyzer at a time. Parallel stages execute
+  configured-order batches no larger than `max_concurrency`; a failed batch
+  prevents later batches and stages from starting.
+- `required = true` is the default and the only accepted setting in the
+  current schema. A failure stops the pipeline and yields `30` before actions.
+- Optional advisory coverage is reserved but is not currently enabled.
+- Once actions exist, every required analyzer reruns during post-action
+  verification.
+
+Selector globs operate on canonical raw logical-path bytes: path segments are
+joined with `/`, glob separators remain literal, and no lossy UTF-8 conversion
+is used. This permits wildcard selection of non-UTF-8 names without changing
+their identity. An artifact must match an include and no exclude; exclusions
+win. Artifacts outside the selected kinds or globs are outside the eligible set
+and do not increment `excluded`. The current capture creates
+`physical_file` artifacts; `archive_member` selection becomes active with the
+archive phase.
+
+`prior_observations` has three closed values:
+
+- `none` supplies an empty projection.
+- `findings_summary` supplies canonically ordered, explicitly safe normalized
+  finding fields and omits classifications.
+- `all_normalized` supplies those findings plus safe normalized classification
+  fields.
+
+The projection is built from completed earlier stages before any analyzer in
+the next stage starts. `prior_limits.max_observations` and
+`prior_limits.max_serialized_bytes` must be positive and bound both its count
+and canonical serialized form. Overflow or serialization failure stops the
+stage as incomplete required analysis. The obsolete `all_summary` spelling is
+not accepted.
 
 Coverage records the inspection phase and eligible, assigned, completed, and
 excluded candidate counts. An analyzer's inability to inspect an assigned
@@ -203,6 +241,12 @@ other execution failures keep the analyzer and phase `incomplete` even when all
 assigned artifacts are arithmetically accounted for. A `complete` phase requires
 every analyzer row to be complete. Excluded artifacts never also increment
 `completed`.
+
+Pi and external-tool analyzer definitions are accepted by the strict parser so
+the end-state configuration has one shape, but their runners are not yet
+implemented. If either kind is selected, the analyzer produces incomplete
+coverage and a typed process failure, and the authorization returns exit `30`.
+Unsupported analyzers are never silently skipped.
 
 ## Built-in rules
 
@@ -220,6 +264,8 @@ non-applicability, not a successful content inspection. Object read failures
 and manifest length or digest mismatches are always incomplete coverage.
 
 ## Internal Pi classifier
+
+Status: specified and parse-ready; execution is not implemented yet.
 
 The Pi analyzer is authorized to send sensitive staged content to the selected
 internal model. Its capabilities remain read-only and transaction-scoped.
@@ -301,6 +347,8 @@ finding.
 
 ## Deterministic external analyzers
 
+Status: specified and parse-ready; execution is not implemented yet.
+
 Password, credential, and secret scanners are the next analyzer kind. File
 Guardian uses reviewed adapters rather than accepting arbitrary native output:
 
@@ -376,8 +424,10 @@ a workspace is created.
 
 The strict mature example is
 [`examples/active-authorization-v2.toml`](examples/active-authorization-v2.toml).
-Early phases may support its built-in and Pi subset, but they must not reinterpret
-or alias fields. Unsupported configured analyzer kinds fail validation.
+The generic pipeline, selectors, and projections in it are implemented. Pi and
+external-tool definitions parse and validate, but selecting either unsupported
+runner fails execution closed with exit `30`; fields are never reinterpreted or
+aliased.
 
 Pipeline identity covers stage order/execution, analyzer definitions and
 selectors, required status, built-in rule identity, Pi executable/model/thinking
@@ -412,13 +462,23 @@ through explicit daemon jobs needed at the v2 cutover.
 Gate: an external caller can reliably gate a staged tree and operational
 uncertainty cannot produce `0` or `20`.
 
-### Phase 3: Pipeline and Pi classifier
+### Phase 3a: Generic analyzer pipeline
 
-Add compiled ordered stages, bounded parallel execution, canonical
-aggregation, prior-observation projections, Pi process lifecycle, read-only
-artifact tools, instruction identity, strict structured output, normalized
-classifications, and policy bindings. Start audit-only and enable enforcement
-only after documented acceptance criteria.
+Implemented: compiled ordered stages, serial and bounded-parallel execution,
+canonical aggregation, byte-safe immutable artifact selectors, bounded
+prior-observation projections, explicit coverage, and the same asynchronous
+engine for one-shot and daemon policy scans.
+
+Gate: fixed input and configuration produce identical assignments,
+observations, coverage, and aggregate report ordering regardless of parallel
+task completion order; every required failure yields `30`.
+
+### Phase 3b: Pi classifier
+
+Add Pi process lifecycle, read-only artifact tools, instruction identity,
+strict structured output, normalized classifications, and policy bindings.
+Start audit-only and enable enforcement only after documented acceptance
+criteria.
 
 Gate: the approved internal model classifies a staged tree through read-only
 artifact capabilities; every required Pi failure yields `30`; audit

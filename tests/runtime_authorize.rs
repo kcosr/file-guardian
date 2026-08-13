@@ -165,6 +165,132 @@ fn authorize_denies_matching_input_with_exit_twenty() {
 }
 
 #[test]
+fn analyzer_selector_excludes_artifacts_before_assignment() {
+    let fixture = Fixture::new("deny", "payload.blocked");
+    let value = fs::read_to_string(&fixture.config).unwrap().replace(
+        &format!(
+            "rule_files = [\"{}\"]",
+            fixture._temp.path().join("rules.toml").display()
+        ),
+        &format!(
+            r#"rule_files = ["{}"]
+
+[analyzers.selection]
+include = ["**"]
+exclude = ["*.blocked"]
+artifact_kinds = ["physical_file"]"#,
+            fixture._temp.path().join("rules.toml").display()
+        ),
+    );
+    fs::write(&fixture.config, value).unwrap();
+
+    let output = fixture.authorize(&[]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = report(&output);
+    assert_eq!(report.outcome, AuthorizationOutcome::Allow);
+    assert!(report.observations.is_empty());
+    assert_eq!(report.coverage.initial.analyzers[0].eligible, 0);
+    assert_eq!(report.coverage.initial.analyzers[0].assigned, 0);
+}
+
+#[test]
+fn parallel_stage_runs_every_selected_analyzer() {
+    let fixture = Fixture::new("deny", "payload.blocked");
+    let value = fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace(
+            "id = \"rules\"\nanalyzers = [\"rules\"]",
+            "id = \"rules\"\nexecution = \"parallel\"\nmax_concurrency = 2\nanalyzers = [\"rules\", \"rules_two\"]",
+        )
+        .replace(
+            "[[policy_bindings]]",
+            &format!(
+                r#"[[analyzers]]
+id = "rules_two"
+kind = "builtin_rules"
+rule_files = ["{}"]
+
+[[policy_bindings]]
+id = "blocked-two"
+profile = "publication"
+analyzer = "rules_two"
+rule = "*"
+directive = "deny"
+
+[[policy_bindings]]"#,
+                fixture._temp.path().join("rules.toml").display()
+            ),
+        );
+    fs::write(&fixture.config, value).unwrap();
+
+    let output = fixture.authorize(&[]);
+    assert_eq!(output.status.code(), Some(20));
+    let report = report(&output);
+    assert_eq!(report.outcome, AuthorizationOutcome::Deny);
+    assert_eq!(report.observations.len(), 2);
+    assert_eq!(report.coverage.initial.analyzers.len(), 2);
+    assert_eq!(report.pipeline_runs[0].analyzers_completed, 2);
+}
+
+#[test]
+fn later_stage_prior_projection_is_bounded_and_fails_closed() {
+    let fixture = Fixture::new("deny", "payload.blocked");
+    let value = fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace(
+            "id = \"rules\"\nanalyzers = [\"rules\"]",
+            r#"id = "rules"
+analyzers = ["rules"]
+
+[[pipelines.stages]]
+id = "second"
+analyzers = ["rules_two"]
+prior_observations = "findings_summary"
+
+[pipelines.stages.prior_limits]
+max_observations = 100
+max_serialized_bytes = 4096"#,
+        )
+        .replace(
+            "[[policy_bindings]]",
+            &format!(
+                r#"[[analyzers]]
+id = "rules_two"
+kind = "builtin_rules"
+rule_files = ["{}"]
+
+[[policy_bindings]]
+id = "blocked-two"
+profile = "publication"
+analyzer = "rules_two"
+rule = "*"
+directive = "deny"
+
+[[policy_bindings]]"#,
+                fixture._temp.path().join("rules.toml").display()
+            ),
+        );
+    fs::write(&fixture.config, &value).unwrap();
+
+    let complete = fixture.authorize(&[]);
+    assert_eq!(complete.status.code(), Some(20));
+    let complete = report(&complete);
+    assert_eq!(complete.outcome, AuthorizationOutcome::Deny);
+    assert_eq!(complete.pipeline_runs[0].stages_completed, 2);
+
+    fs::write(
+        &fixture.config,
+        value.replace("max_serialized_bytes = 4096", "max_serialized_bytes = 1"),
+    )
+    .unwrap();
+    let overflow = fixture.authorize(&[]);
+    assert_eq!(overflow.status.code(), Some(30));
+    let overflow = report(&overflow);
+    assert_eq!(overflow.outcome, AuthorizationOutcome::Error);
+    assert_eq!(overflow.pipeline_runs[0].stages_completed, 1);
+}
+
+#[test]
 fn valid_authorize_syntax_reports_configuration_error_as_json() {
     let temp = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_file-guardian"))
@@ -340,6 +466,50 @@ filename_glob = "*.different"
     assert_eq!(
         second_policy.pipeline_identity,
         third_policy.pipeline_identity
+    );
+
+    let value = fs::read_to_string(&fixture.config).unwrap().replace(
+        &format!(
+            "rule_files = [\"{}\"]",
+            fixture._temp.path().join("rules.toml").display()
+        ),
+        &format!(
+            r#"rule_files = ["{}"]
+
+[analyzers.selection]
+include = ["**"]
+exclude = ["vendor/**"]
+artifact_kinds = ["physical_file"]"#,
+            fixture._temp.path().join("rules.toml").display()
+        ),
+    );
+    fs::write(&fixture.config, &value).unwrap();
+    let selector_policy = report(&fixture.authorize(&[])).policy.unwrap();
+    assert_ne!(
+        third_policy.pipeline_identity,
+        selector_policy.pipeline_identity
+    );
+
+    let value = value.replace(
+        "id = \"rules\"\nanalyzers = [\"rules\"]",
+        "id = \"rules\"\nexecution = \"parallel\"\nmax_concurrency = 2\nanalyzers = [\"rules\"]",
+    );
+    fs::write(&fixture.config, &value).unwrap();
+    let execution_policy = report(&fixture.authorize(&[])).policy.unwrap();
+    assert_ne!(
+        selector_policy.pipeline_identity,
+        execution_policy.pipeline_identity
+    );
+
+    let value = value.replace(
+        "analyzers = [\"rules\"]",
+        "analyzers = [\"rules\"]\n\n[pipelines.stages.prior_limits]\nmax_observations = 77\nmax_serialized_bytes = 4096",
+    );
+    fs::write(&fixture.config, value).unwrap();
+    let limits_policy = report(&fixture.authorize(&[])).policy.unwrap();
+    assert_ne!(
+        execution_policy.pipeline_identity,
+        limits_policy.pipeline_identity
     );
 }
 

@@ -99,6 +99,10 @@ pub enum BuiltinAnalyzerError {
     DuplicateRule(RuleId),
     #[error("max_content_bytes and max_findings must both be nonzero")]
     InvalidLimits,
+    #[error("built-in analyzer artifact assignment is not in canonical order")]
+    AssignmentNotCanonical,
+    #[error("built-in analyzer assignment references unknown artifact {0}")]
+    UnknownAssignedArtifact(ArtifactId),
 }
 
 #[derive(Clone, Debug)]
@@ -173,13 +177,30 @@ impl BuiltinRulesAnalyzer {
         &self.id
     }
 
+    /// Inspects exactly the assigned artifacts.
+    ///
+    /// Assignments are an executor-owned contract and must contain known
+    /// artifact identifiers in strictly increasing canonical order. Empty
+    /// assignments are valid and produce complete zero coverage.
     pub fn analyze(
         &self,
         phase: InspectionPhase,
         manifest: &ArtifactManifest,
+        assignment: &[ArtifactId],
         reader: &impl ArtifactReader,
-    ) -> BuiltinRulesResult {
-        let assigned = manifest.artifacts().len() as u64;
+    ) -> Result<BuiltinRulesResult, BuiltinAnalyzerError> {
+        if assignment.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(BuiltinAnalyzerError::AssignmentNotCanonical);
+        }
+        let artifacts = assignment
+            .iter()
+            .map(|artifact_id| {
+                manifest.artifact(artifact_id).ok_or_else(|| {
+                    BuiltinAnalyzerError::UnknownAssignedArtifact(artifact_id.clone())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let assigned = assignment.len() as u64;
         let content_required = self.rules.iter().any(|rule| rule.content_regex.is_some());
         let filename_required = self.rules.iter().any(|rule| rule.filename_glob.is_some());
         let mut findings = Vec::new();
@@ -187,13 +208,6 @@ impl BuiltinRulesAnalyzer {
         let mut completed = 0_u64;
         let mut excluded = 0_u64;
         let mut limit_reached = false;
-
-        let mut artifacts: Vec<_> = manifest.artifacts().iter().collect();
-        artifacts.sort_by(|left, right| {
-            logical_path(left)
-                .cmp(logical_path(right))
-                .then_with(|| left.id.cmp(&right.id))
-        });
 
         for artifact in artifacts {
             if limit_reached {
@@ -409,11 +423,11 @@ impl BuiltinRulesAnalyzer {
         )
         .expect("analyzer coverage counters are internally consistent");
 
-        BuiltinRulesResult {
+        Ok(BuiltinRulesResult {
             observations,
             issues,
             coverage,
-        }
+        })
     }
 }
 
@@ -566,6 +580,22 @@ mod tests {
         BuiltinRulesAnalyzer::new("builtin", rules, BuiltinAnalyzerLimits::default()).unwrap()
     }
 
+    fn analyze_all(
+        analyzer: &BuiltinRulesAnalyzer,
+        phase: InspectionPhase,
+        manifest: &ArtifactManifest,
+        reader: &impl ArtifactReader,
+    ) -> BuiltinRulesResult {
+        let assignment = manifest
+            .artifacts()
+            .iter()
+            .map(|artifact| artifact.id.clone())
+            .collect::<Vec<_>>();
+        analyzer
+            .analyze(phase, manifest, &assignment, reader)
+            .unwrap()
+    }
+
     #[test]
     fn returns_every_filename_and_content_occurrence_in_canonical_order() {
         let (manifest, reader) = manifest(&[("credentials.secret", b"token=one token=two")]);
@@ -574,7 +604,7 @@ mod tests {
             rule("a-secret-name", Some("*.secret"), None),
         ]);
 
-        let result = analyzer.analyze(InspectionPhase::Initial, &manifest, &reader);
+        let result = analyze_all(&analyzer, InspectionPhase::Initial, &manifest, &reader);
 
         assert!(result.coverage.is_complete());
         assert!(result.issues.is_empty());
@@ -598,8 +628,91 @@ mod tests {
             rule("beta", None, Some("beta")),
         ]);
 
-        let result = analyzer.analyze(InspectionPhase::Initial, &manifest, &reader);
+        let result = analyze_all(&analyzer, InspectionPhase::Initial, &manifest, &reader);
         assert_eq!(result.observations.len(), 3);
+    }
+
+    #[test]
+    fn inspects_only_the_explicit_artifact_assignment() {
+        let (manifest, reader) = manifest(&[
+            ("unassigned.secret", b"token=unassigned"),
+            ("assigned.txt", b"clean"),
+        ]);
+        let analyzer = analyzer(vec![
+            rule("secret-name", Some("*.secret"), None),
+            rule("token", None, Some("token=")),
+        ]);
+        let assignment = vec![manifest.artifacts()[1].id.clone()];
+
+        let result = analyzer
+            .analyze(InspectionPhase::Initial, &manifest, &assignment, &reader)
+            .unwrap();
+
+        assert!(result.observations.is_empty());
+        assert!(result.issues.is_empty());
+        assert!(result.coverage.is_complete());
+        assert_eq!(result.coverage.eligible, 1);
+        assert_eq!(result.coverage.assigned, 1);
+        assert_eq!(result.coverage.completed, 1);
+    }
+
+    #[test]
+    fn empty_assignment_has_complete_zero_coverage() {
+        let (manifest, reader) = manifest(&[("unassigned.secret", b"token=unassigned")]);
+        let analyzer = analyzer(vec![
+            rule("secret-name", Some("*.secret"), None),
+            rule("token", None, Some("token=")),
+        ]);
+
+        let result = analyzer
+            .analyze(InspectionPhase::Initial, &manifest, &[], &reader)
+            .unwrap();
+
+        assert!(result.observations.is_empty());
+        assert!(result.issues.is_empty());
+        assert!(result.coverage.is_complete());
+        assert_eq!(result.coverage.eligible, 0);
+        assert_eq!(result.coverage.assigned, 0);
+        assert_eq!(result.coverage.completed, 0);
+        assert_eq!(result.coverage.excluded, 0);
+    }
+
+    #[test]
+    fn rejects_unknown_duplicate_and_noncanonical_assignments() {
+        let (manifest, reader) = manifest(&[("first", b"one"), ("second", b"two")]);
+        let analyzer = analyzer(vec![rule("content", None, Some("."))]);
+        let first = manifest.artifacts()[0].id.clone();
+        let second = manifest.artifacts()[1].id.clone();
+
+        assert!(matches!(
+            analyzer.analyze(
+                InspectionPhase::Initial,
+                &manifest,
+                &[first.clone(), first],
+                &reader,
+            ),
+            Err(BuiltinAnalyzerError::AssignmentNotCanonical)
+        ));
+        assert!(matches!(
+            analyzer.analyze(
+                InspectionPhase::Initial,
+                &manifest,
+                &[second, manifest.artifacts()[0].id.clone()],
+                &reader,
+            ),
+            Err(BuiltinAnalyzerError::AssignmentNotCanonical)
+        ));
+
+        let unknown = ArtifactId::from_suffix("9999").unwrap();
+        assert!(matches!(
+            analyzer.analyze(
+                InspectionPhase::Initial,
+                &manifest,
+                std::slice::from_ref(&unknown),
+                &reader,
+            ),
+            Err(BuiltinAnalyzerError::UnknownAssignedArtifact(id)) if id == unknown
+        ));
     }
 
     #[test]
@@ -607,8 +720,9 @@ mod tests {
         let (manifest, reader) = manifest(&[("z.txt", b"hit"), ("a.txt", b"hit")]);
         let analyzer = analyzer(vec![rule("match", None, Some("hit"))]);
 
-        let initial = analyzer.analyze(InspectionPhase::Initial, &manifest, &reader);
-        let verification = analyzer.analyze(InspectionPhase::Verification, &manifest, &reader);
+        let initial = analyze_all(&analyzer, InspectionPhase::Initial, &manifest, &reader);
+        let verification =
+            analyze_all(&analyzer, InspectionPhase::Verification, &manifest, &reader);
 
         let initial_ids: Vec<_> = initial
             .observations
@@ -635,7 +749,7 @@ mod tests {
         let (manifest, reader) = manifest(&[("input.txt", b"content")]);
         let analyzer = analyzer(vec![rule("start", None, Some("^"))]);
 
-        let result = analyzer.analyze(InspectionPhase::Initial, &manifest, &reader);
+        let result = analyze_all(&analyzer, InspectionPhase::Initial, &manifest, &reader);
         let NormalizedObservation::Finding(finding) = &result.observations[0] else {
             unreachable!();
         };
@@ -650,9 +764,7 @@ mod tests {
         let analyzer = analyzer(vec![rule("token", None, Some("token=[a-z-]+"))]);
 
         let json = serde_json::to_string(
-            &analyzer
-                .analyze(InspectionPhase::Initial, &manifest, &reader)
-                .observations,
+            &analyze_all(&analyzer, InspectionPhase::Initial, &manifest, &reader).observations,
         )
         .unwrap();
         assert!(!json.contains("do-not-report-this"));
@@ -665,7 +777,7 @@ mod tests {
         let replaced_live_source = b"clean replacement";
         let analyzer = analyzer(vec![rule("captured", None, Some("captured-secret"))]);
 
-        let result = analyzer.analyze(InspectionPhase::Initial, &manifest, &reader);
+        let result = analyze_all(&analyzer, InspectionPhase::Initial, &manifest, &reader);
         assert_eq!(result.observations.len(), 1);
         assert_eq!(replaced_live_source, b"clean replacement");
     }
@@ -684,19 +796,29 @@ mod tests {
         .unwrap();
 
         let (invalid_manifest, invalid_reader) = manifest(&[("invalid", &[0xff])]);
-        let invalid =
-            analyzer.analyze(InspectionPhase::Initial, &invalid_manifest, &invalid_reader);
+        let invalid = analyze_all(
+            &analyzer,
+            InspectionPhase::Initial,
+            &invalid_manifest,
+            &invalid_reader,
+        );
         assert!(!invalid.coverage.is_complete());
         assert_eq!(invalid.issues[0].code, IssueCode::InvalidAnalyzerOutput);
         assert_eq!(invalid.issues[0].analyzer_id.as_ref(), Some(analyzer.id()));
 
         let (large_manifest, large_reader) = manifest(&[("large", b"four")]);
-        let large = analyzer.analyze(InspectionPhase::Initial, &large_manifest, &large_reader);
+        let large = analyze_all(
+            &analyzer,
+            InspectionPhase::Initial,
+            &large_manifest,
+            &large_reader,
+        );
         assert!(!large.coverage.is_complete());
         assert_eq!(large.issues[0].code, IssueCode::SizeLimitExceeded);
 
         let (missing_manifest, _) = manifest(&[("missing", b"one")]);
-        let missing = analyzer.analyze(
+        let missing = analyze_all(
+            &analyzer,
             InspectionPhase::Initial,
             &missing_manifest,
             &MemoryReader::default(),
@@ -705,8 +827,12 @@ mod tests {
         assert_eq!(missing.issues[0].code, IssueCode::AnalyzerFailure);
 
         let (limited_manifest, limited_reader) = manifest(&[("limited", b"aaa")]);
-        let limited =
-            analyzer.analyze(InspectionPhase::Initial, &limited_manifest, &limited_reader);
+        let limited = analyze_all(
+            &analyzer,
+            InspectionPhase::Initial,
+            &limited_manifest,
+            &limited_reader,
+        );
         assert_eq!(limited.observations.len(), 1);
         assert!(!limited.coverage.is_complete());
         assert_eq!(limited.issues[0].code, IssueCode::SizeLimitExceeded);
@@ -733,7 +859,7 @@ mod tests {
         let (manifest, reader) =
             manifest(&[("invalid.secret", &[0xff]), ("large.secret", b"four")]);
 
-        let result = analyzer.analyze(InspectionPhase::Initial, &manifest, &reader);
+        let result = analyze_all(&analyzer, InspectionPhase::Initial, &manifest, &reader);
 
         assert!(result.coverage.is_complete());
         assert_eq!(result.coverage.completed, 0);
@@ -764,7 +890,8 @@ mod tests {
         .unwrap();
         let (missing_manifest, _) = manifest(&[("missing", b"one")]);
 
-        let result = analyzer.analyze(
+        let result = analyze_all(
+            &analyzer,
             InspectionPhase::Initial,
             &missing_manifest,
             &MemoryReader::default(),
@@ -777,8 +904,12 @@ mod tests {
         let (corrupt_manifest, mut corrupt_reader) = manifest(&[("corrupt", b"one")]);
         let object_id = corrupt_manifest.artifacts()[0].object_id.clone();
         corrupt_reader.objects.insert(object_id, b"two".to_vec());
-        let corrupt =
-            analyzer.analyze(InspectionPhase::Initial, &corrupt_manifest, &corrupt_reader);
+        let corrupt = analyze_all(
+            &analyzer,
+            InspectionPhase::Initial,
+            &corrupt_manifest,
+            &corrupt_reader,
+        );
         assert!(!corrupt.coverage.is_complete());
         assert_eq!(corrupt.coverage.excluded, 0);
         assert_eq!(corrupt.issues[0].code, IssueCode::AnalyzerFailure);

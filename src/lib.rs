@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod logging;
+pub mod pipeline;
 pub mod policy;
 pub mod report;
 pub mod rules;

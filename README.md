@@ -6,8 +6,8 @@ machine-readable report to decide whether that exact tree may be published. It
 can also run configured policy scans as explicit daemon jobs.
 
 The current implementation is evaluate-only: it inspects an immutable private
-copy, applies built-in filename and content rules, and never modifies the
-caller-owned staging tree.
+copy through a compiled, ordered analyzer pipeline, applies built-in filename
+and content rules, and never modifies the caller-owned staging tree.
 
 > File Guardian is a policy gate, not a filesystem access-control boundary. The
 > caller must prevent every other writer from changing a staging tree while it
@@ -20,15 +20,23 @@ caller-owned staging tree.
 - Descriptor-anchored capture into a private, invocation-scoped workspace.
 - Immutable SHA-256-addressed objects shared by all analysis in the run.
 - Built-in filename glob and text-content regex matching.
+- Compiled multi-stage pipelines with serial or bounded-parallel stage
+  execution and deterministic aggregation.
+- Per-analyzer, byte-safe include/exclude selectors over immutable logical
+  paths, with explicit eligible/assigned/completed/excluded coverage.
+- Bounded projections of prior normalized observations for later stages.
 - Strict schema-v2 configuration and action-free TOML rule files.
 - Policy bindings that resolve findings independently of rule detection.
 - Exactly one compact JSON report on stdout for a recognized authorization
   request; diagnostics and logs stay on stderr or in protected log files.
-- Explicit `policy_scan` daemon jobs with configured targets and schedules.
+- Explicit asynchronous `policy_scan` daemon jobs with configured targets and
+  schedules, using the same pipeline engine as one-shot authorization.
 
-The Pi classifier, deterministic password and secret scanner delegates,
-delete/quarantine actions, recursive archive inspection, and exact fingerprint
-indexes are planned. See [Roadmap](#roadmap).
+Pi classifier and external-tool definitions are parse-ready but are not yet
+executable; selecting either kind fails the authorization closed with exit
+`30`. Deterministic password and secret scanner delegates, delete/quarantine
+actions, recursive archive inspection, and exact fingerprint indexes remain
+planned. See [Roadmap](#roadmap).
 
 ## Install
 
@@ -127,11 +135,26 @@ Schema v2 defines:
   `quarantine` directives;
 - explicit daemon jobs and logging settings.
 
+Each stage chooses `serial` or bounded `parallel` execution. An analyzer's
+`selection.include`, `selection.exclude`, and `selection.artifact_kinds`
+compile its assignment from the immutable manifest before execution. Matching
+uses canonical raw logical-path bytes with `/` separators, so non-UTF-8 path
+segments do not require lossy conversion; exclusions win. Artifacts outside a
+selector are not eligible and do not count as analyzer exclusions.
+
+Later stages may request `prior_observations = "none"`,
+`"findings_summary"`, or `"all_normalized"`. The host constructs a canonical,
+safe projection before the stage starts and enforces the stage's
+`prior_limits.max_observations` and `prior_limits.max_serialized_bytes`.
+Exceeding either limit is incomplete required analysis and therefore exit
+`30`.
+
 The shipped [sample configuration](config/config.toml) is the source of truth
-for currently implemented syntax. A broader future-facing example is in
-[docs/examples/active-authorization-v2.toml](docs/examples/active-authorization-v2.toml);
-analyzer kinds not yet implemented fail validation rather than being silently
-ignored.
+for an executable built-in pipeline. A broader schema-v2 example is in
+[docs/examples/active-authorization-v2.toml](docs/examples/active-authorization-v2.toml).
+Pi and external-tool definitions in that example parse and validate, but a
+selected unsupported analyzer is never skipped: its run is incomplete and the
+authorization returns exit `30`.
 
 Rules are strict TOML documents. They describe detection only: rule IDs,
 filename globs, and content regexes. Rules do not contain actions. Policy
@@ -154,9 +177,10 @@ file-guardian [--config FILE] daemon [--job JOB_ID ...]
 
 Each configured `policy_scan` job names its profile, targets, and schedule. With
 one or more `--job` options, only those jobs run; otherwise all enabled daemon
-jobs run. A policy scan uses the same evaluate-only authorization engine and
-immutable-workspace guarantees as the one-shot command. It reports decisions
-through protected logging and does not mutate its targets.
+jobs run. Scheduled jobs execute asynchronously and each target uses the same
+compiled, evaluate-only pipeline engine and immutable-workspace guarantees as
+the one-shot command. It reports decisions through protected logging and does
+not mutate its targets.
 
 The shipped example job is disabled intentionally. Set a deployment-specific
 target and enable at least one job before starting the systemd service.
@@ -202,15 +226,16 @@ sudo systemctl enable --now file-guardian
 Implementation proceeds in this order:
 
 1. Contract, immutable inspection, and read-only one-shot authorization.
-2. Ordered analyzer pipelines and an internal, read-only Pi LLM classifier,
-   initially audit-only.
-3. Sandboxed deterministic password and secret scanner delegates.
-4. Centralized, journaled delete and invocation-scoped quarantine with complete
+2. Compiled ordered pipelines, bounded parallelism, artifact selectors, prior
+   observation projections, and shared one-shot/daemon execution.
+3. Internal, read-only Pi LLM classification, initially audit-only.
+4. Sandboxed deterministic password and secret scanner delegates.
+5. Centralized, journaled delete and invocation-scoped quarantine with complete
    post-action verification; this introduces exit `10`.
-5. Bounded recursive archive inspection.
-6. Manual then incremental exact-hash fingerprint indexes with concurrent
+6. Bounded recursive archive inspection.
+7. Manual then incremental exact-hash fingerprint indexes with concurrent
    SQLite readers and optional per-index daemon schedules.
-7. Narrow deterministic redaction, followed separately by similarity
+8. Narrow deterministic redaction, followed separately by similarity
    fingerprints.
 
 The full technical contract and sequencing are documented in

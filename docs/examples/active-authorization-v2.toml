@@ -33,6 +33,10 @@ max_concurrency = 2
 analyzers = ["publication-rules"]
 prior_observations = "none"
 
+[pipelines.stages.prior_limits]
+max_observations = 10000
+max_serialized_bytes = 1048576
+
 [[pipelines.stages]]
 id = "deterministic-security"
 execution = "parallel"
@@ -40,11 +44,19 @@ max_concurrency = 2
 analyzers = ["password-scanner", "secret-scanner"]
 prior_observations = "none"
 
+[pipelines.stages.prior_limits]
+max_observations = 10000
+max_serialized_bytes = 1048576
+
 [[pipelines.stages]]
 id = "semantic-review"
 execution = "serial"
 analyzers = ["publication-llm"]
 prior_observations = "findings_summary"
+
+[pipelines.stages.prior_limits]
+max_observations = 10000
+max_serialized_bytes = 1048576
 
 [[analyzers]]
 id = "publication-rules"

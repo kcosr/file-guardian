@@ -15,12 +15,17 @@ use crate::analyzers::{
 };
 use crate::authorization::SnapshotInputKind;
 use crate::config::{
-    ActionMode as ConfigActionMode, AnalyzerKind, ApplicabilityPolicy, Config, UnboundObservation,
+    ActionMode as ConfigActionMode, AnalyzerKind, ApplicabilityPolicy, ArtifactKindConfig, Config,
+    PriorObservations, StageExecution as ConfigStageExecution, UnboundObservation,
 };
 use crate::domain::{
-    AnalyzerId, ArtifactManifest, ClassificationCode, InspectionIssue, InspectionPhase, IssueCode,
-    LogicalPath, PhaseCoverage, PhaseCoverageStatus, Provenance, RuleId, RunCoverage, RunId,
-    SanitizedMessage,
+    AnalyzerId, ArtifactKind, ArtifactManifest, ClassificationCode, InspectionIssue,
+    InspectionPhase, IssueCode, LogicalPath, PhaseCoverage, PhaseCoverageStatus, Provenance,
+    RuleId, RunCoverage, RunId, SanitizedMessage,
+};
+use crate::pipeline::{
+    AnalyzerImplementation, CompiledAnalyzer, CompiledPipeline, CompiledStage, EligibilitySelector,
+    PriorObservationMode, ProjectionLimits, StageExecution, StageId, UnsupportedAnalyzerKind,
 };
 use crate::policy::{BindingId, ObservationSelector, PolicyBinding, PolicyDirective};
 use crate::report::{
@@ -28,10 +33,7 @@ use crate::report::{
     PipelineRun, PipelineRunStatus, PolicySummary, ReportData, ReportIdentifier, ReportStatistics,
 };
 use crate::rules::load_rule_files;
-use crate::service::{
-    AuthorizationAnalyzer, AuthorizationRequest, AuthorizationResult, AuthorizationStage,
-    ServiceOutcome, UnsupportedAnalyzerKind,
-};
+use crate::service::{AuthorizationRequest, AuthorizationResult, ServiceOutcome};
 
 const RANDOM_RUN_ID_BYTES: usize = 24;
 
@@ -94,7 +96,7 @@ pub fn compile_invocation(
             selected_analyzers.push(config_analyzer);
             let analyzer_id = AnalyzerId::new(id.clone())
                 .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-            match &config_analyzer.kind {
+            let implementation = match &config_analyzer.kind {
                 AnalyzerKind::BuiltinRules {
                     rule_files,
                     max_content_bytes,
@@ -120,7 +122,7 @@ pub fn compile_invocation(
                             "analyzer '{id}' max_findings exceeds this platform"
                         ))
                     })?;
-                    analyzers.push(AuthorizationAnalyzer::Builtin(BuiltinRulesAnalyzer::new(
+                    AnalyzerImplementation::Builtin(BuiltinRulesAnalyzer::new(
                         id.clone(),
                         rules,
                         BuiltinAnalyzerLimits {
@@ -131,24 +133,77 @@ pub fn compile_invocation(
                                 over_max_bytes: applicability(content_applicability.over_max_bytes),
                             },
                         },
-                    )?));
+                    )?)
                 }
-                AnalyzerKind::ExternalTool { .. } => {
-                    analyzers.push(AuthorizationAnalyzer::Unsupported {
-                        id: analyzer_id,
-                        kind: UnsupportedAnalyzerKind::External,
-                    });
-                }
-                AnalyzerKind::PiClassifier { .. } => {
-                    analyzers.push(AuthorizationAnalyzer::Unsupported {
-                        id: analyzer_id,
-                        kind: UnsupportedAnalyzerKind::Pi,
-                    });
-                }
-            }
+                AnalyzerKind::ExternalTool { .. } => AnalyzerImplementation::Unsupported {
+                    kind: UnsupportedAnalyzerKind::External,
+                },
+                AnalyzerKind::PiClassifier { .. } => AnalyzerImplementation::Unsupported {
+                    kind: UnsupportedAnalyzerKind::Pi,
+                },
+            };
+            let eligibility = EligibilitySelector::compile(
+                &config_analyzer.selection.include,
+                &config_analyzer.selection.exclude,
+                config_analyzer
+                    .selection
+                    .artifact_kinds
+                    .iter()
+                    .map(|kind| match kind {
+                        ArtifactKindConfig::PhysicalFile => ArtifactKind::PhysicalFile,
+                        ArtifactKindConfig::ArchiveMember => ArtifactKind::ArchiveMember,
+                    }),
+            )
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            analyzers.push(CompiledAnalyzer::new(
+                analyzer_id,
+                config_analyzer.required,
+                eligibility,
+                implementation,
+            ));
         }
-        stages.push(AuthorizationStage { analyzers });
+        let execution = match stage.execution {
+            ConfigStageExecution::Serial => StageExecution::Serial,
+            ConfigStageExecution::Parallel => StageExecution::Parallel {
+                max_concurrency: stage.max_concurrency,
+            },
+        };
+        let prior_observations = match stage.prior_observations {
+            PriorObservations::None => PriorObservationMode::None,
+            PriorObservations::FindingsSummary => PriorObservationMode::FindingsSummary,
+            PriorObservations::AllNormalized => PriorObservationMode::AllNormalized,
+        };
+        let max_observations =
+            usize::try_from(stage.prior_limits.max_observations).map_err(|_| {
+                RuntimeError::Configuration(format!(
+                    "pipeline stage '{}' max_observations exceeds this platform",
+                    stage.id
+                ))
+            })?;
+        let max_serialized_bytes = usize::try_from(stage.prior_limits.max_serialized_bytes)
+            .map_err(|_| {
+                RuntimeError::Configuration(format!(
+                    "pipeline stage '{}' max_serialized_bytes exceeds this platform",
+                    stage.id
+                ))
+            })?;
+        let prior_limits = ProjectionLimits::new(max_observations, max_serialized_bytes)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let stage_id = StageId::new(stage.id.clone())
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        stages.push(
+            CompiledStage::new(
+                stage_id,
+                execution,
+                analyzers,
+                prior_observations,
+                prior_limits,
+            )
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
+        );
     }
+    let pipeline = CompiledPipeline::new(stages)
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
 
     let policy_bindings = compile_policy_bindings(
         config,
@@ -184,7 +239,7 @@ pub fn compile_invocation(
                 max_total_bytes: capture.max_total_bytes,
                 max_depth: capture.max_depth,
             },
-            stages,
+            pipeline,
             policy_bindings,
         },
         policy,
@@ -481,9 +536,7 @@ mod tests {
     use super::*;
     use crate::analyzers::{BuiltinAnalyzerLimits, BuiltinRulesAnalyzer};
     use crate::report::EffectiveActionMode;
-    use crate::service::{
-        AuthorizationAnalyzer, AuthorizationRequest, AuthorizationService, AuthorizationStage,
-    };
+    use crate::service::{AuthorizationRequest, AuthorizationService};
     use crate::{authorization::CaptureLimits, domain::Digest};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -569,8 +622,8 @@ directive = "deny"
         }
     }
 
-    #[test]
-    fn complete_service_result_maps_to_allow_report() {
+    #[tokio::test]
+    async fn complete_service_result_maps_to_allow_report() {
         let temp = tempfile::tempdir().unwrap();
         let input = temp.path().join("input");
         let workspace = temp.path().join("workspace");
@@ -579,23 +632,33 @@ directive = "deny"
         fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(input.join("safe.txt"), b"safe").unwrap();
         let run_id = RunId::from_suffix("report-adapter").unwrap();
+        let analyzer = CompiledAnalyzer::new(
+            AnalyzerId::new("builtin").unwrap(),
+            true,
+            EligibilitySelector::compile(&["**".to_string()], &[], [ArtifactKind::PhysicalFile])
+                .unwrap(),
+            AnalyzerImplementation::Builtin(
+                BuiltinRulesAnalyzer::new("builtin", Vec::new(), BuiltinAnalyzerLimits::default())
+                    .unwrap(),
+            ),
+        );
         let result = AuthorizationService::authorize(AuthorizationRequest {
             run_id: run_id.clone(),
             workspace_root: workspace,
             input,
             capture_limits: CaptureLimits::default(),
-            stages: vec![AuthorizationStage {
-                analyzers: vec![AuthorizationAnalyzer::Builtin(
-                    BuiltinRulesAnalyzer::new(
-                        "builtin",
-                        Vec::new(),
-                        BuiltinAnalyzerLimits::default(),
-                    )
-                    .unwrap(),
-                )],
-            }],
+            pipeline: CompiledPipeline::new(vec![CompiledStage::new(
+                StageId::new("rules").unwrap(),
+                StageExecution::Serial,
+                vec![analyzer],
+                PriorObservationMode::None,
+                ProjectionLimits::new(100, 16_384).unwrap(),
+            )
+            .unwrap()])
+            .unwrap(),
             policy_bindings: Vec::new(),
-        });
+        })
+        .await;
         let report = report_from_result(
             ReportContext {
                 run_id,

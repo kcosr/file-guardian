@@ -10,6 +10,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use globset::Glob;
 use serde::{Deserialize, Serialize};
 
 use crate::logging::LoggingSettings;
@@ -198,12 +199,13 @@ impl Config {
                         pipeline.id, stage.id
                     ));
                 }
-                if stage.execution == StageExecution::Parallel && stage.max_concurrency == 0 {
+                if stage.max_concurrency == 0 {
                     return invalid(format!(
                         "pipeline '{}' stage '{}' max_concurrency must be greater than zero",
                         pipeline.id, stage.id
                     ));
                 }
+                stage.prior_limits.validate(&pipeline.id, &stage.id)?;
                 for analyzer in &stage.analyzers {
                     if !analyzers.contains_key(analyzer.as_str()) {
                         return invalid(format!(
@@ -319,15 +321,6 @@ impl Config {
             .iter()
             .find(|pipeline| pipeline.id == profile.pipeline)
             .expect("validated pipeline reference");
-        if pipeline.stages.iter().any(|stage| {
-            stage.execution != StageExecution::Serial
-                || stage.prior_observations != PriorObservations::None
-        }) {
-            return invalid(format!(
-                "profile '{}' selects stage execution semantics unavailable in this authorization phase",
-                profile.id
-            ));
-        }
         if profile.action_mode == ActionMode::Evaluate && requested_mode == Some(ActionMode::Apply)
         {
             return invalid(format!(
@@ -349,15 +342,6 @@ impl Config {
             if !matches!(analyzer.kind, AnalyzerKind::BuiltinRules { .. }) {
                 return invalid(format!(
                     "profile '{}' selects analyzer '{}' whose kind is not available in this authorization phase",
-                    profile.id, analyzer.id
-                ));
-            }
-            if analyzer.selection.include != ["**"]
-                || !analyzer.selection.exclude.is_empty()
-                || analyzer.selection.artifact_kinds != [ArtifactKindConfig::PhysicalFile]
-            {
-                return invalid(format!(
-                    "profile '{}' selects analyzer '{}' with selection semantics unavailable in this authorization phase",
                     profile.id, analyzer.id
                 ));
             }
@@ -517,6 +501,8 @@ pub struct StageConfig {
     pub analyzers: Vec<String>,
     #[serde(default)]
     pub prior_observations: PriorObservations,
+    #[serde(default)]
+    pub prior_limits: PriorObservationLimitsConfig,
 }
 
 fn default_max_concurrency() -> usize {
@@ -537,7 +523,44 @@ pub enum PriorObservations {
     #[default]
     None,
     FindingsSummary,
-    AllSummary,
+    AllNormalized,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriorObservationLimitsConfig {
+    #[serde(default = "default_max_prior_observations")]
+    pub max_observations: u64,
+    #[serde(default = "default_max_prior_serialized_bytes")]
+    pub max_serialized_bytes: u64,
+}
+
+impl Default for PriorObservationLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_observations: default_max_prior_observations(),
+            max_serialized_bytes: default_max_prior_serialized_bytes(),
+        }
+    }
+}
+
+impl PriorObservationLimitsConfig {
+    fn validate(&self, pipeline: &str, stage: &str) -> Result<(), ConfigError> {
+        if self.max_observations == 0 || self.max_serialized_bytes == 0 {
+            return invalid(format!(
+                "pipeline '{pipeline}' stage '{stage}' prior_limits must be greater than zero"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_max_prior_observations() -> u64 {
+    10_000
+}
+
+fn default_max_prior_serialized_bytes() -> u64 {
+    1024 * 1024
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -801,7 +824,7 @@ impl SelectionConfig {
             ));
         }
         for pattern in self.include.iter().chain(&self.exclude) {
-            glob::Pattern::new(pattern).map_err(|error| {
+            Glob::new(pattern).map_err(|error| {
                 ConfigError::Invalid(format!(
                     "analyzer '{id}' has invalid selection glob '{pattern}': {error}"
                 ))
@@ -1309,20 +1332,21 @@ path = "/srv/uploads"
     }
 
     #[test]
-    fn phase_two_rejects_unimplemented_pipeline_semantics() {
+    fn phase_three_accepts_parallel_execution_and_real_selectors() {
         let mut config = parse(MINIMAL).unwrap();
         config.pipelines[0].stages[0].execution = StageExecution::Parallel;
-        assert!(config.validate_for_authorize(None).is_err());
-        config.pipelines[0].stages[0].execution = StageExecution::Serial;
-        config.pipelines[0].stages[0].prior_observations = PriorObservations::AllSummary;
-        assert!(config.validate_for_authorize(None).is_err());
-        config.pipelines[0].stages[0].prior_observations = PriorObservations::None;
+        config.pipelines[0].stages[0].max_concurrency = 2;
+        config.pipelines[0].stages[0].prior_observations = PriorObservations::AllNormalized;
         config.analyzers[0]
             .selection
             .exclude
             .push("vendor/**".to_string());
-        assert!(config.validate_for_authorize(None).is_err());
-        config.analyzers[0].selection = SelectionConfig::default();
+        assert!(config.validate_for_authorize(None).is_ok());
+    }
+
+    #[test]
+    fn phase_three_rejects_unimplemented_analyzer_kinds() {
+        let mut config = parse(MINIMAL).unwrap();
         config.analyzers[0].kind = AnalyzerKind::ExternalTool {
             adapter: PathBuf::from("/usr/libexec/file-guardian/scanner"),
             args: Vec::new(),
@@ -1330,6 +1354,19 @@ path = "/srv/uploads"
             sandbox: "required".to_string(),
         };
         assert!(config.validate_for_authorize(None).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_prior_projection_limits_and_unknown_projection_names() {
+        let mut config = parse(MINIMAL).unwrap();
+        config.pipelines[0].stages[0].prior_limits.max_observations = 0;
+        assert!(config.validate().is_err());
+
+        let invalid = MINIMAL.replace(
+            "analyzers = [\"rules\"]",
+            "analyzers = [\"rules\"]\nprior_observations = \"all_summary\"",
+        );
+        assert!(parse(&invalid).is_err());
     }
 
     #[test]
