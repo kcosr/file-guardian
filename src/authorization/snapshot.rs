@@ -22,6 +22,7 @@ const FILE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::CLOEXEC)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK);
+const MAX_ANCESTOR_DIRECTORIES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureLimits {
@@ -90,6 +91,7 @@ impl<'a> Snapshotter<'a> {
                 let opened = fs::fstat(&root)
                     .map_err(|error| CaptureError::InputUnavailable(error.kind()))?;
                 ensure_same_entry(&initial, &opened).map_err(|_| CaptureError::InputUnstable)?;
+                reject_workspace_ancestry(self.workspace, &root)?;
                 state.capture_directory(&root, &[], 0)?;
                 let final_stat = fs::fstat(&root).map_err(|_| CaptureError::InputUnstable)?;
                 ensure_stable(&opened, &final_stat).map_err(|_| CaptureError::InputUnstable)
@@ -100,12 +102,25 @@ impl<'a> Snapshotter<'a> {
                     .ok_or(CaptureError::InvalidInputName)?;
                 let segment =
                     PathSegment::try_from(name).map_err(|_| CaptureError::InvalidInputName)?;
-                let fd = fs::open(input, FILE_FLAGS, Mode::empty())
+                let parent_path = input
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let parent = fs::open(parent_path, DIRECTORY_FLAGS, Mode::empty())
+                    .map_err(|error| CaptureError::InputUnavailable(error.kind()))?;
+                reject_workspace_ancestry(self.workspace, &parent)?;
+                let parent_entry = fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(|_| CaptureError::InputUnstable)?;
+                ensure_same_entry(&initial, &parent_entry)
+                    .map_err(|_| CaptureError::InputUnstable)?;
+                let fd = fs::openat(&parent, name, FILE_FLAGS, Mode::empty())
                     .map_err(|error| CaptureError::InputUnavailable(error.kind()))?;
                 let opened =
                     fs::fstat(&fd).map_err(|error| CaptureError::InputUnavailable(error.kind()))?;
-                ensure_same_entry(&initial, &opened).map_err(|_| CaptureError::InputUnstable)?;
-                state.capture_file(fd, vec![segment], opened)
+                ensure_same_entry(&parent_entry, &opened)
+                    .map_err(|_| CaptureError::InputUnstable)?;
+                state.capture_file(fd, vec![segment], opened)?;
+                validate_parent_entry(&parent, name, &initial)
             } else {
                 Err(CaptureError::UnsupportedFileType)
             }?;
@@ -128,6 +143,42 @@ impl<'a> Snapshotter<'a> {
         };
         Ok(Snapshot { manifest })
     }
+}
+
+/// Proves that an opened input is not nested beneath any directory belonging
+/// to this invocation. Walking `..` from descriptors avoids trusting a textual
+/// path or canonicalization result that can be replaced during capture.
+fn reject_workspace_ancestry(
+    workspace: &InvocationWorkspace,
+    start: &OwnedFd,
+) -> Result<(), CaptureError> {
+    let mut current = start
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|_| CaptureError::WorkspaceAncestryUnavailable)?;
+    for _ in 0..MAX_ANCESTOR_DIRECTORIES {
+        let current_stat =
+            fs::fstat(&current).map_err(|_| CaptureError::WorkspaceAncestryUnavailable)?;
+        let current_identity = FilesystemIdentity::from_stat(&current_stat)
+            .map_err(|_| CaptureError::InvalidFileMetadata)?;
+        if workspace.contains_identity(current_identity) {
+            return Err(CaptureError::WorkspaceTraversalRejected);
+        }
+
+        let parent = fs::openat(&current, "..", DIRECTORY_FLAGS, Mode::empty())
+            .map_err(|_| CaptureError::WorkspaceAncestryUnavailable)?;
+        let parent_stat =
+            fs::fstat(&parent).map_err(|_| CaptureError::WorkspaceAncestryUnavailable)?;
+        let parent_identity = FilesystemIdentity::from_stat(&parent_stat)
+            .map_err(|_| CaptureError::InvalidFileMetadata)?;
+        if parent_identity == current_identity {
+            return Ok(());
+        }
+        current = parent;
+    }
+    Err(CaptureError::WorkspaceAncestryLimitExceeded {
+        limit: MAX_ANCESTOR_DIRECTORIES,
+    })
 }
 
 struct CaptureState<'a> {
@@ -410,6 +461,16 @@ fn validate_root_path(input: &Path, initial: &Stat) -> Result<(), CaptureError> 
     ensure_stable(initial, &final_path).map_err(|_| CaptureError::InputUnstable)
 }
 
+fn validate_parent_entry(
+    parent: &OwnedFd,
+    name: &OsStr,
+    initial: &Stat,
+) -> Result<(), CaptureError> {
+    let final_entry = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|_| CaptureError::InputUnstable)?;
+    ensure_stable(initial, &final_entry).map_err(|_| CaptureError::InputUnstable)
+}
+
 fn source_identity(
     stat: &StatKey,
     digest: crate::domain::Digest,
@@ -468,6 +529,10 @@ pub enum CaptureError {
     InvalidFileMetadata,
     #[error("the input traverses the workspace root, invocation run directory, or fixed layout")]
     WorkspaceTraversalRejected,
+    #[error("the input's directory ancestry could not be inspected safely")]
+    WorkspaceAncestryUnavailable,
+    #[error("the input's directory ancestry exceeds {limit} directories")]
+    WorkspaceAncestryLimitExceeded { limit: usize },
     #[error("directory enumeration failed")]
     EnumerationFailure,
     #[error("an entry changed while it was opened")]
@@ -629,6 +694,28 @@ mod tests {
                 Err(CaptureError::WorkspaceTraversalRejected)
             ));
         }
+    }
+
+    #[test]
+    fn rejects_an_object_file_nested_beneath_the_workspace() {
+        let fixture = Fixture::new("object-containment");
+        stdfs::write(fixture.input(), b"captured once").unwrap();
+        let first = fixture.capture(CaptureLimits::default()).unwrap();
+        let object_path = fixture
+            .root
+            .path()
+            .join("workspaces/run_object-containment/objects")
+            .join(first.manifest.artifacts()[0].object_id.as_str());
+        let snapshotter = Snapshotter::new(&fixture.workspace, CaptureLimits::default());
+
+        assert!(matches!(
+            snapshotter.capture(&object_path),
+            Err(CaptureError::WorkspaceTraversalRejected)
+        ));
+
+        let sibling = fixture.root.path().join("sibling.txt");
+        stdfs::write(&sibling, b"ordinary sibling").unwrap();
+        assert!(snapshotter.capture(&sibling).is_ok());
     }
 
     #[test]

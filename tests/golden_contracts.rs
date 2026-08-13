@@ -83,6 +83,36 @@ fn checked_in_configuration_and_classifier_examples_parse() {
     .expect("valid classifier JSON");
 }
 
+#[test]
+fn run_coverage_deserialization_is_strict_and_phase_safe() {
+    let unknown_field = r#"{
+        "initial":{"status":"incomplete","analyzers":[]},
+        "verification":{"status":"not_run","analyzers":[]},
+        "extra":true
+    }"#;
+    assert!(serde_json::from_str::<RunCoverage>(unknown_field).is_err());
+
+    let misplaced_phase = r#"{
+        "initial":{"status":"complete","analyzers":[{
+            "analyzer_id":"builtin","phase":"verification","eligible":0,
+            "assigned":0,"completed":0,"excluded":0,"status":"complete"
+        }]},
+        "verification":{"status":"not_run","analyzers":[]}
+    }"#;
+    assert!(serde_json::from_str::<RunCoverage>(misplaced_phase).is_err());
+
+    let fully_accounted_but_incomplete = r#"{
+        "initial":{"status":"incomplete","analyzers":[{
+            "analyzer_id":"builtin","phase":"initial","eligible":1,
+            "assigned":1,"completed":1,"excluded":0,"status":"incomplete"
+        }]},
+        "verification":{"status":"not_run","analyzers":[]}
+    }"#;
+    let coverage: RunCoverage = serde_json::from_str(fully_accounted_but_incomplete)
+        .expect("execution failure may make fully-accounted coverage incomplete");
+    assert_eq!(coverage.initial.status, PhaseCoverageStatus::Incomplete);
+}
+
 fn assert_exit_invariants(report: &GoldenReport) {
     match report.exit_code {
         0 => {

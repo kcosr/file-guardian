@@ -188,8 +188,11 @@ candidate is incomplete coverage, not an exclusion.
 
 The counters are disjoint: `completed` counts assigned artifacts the analyzer
 inspected, while `excluded` counts assigned artifacts made explicitly
-inapplicable by policy. Coverage is complete exactly when
-`completed + excluded == assigned`; excluded artifacts never also increment
+inapplicable by policy. `completed + excluded == assigned` is required for a
+`complete` analyzer row, but it is not sufficient: protocol, budget, tool, or
+other execution failures keep the analyzer and phase `incomplete` even when all
+assigned artifacts are arithmetically accounted for. A `complete` phase requires
+every analyzer row to be complete. Excluded artifacts never also increment
 `completed`.
 
 ## Built-in rules

@@ -50,7 +50,7 @@ impl AnalyzerCoverage {
         if accounted > assigned {
             return Err(CoverageError::AccountedExceedsAssigned);
         }
-        if (status == CoverageStatus::Complete) != (accounted == assigned) {
+        if status == CoverageStatus::Complete && accounted != assigned {
             return Err(CoverageError::StatusMismatch);
         }
         Ok(Self {
@@ -134,11 +134,6 @@ impl PhaseCoverage {
             PhaseCoverageStatus::Complete if analyzers.iter().any(|item| !item.is_complete()) => {
                 return Err(CoverageError::PhaseStatusMismatch)
             }
-            PhaseCoverageStatus::Incomplete
-                if !analyzers.is_empty() && analyzers.iter().all(AnalyzerCoverage::is_complete) =>
-            {
-                return Err(CoverageError::PhaseStatusMismatch)
-            }
             PhaseCoverageStatus::NotRun if !analyzers.is_empty() => {
                 return Err(CoverageError::NotRunHasAnalyzers)
             }
@@ -165,10 +160,52 @@ impl<'de> Deserialize<'de> for PhaseCoverage {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct RunCoverage {
     pub initial: PhaseCoverage,
     pub verification: PhaseCoverage,
+}
+
+impl RunCoverage {
+    pub fn new(initial: PhaseCoverage, verification: PhaseCoverage) -> Result<Self, CoverageError> {
+        Self::validate_phase(&initial, InspectionPhase::Initial)?;
+        Self::validate_phase(&verification, InspectionPhase::Verification)?;
+        Ok(Self {
+            initial,
+            verification,
+        })
+    }
+
+    fn validate_phase(
+        coverage: &PhaseCoverage,
+        expected: InspectionPhase,
+    ) -> Result<(), CoverageError> {
+        if let Some(row) = coverage.analyzers.iter().find(|row| row.phase != expected) {
+            return Err(CoverageError::AnalyzerInWrongPhase {
+                analyzer_id: row.analyzer_id.clone(),
+                expected,
+                actual: row.phase,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for RunCoverage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            initial: PhaseCoverage,
+            verification: PhaseCoverage,
+        }
+
+        let fields = Fields::deserialize(deserializer)?;
+        Self::new(fields.initial, fields.verification).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -181,12 +218,20 @@ pub enum CoverageError {
     ExcludedExceedsEligible,
     #[error("completed plus excluded artifact count exceeds assigned artifact count")]
     AccountedExceedsAssigned,
-    #[error("coverage status does not match whether all assigned artifacts are accounted for")]
+    #[error("complete coverage requires all assigned artifacts to be accounted for")]
     StatusMismatch,
     #[error("phase coverage status does not match its analyzer coverage")]
     PhaseStatusMismatch,
     #[error("not-run coverage cannot contain analyzer runs")]
     NotRunHasAnalyzers,
+    #[error(
+        "analyzer {analyzer_id} is in the {actual:?} phase but appears under {expected:?} coverage"
+    )]
+    AnalyzerInWrongPhase {
+        analyzer_id: AnalyzerId,
+        expected: InspectionPhase,
+        actual: InspectionPhase,
+    },
 }
 
 #[cfg(test)]
@@ -264,8 +309,8 @@ mod tests {
         let not_run_with_row = r#"{"status":"not_run","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"excluded":0,"status":"complete"}]}"#;
         assert!(serde_json::from_str::<PhaseCoverage>(not_run_with_row).is_err());
 
-        let false_incomplete = r#"{"status":"incomplete","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":1,"assigned":1,"completed":1,"excluded":0,"status":"complete"}]}"#;
-        assert!(serde_json::from_str::<PhaseCoverage>(false_incomplete).is_err());
+        let fully_accounted_incomplete = r#"{"status":"incomplete","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":1,"assigned":1,"completed":1,"excluded":0,"status":"complete"}]}"#;
+        assert!(serde_json::from_str::<PhaseCoverage>(fully_accounted_incomplete).is_ok());
 
         let duplicates = r#"{"status":"complete","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"excluded":0,"status":"complete"},{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"excluded":0,"status":"complete"}]}"#;
         assert!(serde_json::from_str::<PhaseCoverage>(duplicates).is_err());
@@ -315,6 +360,86 @@ mod tests {
             Err(CoverageError::DuplicateAnalyzer(
                 AnalyzerId::new("builtin").unwrap()
             ))
+        );
+    }
+
+    #[test]
+    fn incomplete_status_can_represent_non_arithmetic_failure() {
+        let analyzer = AnalyzerCoverage::new(
+            AnalyzerId::new("builtin").unwrap(),
+            InspectionPhase::Initial,
+            1,
+            1,
+            1,
+            0,
+            CoverageStatus::Incomplete,
+        )
+        .unwrap();
+        assert!(!analyzer.is_complete());
+
+        assert!(PhaseCoverage::new(
+            PhaseCoverageStatus::Incomplete,
+            vec![AnalyzerCoverage::new(
+                AnalyzerId::new("complete-row").unwrap(),
+                InspectionPhase::Initial,
+                1,
+                1,
+                1,
+                0,
+                CoverageStatus::Complete,
+            )
+            .unwrap()],
+        )
+        .is_ok());
+        assert!(PhaseCoverage::new(PhaseCoverageStatus::Incomplete, Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn run_coverage_rejects_analyzer_rows_in_the_wrong_phase() {
+        let misplaced_verification = AnalyzerCoverage::new(
+            AnalyzerId::new("builtin").unwrap(),
+            InspectionPhase::Verification,
+            0,
+            0,
+            0,
+            0,
+            CoverageStatus::Complete,
+        )
+        .unwrap();
+        let initial =
+            PhaseCoverage::new(PhaseCoverageStatus::Complete, vec![misplaced_verification])
+                .unwrap();
+        let verification = PhaseCoverage::new(PhaseCoverageStatus::NotRun, Vec::new()).unwrap();
+
+        assert_eq!(
+            RunCoverage::new(initial, verification),
+            Err(CoverageError::AnalyzerInWrongPhase {
+                analyzer_id: AnalyzerId::new("builtin").unwrap(),
+                expected: InspectionPhase::Initial,
+                actual: InspectionPhase::Verification,
+            })
+        );
+
+        let initial = PhaseCoverage::new(PhaseCoverageStatus::Complete, Vec::new()).unwrap();
+        let misplaced_initial = AnalyzerCoverage::new(
+            AnalyzerId::new("builtin").unwrap(),
+            InspectionPhase::Initial,
+            0,
+            0,
+            0,
+            0,
+            CoverageStatus::Complete,
+        )
+        .unwrap();
+        let verification =
+            PhaseCoverage::new(PhaseCoverageStatus::Complete, vec![misplaced_initial]).unwrap();
+        assert_eq!(
+            RunCoverage::new(initial, verification),
+            Err(CoverageError::AnalyzerInWrongPhase {
+                analyzer_id: AnalyzerId::new("builtin").unwrap(),
+                expected: InspectionPhase::Verification,
+                actual: InspectionPhase::Initial,
+            })
         );
     }
 }
