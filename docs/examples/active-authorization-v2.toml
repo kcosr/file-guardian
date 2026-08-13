@@ -1,0 +1,183 @@
+schema_version = "2"
+
+[authorization]
+default_profile = "publication"
+
+[authorization.workspace]
+root = "/var/lib/file-guardian/runs"
+retention = "on_modified"
+ttl_secs = 86400
+max_retained_bytes = 10737418240
+
+[authorization.actions]
+default_quarantine = "job"
+journal_root = "/var/lib/file-guardian/action-journal"
+
+[[authorization.profiles]]
+id = "publication"
+pipeline = "publication-review"
+action_mode = "evaluate"
+default_unbound_observation = "deny"
+
+[[pipelines]]
+id = "publication-review"
+
+[[pipelines.stages]]
+id = "builtin-policy"
+execution = "parallel"
+max_concurrency = 2
+analyzers = ["publication-rules"]
+prior_observations = "none"
+
+[[pipelines.stages]]
+id = "deterministic-security"
+execution = "parallel"
+max_concurrency = 2
+analyzers = ["password-scanner", "secret-scanner"]
+prior_observations = "none"
+
+[[pipelines.stages]]
+id = "semantic-review"
+execution = "serial"
+analyzers = ["publication-llm"]
+prior_observations = "findings_summary"
+
+[[analyzers]]
+id = "publication-rules"
+kind = "builtin_rules"
+required = true
+rule_files = ["/etc/file-guardian/rules.d/publication.toml"]
+
+[[analyzers]]
+id = "password-scanner"
+kind = "external_tool"
+required = true
+adapter = "/usr/libexec/file-guardian/fg-password-scanner"
+args = []
+protocol = "file-guardian-delegate/1"
+sandbox = "required"
+
+[analyzers.selection]
+include = ["**"]
+exclude = ["**/vendor/**"]
+artifact_kinds = ["physical_file", "archive_member"]
+
+[analyzers.limits]
+wall_timeout_secs = 60
+memory_bytes = 536870912
+max_output_bytes = 10485760
+max_findings = 10000
+
+[[analyzers]]
+id = "secret-scanner"
+kind = "external_tool"
+required = true
+adapter = "/usr/libexec/file-guardian/fg-secret-scanner"
+args = []
+protocol = "file-guardian-delegate/1"
+sandbox = "required"
+
+[analyzers.selection]
+include = ["**"]
+exclude = []
+artifact_kinds = ["physical_file", "archive_member"]
+
+[analyzers.limits]
+wall_timeout_secs = 90
+memory_bytes = 536870912
+max_output_bytes = 10485760
+max_findings = 10000
+
+[[analyzers]]
+id = "publication-llm"
+kind = "pi_classifier"
+required = true
+scope = "tree"
+
+[analyzers.pi]
+executable = "/usr/local/bin/pi"
+expected_version = "0.83.0"
+provider = "internal-provider"
+model = "internal-classification-model"
+thinking = "high"
+instruction_file = "/etc/file-guardian/prompts/publication-review.md"
+trusted_extension = "/usr/libexec/file-guardian/pi-classifier-extension.js"
+isolated_agent_dir = "/etc/file-guardian/pi-agent"
+output_schema = "file-guardian-pi-classifier/1"
+tool_grant = "artifact-readonly-v1"
+sandbox = "bubblewrap-v1"
+
+[analyzers.vocabulary]
+classifications = ["public", "internal", "restricted", "uncertain"]
+confidences = ["low", "medium", "high"]
+reason_codes = [
+  "internal_project_material",
+  "restricted_source_material",
+  "customer_confidential_material",
+  "publication_context_unclear",
+]
+
+[analyzers.selection]
+include = ["**"]
+exclude = ["**/vendor/**"]
+artifact_kinds = ["physical_file", "archive_member"]
+
+[analyzers.limits]
+wall_timeout_secs = 180
+max_tool_calls = 1000
+max_bytes_read = 268435456
+max_output_bytes = 1048576
+
+[[policy_bindings]]
+id = "builtin-deny"
+profile = "publication"
+analyzer = "publication-rules"
+rule = "*"
+directive = "deny"
+
+[[policy_bindings]]
+id = "password-deny"
+profile = "publication"
+analyzer = "password-scanner"
+rule = "*"
+directive = "deny"
+
+[[policy_bindings]]
+id = "secret-deny"
+profile = "publication"
+analyzer = "secret-scanner"
+rule = "*"
+directive = "deny"
+
+[[policy_bindings]]
+id = "llm-public-audit"
+profile = "publication"
+analyzer = "publication-llm"
+classification = "public"
+directive = "audit"
+
+[[policy_bindings]]
+id = "llm-internal-audit"
+profile = "publication"
+analyzer = "publication-llm"
+classification = "internal"
+directive = "audit"
+
+[[policy_bindings]]
+id = "llm-restricted-audit"
+profile = "publication"
+analyzer = "publication-llm"
+classification = "restricted"
+directive = "audit"
+
+[[policy_bindings]]
+id = "llm-uncertain-audit"
+profile = "publication"
+analyzer = "publication-llm"
+classification = "uncertain"
+directive = "audit"
+
+[logging]
+level = "info"
+directory = "/var/log/file-guardian"
+console = false

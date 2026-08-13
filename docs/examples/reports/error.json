@@ -1,0 +1,49 @@
+{
+  "schema_version": "1",
+  "run_id": "run_01J5ERROR000000000000000000",
+  "request_id": "build-4823",
+  "outcome": "error",
+  "exit_code": 30,
+  "modified": false,
+  "coverage": {
+    "initial": "incomplete",
+    "verification": "not_run"
+  },
+  "policy": {
+    "profile_id": "publication",
+    "identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "pipeline_id": "publication-review",
+    "pipeline_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "effective_action_mode": "evaluate"
+  },
+  "input": {
+    "kind": "directory",
+    "initial_manifest_identity": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "final_manifest_identity": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+  },
+  "pipeline_runs": [
+    {
+      "phase": "initial",
+      "status": "incomplete",
+      "stages_completed": 2,
+      "analyzers_completed": 3
+    }
+  ],
+  "observations": [],
+  "resolutions": [],
+  "actions": [],
+  "issues": [
+    {
+      "code": "required_analyzer_timeout",
+      "phase": "initial",
+      "analyzer_id": "publication-llm",
+      "safe_message": "Required analyzer did not complete within its configured wall-time budget."
+    }
+  ],
+  "statistics": {
+    "physical_artifacts": 12,
+    "logical_artifacts": 12,
+    "observations": 0,
+    "duration_ms": 180014
+  }
+}

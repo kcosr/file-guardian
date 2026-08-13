@@ -1,0 +1,42 @@
+{
+  "schema_version": "1",
+  "run_id": "run_01J5ALLOW000000000000000000",
+  "request_id": "build-4821",
+  "outcome": "allow",
+  "exit_code": 0,
+  "modified": false,
+  "coverage": {
+    "initial": "complete",
+    "verification": "not_run"
+  },
+  "policy": {
+    "profile_id": "publication",
+    "identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "pipeline_id": "publication-review",
+    "pipeline_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "effective_action_mode": "evaluate"
+  },
+  "input": {
+    "kind": "directory",
+    "initial_manifest_identity": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "final_manifest_identity": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "pipeline_runs": [
+    {
+      "phase": "initial",
+      "status": "complete",
+      "stages_completed": 3,
+      "analyzers_completed": 4
+    }
+  ],
+  "observations": [],
+  "resolutions": [],
+  "actions": [],
+  "issues": [],
+  "statistics": {
+    "physical_artifacts": 12,
+    "logical_artifacts": 12,
+    "observations": 0,
+    "duration_ms": 1840
+  }
+}
