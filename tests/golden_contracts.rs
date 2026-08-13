@@ -1,3 +1,4 @@
+use file_guardian::config::Config;
 use file_guardian::domain::{
     InspectionIssue, IssueCode, NormalizedObservation, PhaseCoverageStatus, RunCoverage,
 };
@@ -91,6 +92,25 @@ fn golden_reports_satisfy_the_full_machine_report_contract() {
 }
 
 #[test]
+fn decisions_reject_forged_empty_or_inconsistent_execution_coverage() {
+    let allow: Value =
+        serde_json::from_str(include_str!("../docs/examples/reports/allow.json")).unwrap();
+
+    let mut empty_coverage = allow.clone();
+    empty_coverage["coverage"]["initial"]["analyzers"] = serde_json::json!([]);
+    empty_coverage["pipeline_runs"][0]["analyzers_completed"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<AuthorizationReport>(empty_coverage).is_err());
+
+    let mut wrong_analyzer_count = allow.clone();
+    wrong_analyzer_count["pipeline_runs"][0]["analyzers_completed"] = serde_json::json!(3);
+    assert!(serde_json::from_value::<AuthorizationReport>(wrong_analyzer_count).is_err());
+
+    let mut impossible_stage_count = allow;
+    impossible_stage_count["pipeline_runs"][0]["stages_completed"] = serde_json::json!(5);
+    assert!(serde_json::from_value::<AuthorizationReport>(impossible_stage_count).is_err());
+}
+
+#[test]
 fn final_manifest_identity_is_strict_for_decisions_and_partial_for_errors() {
     let mut allow: Value =
         serde_json::from_str(include_str!("../docs/examples/reports/allow.json")).unwrap();
@@ -128,9 +148,13 @@ fn error_report_keeps_relative_artifacts_from_a_trustworthy_initial_capture() {
 
 #[test]
 fn checked_in_configuration_and_classifier_examples_parse() {
-    let _: toml::Value = include_str!("../docs/examples/active-authorization-v2.toml")
-        .parse()
-        .expect("valid configuration TOML");
+    let configuration: Config = toml::from_str(include_str!(
+        "../docs/examples/active-authorization-v2.toml"
+    ))
+    .expect("example follows the strict configuration schema");
+    configuration
+        .validate()
+        .expect("example satisfies cross-reference and path invariants");
     let _: Value = serde_json::from_str(include_str!(
         "../docs/examples/pi-classifier/restricted.json"
     ))

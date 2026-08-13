@@ -1,17 +1,21 @@
 schema_version = "2"
 
+# This is a schema-complete forward configuration example. The strict parser
+# accepts and validates every field below. Some pipeline execution and analyzer
+# kinds are introduced by later implementation phases and therefore are not
+# selectable by the current evaluate-only runtime yet.
+
 [authorization]
 default_profile = "publication"
 
 [authorization.workspace]
 root = "/var/lib/file-guardian/runs"
-retention = "on_modified"
-ttl_secs = 86400
-max_retained_bytes = 10737418240
 
-[authorization.actions]
-default_quarantine = "job"
-journal_root = "/var/lib/file-guardian/action-journal"
+[authorization.workspace.capture]
+max_files = 100000
+max_file_bytes = 1073741824
+max_total_bytes = 10737418240
+max_depth = 64
 
 [[authorization.profiles]]
 id = "publication"

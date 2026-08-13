@@ -284,6 +284,29 @@ fn malformed_rules_are_reported_as_json_error() {
 }
 
 #[test]
+fn unknown_deny_rule_binding_fails_before_scanning_instead_of_allowing() {
+    let fixture = Fixture::new("deny", "payload.blocked");
+    let value = fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace(
+            "default_unbound_observation = \"error\"",
+            "default_unbound_observation = \"audit\"",
+        )
+        .replace("rule = \"*\"", "rule = \"blockde\"");
+    fs::write(&fixture.config, value).unwrap();
+
+    let output = fixture.authorize(&[]);
+    assert_eq!(output.status.code(), Some(30));
+    let report = report(&output);
+    assert_eq!(report.outcome, AuthorizationOutcome::Error);
+    assert!(report.input.is_none());
+    assert!(report.policy.is_none());
+    assert!(report.artifacts.is_empty());
+    assert!(report.observations.is_empty());
+    assert!(fixture.input.join("payload.blocked").exists());
+}
+
+#[test]
 fn report_identities_cover_compiled_rules_and_effective_policy() {
     let fixture = Fixture::new("audit", "safe.txt");
     let first = report(&fixture.authorize(&[]));

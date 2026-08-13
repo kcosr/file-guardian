@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,7 +20,7 @@ use file_guardian::runtime::{
 };
 use file_guardian::service::AuthorizationService;
 use tokio::signal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -154,18 +156,20 @@ async fn run_daemon_command(config_path: Option<&Path>, args: DaemonArgs) -> Exi
     };
     let config = Arc::new(config);
     let (failed_tx, mut failed_rx) = mpsc::channel::<String>(jobs.len());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut handles = Vec::with_capacity(jobs.len());
     for job in jobs {
         let config = Arc::clone(&config);
         let failed_tx = failed_tx.clone();
+        let shutdown_rx = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {
-            run_daemon_loop(config, job, failed_tx).await;
+            run_daemon_loop(config, job, failed_tx, shutdown_rx).await;
         }));
     }
     drop(failed_tx);
 
     let status = tokio::select! {
-        result = signal::ctrl_c() => {
+        result = wait_for_shutdown_signal() => {
             match result {
                 Ok(()) => {
                     tracing::info!("received shutdown signal");
@@ -186,19 +190,59 @@ async fn run_daemon_command(config_path: Option<&Path>, args: DaemonArgs) -> Exi
             ExitCode::from(30)
         }
     };
+    let _ = shutdown_tx.send(true);
     for handle in handles {
-        handle.abort();
+        if let Err(error) = handle.await {
+            tracing::error!("daemon job task failed during shutdown: {error}");
+            return ExitCode::from(30);
+        }
     }
     status
 }
 
-async fn run_daemon_loop(config: Arc<Config>, job: DaemonJobConfig, failed: mpsc::Sender<String>) {
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() -> io::Result<()> {
+    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    wait_for_unix_shutdown(signal::ctrl_c(), terminate.recv()).await
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() -> io::Result<()> {
+    signal::ctrl_c().await
+}
+
+#[cfg(unix)]
+async fn wait_for_unix_shutdown<Interrupt, Terminate>(
+    interrupt: Interrupt,
+    terminate: Terminate,
+) -> io::Result<()>
+where
+    Interrupt: Future<Output = io::Result<()>>,
+    Terminate: Future<Output = Option<()>>,
+{
+    tokio::select! {
+        result = interrupt => result,
+        result = terminate => result.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "SIGTERM listener closed")
+        }),
+    }
+}
+
+async fn run_daemon_loop(
+    config: Arc<Config>,
+    job: DaemonJobConfig,
+    failed: mpsc::Sender<String>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let DaemonJobKind::PolicyScan {
         profile,
         target,
         every_secs,
         run_on_start,
     } = &job.kind;
+    if *shutdown.borrow() {
+        return;
+    }
     if *run_on_start
         && !run_daemon_scan_blocking(
             Arc::clone(&config),
@@ -214,7 +258,19 @@ async fn run_daemon_loop(config: Arc<Config>, job: DaemonJobConfig, failed: mpsc
     let mut interval = tokio::time::interval(Duration::from_secs(*every_secs));
     interval.tick().await;
     loop {
-        interval.tick().await;
+        tokio::select! {
+            biased;
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    return;
+                }
+                continue;
+            }
+            _ = interval.tick() => {}
+        }
+        if *shutdown.borrow() {
+            return;
+        }
         if !run_daemon_scan_blocking(
             Arc::clone(&config),
             job.id.clone(),
@@ -342,6 +398,8 @@ fn elapsed_millis(started: Instant) -> u64 {
 mod tests {
     use super::*;
     use file_guardian::report::ReportIdentifier;
+    #[cfg(unix)]
+    use std::future;
 
     struct FailingWriter;
 
@@ -381,5 +439,13 @@ mod tests {
             "test report",
         );
         assert!(write_report(&mut FailingWriter, &report).is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_completes_the_daemon_shutdown_future() {
+        wait_for_unix_shutdown(future::pending(), future::ready(Some(())))
+            .await
+            .unwrap();
     }
 }

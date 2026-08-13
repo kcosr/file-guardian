@@ -298,6 +298,9 @@ impl AuthorizationReport {
                 if self.coverage.initial.status != PhaseCoverageStatus::Complete {
                     return Err(ReportError::IncompleteDecisionCoverage);
                 }
+                if self.coverage.initial.analyzers.is_empty() {
+                    return Err(ReportError::DecisionCoverageMissing);
+                }
                 if self.coverage.verification.status != PhaseCoverageStatus::NotRun {
                     return Err(ReportError::UnexpectedVerification);
                 }
@@ -311,12 +314,13 @@ impl AuthorizationReport {
                 if !self.issues.is_empty() {
                     return Err(ReportError::DecisionHasIssues);
                 }
-                if !self.pipeline_runs.iter().any(|run| {
+                let Some(pipeline_run) = self.pipeline_runs.iter().find(|run| {
                     run.phase == InspectionPhase::Initial
                         && run.status == PipelineRunStatus::Complete
-                }) {
+                }) else {
                     return Err(ReportError::DecisionPipelineMissing);
-                }
+                };
+                validate_decision_pipeline(pipeline_run, &self.coverage)?;
             }
             AuthorizationOutcome::Error => {
                 if self.issues.is_empty() {
@@ -442,15 +446,35 @@ fn validate_pipeline_runs(runs: &[PipelineRun], coverage: &RunCoverage) -> Resul
         if !phases.insert(run.phase) {
             return Err(ReportError::DuplicatePipelinePhase);
         }
-        let expected = match run.phase {
-            InspectionPhase::Initial => coverage.initial.status,
-            InspectionPhase::Verification => coverage.verification.status,
+        let phase_coverage = match run.phase {
+            InspectionPhase::Initial => &coverage.initial,
+            InspectionPhase::Verification => &coverage.verification,
         };
-        match (run.status, expected) {
+        match (run.status, phase_coverage.status) {
             (PipelineRunStatus::Complete, PhaseCoverageStatus::Complete)
             | (PipelineRunStatus::Incomplete, PhaseCoverageStatus::Incomplete) => {}
             _ => return Err(ReportError::PipelineCoverageMismatch),
         }
+    }
+    Ok(())
+}
+
+fn validate_decision_pipeline(
+    run: &PipelineRun,
+    coverage: &RunCoverage,
+) -> Result<(), ReportError> {
+    // `analyzers_completed` counts completed analyzer invocations, not
+    // artifacts. A successful decision has exactly one complete coverage row
+    // per invocation, so its row count is the authoritative cross-check.
+    if run.analyzers_completed != coverage.initial.analyzers.len() as u64 {
+        return Err(ReportError::PipelineAnalyzerCountMismatch);
+    }
+
+    // Coverage does not expose stage membership, but every completed stage
+    // contains at least one completed analyzer. This is therefore the
+    // strongest stage-count invariant the wire schema can prove.
+    if run.stages_completed == 0 || run.stages_completed > run.analyzers_completed {
+        return Err(ReportError::PipelineStageCountInvalid);
     }
     Ok(())
 }
@@ -528,6 +552,10 @@ pub enum ReportError {
     DuplicatePipelinePhase,
     #[error("pipeline run status disagrees with coverage")]
     PipelineCoverageMismatch,
+    #[error("pipeline analyzer completion count disagrees with coverage rows")]
+    PipelineAnalyzerCountMismatch,
+    #[error("pipeline stage completion count is inconsistent with completed analyzers")]
+    PipelineStageCountInvalid,
     #[error("resolution references an unknown observation")]
     ResolutionUnknownObservation,
     #[error("report contains duplicate resolutions")]
@@ -544,6 +572,8 @@ pub enum ReportError {
     ArtifactsWithoutInput,
     #[error("allow or deny requires complete initial coverage")]
     IncompleteDecisionCoverage,
+    #[error("allow or deny requires at least one initial analyzer coverage row")]
+    DecisionCoverageMissing,
     #[error("evaluate-only authorization must not run verification")]
     UnexpectedVerification,
     #[error("allow or deny requires policy and input context")]

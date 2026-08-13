@@ -65,9 +65,49 @@ impl Config {
             path: path.clone(),
             source,
         })?;
-        let config = toml::from_str::<Self>(&raw)
-            .map_err(|source| ConfigError::ParseToml { path, source })?;
+        let config = toml::from_str::<Self>(&raw).map_err(|source| ConfigError::ParseToml {
+            path: path.clone(),
+            source,
+        })?;
         config.validate()?;
+        let sourced_path = if path.is_absolute() {
+            path.clone()
+        } else {
+            env::current_dir()
+                .map_err(|source| ConfigError::Io {
+                    path: path.clone(),
+                    source,
+                })?
+                .join(&path)
+        };
+        let resolved_path = fs::canonicalize(&path).map_err(|source| ConfigError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let resolved_workspace = match fs::canonicalize(&config.authorization.workspace.root) {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                config.authorization.workspace.root.clone()
+            }
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: config.authorization.workspace.root.clone(),
+                    source,
+                });
+            }
+        };
+        validate_disjoint(
+            "authorization.workspace.root",
+            &config.authorization.workspace.root,
+            "configuration source path",
+            &sourced_path,
+        )?;
+        validate_disjoint(
+            "resolved authorization.workspace.root",
+            &resolved_workspace,
+            "resolved configuration file path",
+            &resolved_path,
+        )?;
         Ok(config)
     }
 
@@ -1172,6 +1212,56 @@ directive = "deny"
             Config::resolve_path(Some(explicit)),
             (explicit.to_path_buf(), ConfigPathKind::Explicit)
         );
+    }
+
+    #[test]
+    fn loaded_config_file_must_be_disjoint_from_workspace_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("runs");
+        fs::create_dir(&workspace).unwrap();
+        let config_path = workspace.join("config.toml");
+        let source = MINIMAL.replace("/var/lib/file-guardian/runs", workspace.to_str().unwrap());
+        fs::write(&config_path, source).unwrap();
+
+        let error = Config::load_from_sources(Some(&config_path)).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Invalid(message)
+                if message.contains("configuration source path")
+        ));
+    }
+
+    #[test]
+    fn loaded_config_file_outside_workspace_root_is_accepted() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("runs");
+        fs::create_dir(&workspace).unwrap();
+        let config_path = temporary.path().join("config.toml");
+        let source = MINIMAL.replace("/var/lib/file-guardian/runs", workspace.to_str().unwrap());
+        fs::write(&config_path, source).unwrap();
+
+        Config::load_from_sources(Some(&config_path)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_located_in_workspace_is_rejected_even_when_target_is_outside() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("runs");
+        fs::create_dir(&workspace).unwrap();
+        let actual_config = temporary.path().join("config.toml");
+        let source = MINIMAL.replace("/var/lib/file-guardian/runs", workspace.to_str().unwrap());
+        fs::write(&actual_config, source).unwrap();
+        let linked_config = workspace.join("config.toml");
+        symlink(&actual_config, &linked_config).unwrap();
+
+        let error = Config::load_from_sources(Some(&linked_config)).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Invalid(message) if message.contains("configuration source path")
+        ));
     }
 
     #[test]

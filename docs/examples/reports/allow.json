@@ -8,7 +8,44 @@
   "coverage": {
     "initial": {
       "status": "complete",
-      "analyzers": []
+      "analyzers": [
+        {
+          "analyzer_id": "password-scanner",
+          "phase": "initial",
+          "eligible": 0,
+          "assigned": 0,
+          "completed": 0,
+          "excluded": 0,
+          "status": "complete"
+        },
+        {
+          "analyzer_id": "publication-llm",
+          "phase": "initial",
+          "eligible": 0,
+          "assigned": 0,
+          "completed": 0,
+          "excluded": 0,
+          "status": "complete"
+        },
+        {
+          "analyzer_id": "publication-rules",
+          "phase": "initial",
+          "eligible": 0,
+          "assigned": 0,
+          "completed": 0,
+          "excluded": 0,
+          "status": "complete"
+        },
+        {
+          "analyzer_id": "secret-scanner",
+          "phase": "initial",
+          "eligible": 0,
+          "assigned": 0,
+          "completed": 0,
+          "excluded": 0,
+          "status": "complete"
+        }
+      ]
     },
     "verification": {
       "status": "not_run",

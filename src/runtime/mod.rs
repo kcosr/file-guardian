@@ -209,6 +209,31 @@ fn compile_policy_bindings(
         .iter()
         .filter(|binding| binding.profile == profile_id)
         .collect::<Vec<_>>();
+    let known_rule_set = known_rules
+        .iter()
+        .map(|(analyzer, rule)| (analyzer.as_str(), rule.as_str()))
+        .collect::<BTreeSet<_>>();
+    for binding in &configured {
+        let Some(rule) = binding.rule.as_deref() else {
+            continue;
+        };
+        let analyzer_has_rules = known_rule_set
+            .iter()
+            .any(|(analyzer, _)| *analyzer == binding.analyzer);
+        if rule == "*" {
+            if !analyzer_has_rules {
+                return Err(RuntimeError::Configuration(format!(
+                    "policy binding '{}' uses a wildcard rule selector, but analyzer '{}' loaded no rules",
+                    binding.id, binding.analyzer
+                )));
+            }
+        } else if !known_rule_set.contains(&(binding.analyzer.as_str(), rule)) {
+            return Err(RuntimeError::Configuration(format!(
+                "policy binding '{}' references rule '{}' which was not loaded for analyzer '{}'",
+                binding.id, rule, binding.analyzer
+            )));
+        }
+    }
     let mut bindings = configured
         .iter()
         .map(|binding| {
@@ -463,6 +488,48 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
+    fn config_with_rule_binding(rule: &str) -> Config {
+        let raw = format!(
+            r#"
+schema_version = "2"
+
+[authorization]
+default_profile = "publication"
+
+[authorization.workspace]
+root = "/var/lib/file-guardian/runs"
+
+[[authorization.profiles]]
+id = "publication"
+pipeline = "publication"
+action_mode = "evaluate"
+default_unbound_observation = "error"
+
+[[pipelines]]
+id = "publication"
+
+[[pipelines.stages]]
+id = "rules"
+analyzers = ["rules"]
+
+[[analyzers]]
+id = "rules"
+kind = "builtin_rules"
+rule_files = ["/etc/file-guardian/rules.toml"]
+
+[[policy_bindings]]
+id = "blocked"
+profile = "publication"
+analyzer = "rules"
+rule = "{rule}"
+directive = "deny"
+"#
+        );
+        let config: Config = toml::from_str(&raw).unwrap();
+        config.validate().unwrap();
+        config
+    }
+
     #[test]
     fn run_id_generation_uses_all_csprng_bytes() {
         let bytes = (0_u8..RANDOM_RUN_ID_BYTES as u8).collect::<Vec<_>>();
@@ -485,6 +552,21 @@ mod tests {
         assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
         assert_eq!(bytes.last(), Some(&b'\n'));
         assert_eq!(report.exit_code, 30);
+    }
+
+    #[test]
+    fn rule_bindings_reject_an_analyzer_that_loaded_no_rules() {
+        for rule in ["blocked", "*"] {
+            let config = config_with_rule_binding(rule);
+            let error =
+                compile_policy_bindings(&config, "publication", UnboundObservation::Error, &[])
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("loaded no rules")
+                    || error.to_string().contains("was not loaded"),
+                "unexpected error for selector {rule:?}: {error}"
+            );
+        }
     }
 
     #[test]
