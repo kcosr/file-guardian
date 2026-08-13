@@ -1,267 +1,224 @@
 # file-guardian
 
-A Rust service that scans directories for disallowed files based on configurable rules. Designed to run as root to monitor and enforce file policies across user directories.
+File Guardian is a fail-closed file authorization service. A caller can stage
+one file tree, run a one-shot policy evaluation, and use the process status and
+machine-readable report to decide whether that exact tree may be published. It
+can also run configured policy scans as explicit daemon jobs.
 
-> **⚠️ Important:** This tool provides best-effort detection of unapproved files in agent working directories, primarily to help prevent proprietary or sensitive data from being exfiltrated to model providers. Because it relies on periodic scanning rather than intercepting file operations, files may be read by an agent between scans. For comprehensive protection, use solutions that hook agent file access at the system or application level.
+The current implementation is evaluate-only: it inspects an immutable private
+copy, applies built-in filename and content rules, and never modifies the
+caller-owned staging tree.
 
-## Features
+> File Guardian is a policy gate, not a filesystem access-control boundary. The
+> caller must prevent every other writer from changing a staging tree while it
+> is being authorized and must atomically promote or consume that same tree
+> after a successful decision.
 
-- **Periodic scanning** of directories matching glob patterns (e.g., `/home/*`)
-- **Filename matching** via glob patterns (e.g., `*.exe`, `*.dll`)
-- **Content matching** via regex patterns (e.g., detect hardcoded passwords, API keys)
-- **Binary file detection** - automatically skips binary files for content scanning
-- **Configurable actions**:
-  - `warn` - log the violation only
-  - `remove` - delete the file
-  - `recover` - move file to a timestamped recovery directory
-- **Replacement stubs** - optional replacement content after remove/recover actions
-- **Dry-run mode** - test rules without modifying files
-- **Scan summaries** - optional JSON report per scan
-- **Rules from multiple sources** - inline in TOML config or from `.rules` files
+## Current features
+
+- One-shot authorization of exactly one literal regular file or directory.
+- Descriptor-anchored capture into a private, invocation-scoped workspace.
+- Immutable SHA-256-addressed objects shared by all analysis in the run.
+- Built-in filename glob and text-content regex matching.
+- Strict schema-v2 configuration and action-free TOML rule files.
+- Policy bindings that resolve findings independently of rule detection.
+- Exactly one compact JSON report on stdout for a recognized authorization
+  request; diagnostics and logs stay on stderr or in protected log files.
+- Explicit `policy_scan` daemon jobs with configured targets and schedules.
+
+The Pi classifier, deterministic password and secret scanner delegates,
+delete/quarantine actions, recursive archive inspection, and exact fingerprint
+indexes are planned. See [Roadmap](#roadmap).
 
 ## Install
 
-Download the latest archive for your platform from GitHub Releases:
-
-```text
-https://github.com/kcosr/file-guardian/releases
-```
-
-Supported release platforms are currently:
+Download the latest archive for your platform from
+[GitHub Releases](https://github.com/kcosr/file-guardian/releases). Supported
+release platforms are currently:
 
 - `linux-x86_64`
 - `macos-arm64`
 
-Extract the archive on the host that will run `file-guardian`. The archive
-contains the optimized binary, sample config, rule examples, and project
-documentation.
+The archive contains the optimized binary, sample schema-v2 configuration,
+TOML rule examples, and project documentation.
 
 ```bash
 RELEASE_ROOT=/path/to/file-guardian-VERSION-PLATFORM
 
 sudo install -m 0755 "$RELEASE_ROOT/bin/file-guardian" /usr/local/bin/file-guardian
-sudo mkdir -p /etc/file-guardian/rules.d
-sudo cp "$RELEASE_ROOT/config/config.toml" /etc/file-guardian/
-sudo cp "$RELEASE_ROOT/config/rules.d/"*.rules /etc/file-guardian/rules.d/
-sudo mkdir -p /var/log/file-guardian
-# Optional if scan.write_summaries = true
-sudo mkdir -p /var/log/file-guardian/summaries
-# Optional if recover action is used
-sudo mkdir -p /var/lib/file-guardian/recovered
+sudo install -d -m 0755 /etc/file-guardian/rules.d
+sudo cp "$RELEASE_ROOT/config/config.toml" /etc/file-guardian/config.toml
+sudo cp "$RELEASE_ROOT/config/rules.d/"*.toml /etc/file-guardian/rules.d/
+sudo install -d -m 0700 /var/lib/file-guardian/runs
+sudo install -d -m 0750 /var/log/file-guardian
 ```
 
-For unsupported platforms or local development, build from source in the
-[Development](#development) section.
+Run File Guardian under an account that can read the configured inputs and
+create private workspaces. Root is only necessary when those inputs require
+root access.
 
-## Usage
+## One-shot authorization
+
+```text
+file-guardian [--config FILE] authorize
+    [--profile PROFILE_ID]
+    [--request-id ID]
+    [--action-mode evaluate|apply]
+    PATH
+```
+
+`PATH` is one literal regular file or directory and represents one publication
+transaction. It is not glob-expanded, and a symlink or special file cannot be
+the transaction root.
 
 ```bash
-# Run with default config (/etc/file-guardian/config.toml)
-sudo file-guardian
-
-# Run with custom config
-sudo file-guardian --config /path/to/config.toml
-
-# Run once and exit (don't loop)
-sudo file-guardian --once
-
-# Dry-run mode (log violations without modifying files)
-sudo file-guardian --dry-run
-
-# Combine flags
-sudo file-guardian --once --dry-run
+file-guardian \
+  --config /etc/file-guardian/config.toml \
+  authorize \
+  --profile publication \
+  --request-id build-4821 \
+  --action-mode evaluate \
+  /srv/build-service/private-staging/upload-4821
 ```
 
-## Configuration
+For a syntactically valid `authorize` command, stdout contains exactly one
+compact JSON document followed by a newline. The caller must parse the document
+and verify that its `exit_code` equals the process status. Logs and diagnostics
+are never mixed into stdout.
 
-Configuration is loaded from (in order of precedence):
-1. `--config` command-line argument
-2. `FILE_GUARDIAN_CONFIG` environment variable
-3. `/etc/file-guardian/config.toml` (default)
+| Exit | Report outcome | Caller meaning |
+| ---: | --- | --- |
+| `0` | `allow` | Required analysis completed; the tree is allowed and unchanged. |
+| `10` | `allow_modified` | Reserved until safe actions and verification are implemented. |
+| `20` | `deny` | Required analysis completed; policy rejects the transaction. |
+| `30` | `error` | Capture, analysis, policy, configuration, or reporting is incomplete or untrustworthy. |
 
-### Example config.toml
+CLI syntax and help errors conventionally exit `2`. A publisher must fail
+closed on malformed, missing, truncated, or exit-inconsistent JSON and must
+publish only exits `0` and, once supported, `10`.
 
-```toml
-schema_version = "1"
+### Safe caller pattern
 
-[scan]
-# Glob patterns for directories to scan
-directories = ["/home/*"]
+1. Copy selected artifacts into a private staging directory.
+2. Stop all other writers to that directory.
+3. Invoke File Guardian once for the entire staged tree.
+4. Require valid JSON and matching process/report exit codes.
+5. Publish only an allowed result by atomically promoting or consuming the
+   exact staged tree.
 
-# Scan interval in seconds
-interval_secs = 3600
+Scan staged copies, never an active build workspace. A manifest hash identifies
+the captured transaction for audit; it does not authorize a later copy or a
+tree changed after the run.
 
-# Skip files larger than this (bytes)
-max_file_size = 10485760
+## Configuration and rules
 
-# Write summary files after each scan
-write_summaries = true
+Configuration schema `2` is a deliberate break from the old implicit scanner
+configuration. Configuration path precedence is `--config`, then
+`FILE_GUARDIAN_CONFIG`, then `/etc/file-guardian/config.toml`. Unknown fields, duplicate IDs,
+unresolved references, unsupported analyzers, invalid modes, relative
+administrator paths, and unsafe root overlap are rejected.
 
-# Directory to store scan summaries
-summary_dir = "/var/log/file-guardian/summaries"
+Schema v2 defines:
 
-# Layout for summary files: flat, daily, hourly
-summary_layout = "flat"
+- authorization workspace settings and named profiles;
+- ordered analyzer pipelines and stages;
+- analyzer definitions and immutable-content applicability limits;
+- policy bindings from observations to `audit`, `deny`, `delete`, or
+  `quarantine` directives;
+- explicit daemon jobs and logging settings.
 
-# Patterns to exclude
-exclude_patterns = ["*.git*", "node_modules"]
+The shipped [sample configuration](config/config.toml) is the source of truth
+for currently implemented syntax. A broader future-facing example is in
+[docs/examples/active-authorization-v2.toml](docs/examples/active-authorization-v2.toml);
+analyzer kinds not yet implemented fail validation rather than being silently
+ignored.
 
-[policy]
-# Default action: warn, remove, recover
-default_action = "warn"
+Rules are strict TOML documents. They describe detection only: rule IDs,
+filename globs, and content regexes. Rules do not contain actions. Policy
+bindings in the main configuration determine what a finding means for a
+profile, keeping detection reusable and policy resolution centralized. See the
+shipped [rule examples](config/rules.d/).
 
-# Recovery directory for 'recover' action
-recovery_dir = "/var/lib/file-guardian/recovered"
+Built-in content inspection fails closed by default when an assigned file is
+invalid UTF-8 or larger than its configured content ceiling. A configuration
+may explicitly make either case inapplicable; object read failures and digest
+or length disagreement are always errors.
 
-[policy.replacement]
-# Apply a replacement stub after remove/recover actions
-enabled = false
+## Daemon jobs
 
-# Replacement content to write
-content = "This file was removed due to policy violation.\n"
+Passive operation is explicit rather than an implicit default:
 
-# Optional marker used to suppress violations on replacement files
-# marker = "FILE_GUARDIAN_REPLACEMENT"
-
-[rules]
-# Directory containing .rules files
-rules_d = "/etc/file-guardian/rules.d"
-
-# Inline rules
-[[rules.inline]]
-name = "no-exe"
-filename_glob = "*.exe"
-action = "remove"
-
-[[rules.inline]]
-name = "detect-passwords"
-content_regex = "(?i)password\\s*=\\s*[\"'][^\"']+[\"']"
-action = "warn"
-
-[logging]
-level = "info"
-directory = "/var/log/file-guardian"
-max_bytes = 104857600
-max_files = 5
-console = false
+```text
+file-guardian [--config FILE] daemon [--job JOB_ID ...]
 ```
 
-When replacement stubs are enabled, files whose content exactly matches the
-replacement marker (or content when `marker` is unset) are suppressed from
-violation reporting. Binary files are never suppressed this way.
+Each configured `policy_scan` job names its profile, targets, and schedule. With
+one or more `--job` options, only those jobs run; otherwise all enabled daemon
+jobs run. A policy scan uses the same evaluate-only authorization engine and
+immutable-workspace guarantees as the one-shot command. It reports decisions
+through protected logging and does not mutate its targets.
 
-## Rules Files
+The shipped example job is disabled intentionally. Set a deployment-specific
+target and enable at least one job before starting the systemd service.
 
-Rules can be defined in `.rules` files in the `rules.d` directory. Format:
-
-```
-# Comments start with #
-name:type:pattern[:action]
-```
-
-- `name` - unique identifier for the rule
-- `type` - `glob` (filename) or `regex` (content)
-- `pattern` - the glob or regex pattern
-- `action` - optional, one of: `warn`, `remove`, `recover`
-
-### Example rules file
-
-```
-# Block executables
-no-exe:glob:*.exe:remove
-no-dll:glob:*.dll:remove
-
-# Detect secrets
-passwords:regex:(?i)password\s*=\s*["'][^"']+["']:warn
-aws-keys:regex:AKIA[0-9A-Z]{16}:recover
-private-keys:regex:-----BEGIN PRIVATE KEY-----:recover
-```
-
-## Recovery Directory Structure
-
-When using the `recover` action, files are moved to:
-```
-/var/lib/file-guardian/recovered/
-└── 2026-01-14T10-36-40/
-    ├── --home--kevin--sensitive.txt
-    └── --home--alice--secrets.conf
-```
-
-The original path is encoded in the filename by replacing `/` with `--`.
-
-The recovery directory is created on-demand when a `recover` action executes.
-
-## Logging
-
-Logs are written to:
-- Console (if `logging.console = true`)
-- File (if `logging.directory` is set)
-
-Log rotation is automatic based on `max_bytes` and `max_files` settings.
-
-Override log level via environment:
-```bash
-FILE_GUARDIAN_LOG_LEVEL=debug file-guardian
-```
-
-## Scan Summaries
-
-When `scan.write_summaries = true`, each scan writes a summary file to
-`scan.summary_dir`. The filename uses the run timestamp (for example,
-`2026-01-14T10-36-40.json`), and the parent directory is controlled by
-`scan.summary_layout` (`flat`, `daily`, or `hourly`). For example, `daily`
-layout produces:
-
-```
-/var/log/file-guardian/summaries/
-└── 2026-01-14/
-    └── 2026-01-14T10-36-40.json
-```
-
-Set `scan.write_summaries = false` to disable summary file creation.
-
-## Running as a Service
-
-Create a systemd unit file at `/etc/systemd/system/file-guardian.service`:
+Example systemd unit:
 
 ```ini
 [Unit]
-Description=File Guardian - Policy enforcement scanner
-After=network.target
+Description=File Guardian policy scans
+After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/file-guardian
+ExecStart=/usr/local/bin/file-guardian --config /etc/file-guardian/config.toml daemon
 Restart=on-failure
 RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Enable and start:
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable file-guardian
-sudo systemctl start file-guardian
+sudo systemctl enable --now file-guardian
 ```
+
+## Security model
+
+- The caller retains exclusive ownership of live staging throughout a run.
+- Capture rejects symlinks, hardlinks, special files, cross-filesystem
+  traversal, unstable metadata, and unsafe input/workspace overlap.
+- All analyzers read captured immutable objects, never live staging paths.
+- Reports contain artifact-relative paths and safe reason codes, not matched
+  secrets, raw content, prompts, native scanner output, absolute staging or
+  workspace paths, credentials, or environment values.
+- Required capture or analyzer uncertainty becomes exit `30`, never allow.
+- Evaluate-only mode never deletes, quarantines, redacts, or rewrites input.
+
+## Roadmap
+
+Implementation proceeds in this order:
+
+1. Contract, immutable inspection, and read-only one-shot authorization.
+2. Ordered analyzer pipelines and an internal, read-only Pi LLM classifier,
+   initially audit-only.
+3. Sandboxed deterministic password and secret scanner delegates.
+4. Centralized, journaled delete and invocation-scoped quarantine with complete
+   post-action verification; this introduces exit `10`.
+5. Bounded recursive archive inspection.
+6. Manual then incremental exact-hash fingerprint indexes with concurrent
+   SQLite readers and optional per-index daemon schedules.
+7. Narrow deterministic redaction, followed separately by similarity
+   fingerprints.
+
+The full technical contract and sequencing are documented in
+[docs/active-authorization-analyzer-pipeline.md](docs/active-authorization-analyzer-pipeline.md).
 
 ## Development
 
-Use source builds for local development or unsupported release platforms. Run
-build commands from the cloned repository root.
-
-```bash
-cargo build --release
-```
-
-The release binary is:
-
-```text
-target/release/file-guardian
-```
-
-For substantial code changes, run:
+Run build commands from the cloned repository root:
 
 ```bash
 cargo fmt
@@ -270,11 +227,13 @@ cargo test
 cargo build --release
 ```
 
+The release binary is `target/release/file-guardian`.
+
 ## Release
 
-Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
-Use `current` when `Cargo.toml` already has the intended release version, use
-`patch`, `minor`, or `major`, or pass an explicit version:
+Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`. Use
+`current` when `Cargo.toml` already has the intended version, use `patch`,
+`minor`, or `major`, or pass an explicit version:
 
 ```bash
 node scripts/release.mjs current
@@ -284,35 +243,29 @@ node scripts/release.mjs major
 node scripts/release.mjs 0.1.0
 ```
 
-The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
-matching git tag, creates a GitHub release with notes from the changelog,
-then commits a fresh `Unreleased` section for the next cycle.
+The script stamps the changelog, commits and tags the release, pushes it,
+creates the GitHub release, and prepares a fresh `Unreleased` section. If
+GitHub release creation fails after the commit and tag are pushed, create the
+release manually for the existing tag rather than rerunning the script.
 
-If GitHub release creation fails after the commit and tag are pushed, recover
-by creating the release manually for the existing tag instead of rerunning the
-script. Then add a fresh `## [Unreleased]` section with the standard
-`_No unreleased changes._` placeholder, commit it as
-`Prepare for next release`, and push `main`.
-
-Release binaries are packaged separately after the target-platform binary has
-been built by the release operator. Build Linux x86_64 on Linux, and build
-macOS ARM64 natively on Apple Silicon. Supported release archives currently use
-these names:
+Supported archives are named:
 
 ```text
 file-guardian-VERSION-linux-x86_64.tar.gz
 file-guardian-VERSION-macos-arm64.tar.gz
 ```
 
-Each archive should contain one top-level directory named
-`file-guardian-VERSION-PLATFORM` with:
+Each archive has one `file-guardian-VERSION-PLATFORM` directory containing:
 
-- `bin/file-guardian` - policy scanner binary.
+- `bin/file-guardian`
 - `README.md`
 - `LICENSE`
 - `CHANGELOG.md`
 - `config/`
 - `requirements.md`
+
+Build Linux x86_64 on Linux and macOS ARM64 natively on Apple Silicon. Inspect
+the archive layout and verify checksums before publishing it.
 
 Example packaging flow:
 

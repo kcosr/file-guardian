@@ -6,6 +6,7 @@ use thiserror::Error;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueCode {
+    ConfigurationFailure,
     InputUnavailable,
     WorkspaceFailure,
     EnumerationFailure,
@@ -25,10 +26,12 @@ pub enum IssueCode {
     AnalyzerFailure,
     InvalidAnalyzerOutput,
     IncompleteCoverage,
+    PolicyResolutionFailure,
     InternalFailure,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct InspectionIssue {
     pub phase: InspectionPhase,
     pub code: IssueCode,

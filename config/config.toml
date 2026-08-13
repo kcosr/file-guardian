@@ -1,80 +1,70 @@
-schema_version = "1"
+# File Guardian schema 2 is a deliberate break from the legacy implicit scan
+# configuration. This example is evaluate-only and works without network
+# access or an external analyzer.
+schema_version = "2"
 
-[scan]
-# Glob patterns for directories to scan
-directories = ["/home/*"]
+[authorization]
+default_profile = "publication"
 
-# Scan interval in seconds (default: 1 hour)
-interval_secs = 3600
+[authorization.workspace]
+root = "/var/lib/file-guardian/runs"
 
-# Maximum file size to scan (10 MiB default, skips larger files)
-max_file_size = 10485760
+[authorization.workspace.capture]
+max_files = 100000
+max_file_bytes = 1073741824
+max_total_bytes = 10737418240
+max_depth = 64
 
-# Write summary files after each scan
-write_summaries = true
+[[authorization.profiles]]
+id = "publication"
+pipeline = "publication"
+action_mode = "evaluate"
+default_unbound_observation = "error"
 
-# Directory to store scan summaries
-summary_dir = "/var/log/file-guardian/summaries"
+[[pipelines]]
+id = "publication"
 
-# Layout for summary files: flat, daily, hourly
-summary_layout = "flat"
+[[pipelines.stages]]
+id = "built-in-policy"
+execution = "serial"
+max_concurrency = 1
+analyzers = ["publication-rules"]
+prior_observations = "none"
 
-# Patterns to exclude from scanning
-exclude_patterns = [
-    "*.git*",
-    "node_modules",
-    ".cache",
-]
+[[analyzers]]
+id = "publication-rules"
+kind = "builtin_rules"
+required = true
+rule_files = ["/etc/file-guardian/rules.d/publication.toml"]
+max_content_bytes = 16777216
 
-[policy]
-# Default action when a rule doesn't specify one: warn, remove, recover
-default_action = "warn"
+[analyzers.content_applicability]
+invalid_utf8 = "fail"
+over_max_bytes = "fail"
 
-# Directory for recovered files (used with 'recover' action)
-recovery_dir = "/var/lib/file-guardian/recovered"
+[analyzers.selection]
+include = ["**"]
+exclude = []
+artifact_kinds = ["physical_file"]
 
-[policy.replacement]
-# Apply a replacement stub after remove/recover actions
+[[policy_bindings]]
+id = "publication-rules-deny"
+profile = "publication"
+analyzer = "publication-rules"
+rule = "*"
+directive = "deny"
+
+[[daemon.jobs]]
+id = "uploads"
 enabled = false
+kind = "policy_scan"
+profile = "publication"
+every_secs = 300
+run_on_start = true
 
-# Replacement content to write
-content = """
-This file has been removed by file-guardian due to policy violation.
-Contact your system administrator for more information.
-"""
-
-# Optional marker used to suppress violations on replacement files
-# marker = "FILE_GUARDIAN_REPLACEMENT"
-
-[rules]
-# Directory containing .rules files (one rule per line)
-rules_d = "/etc/file-guardian/rules.d"
-
-# Inline rules defined in this config file
-[[rules.inline]]
-name = "no-exe"
-filename_glob = "*.exe"
-action = "warn"
-
-[[rules.inline]]
-name = "no-dll"
-filename_glob = "*.dll"
-action = "warn"
-
-[[rules.inline]]
-name = "hardcoded-passwords"
-content_regex = "(?i)password\\s*=\\s*[\"'][^\"']+[\"']"
-action = "warn"
-
-[[rules.inline]]
-name = "aws-keys"
-content_regex = "AKIA[0-9A-Z]{16}"
-action = "warn"
-
-[[rules.inline]]
-name = "private-keys"
-content_regex = "-----BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----"
-action = "warn"
+[daemon.jobs.target]
+kind = "literal"
+path = "/srv/uploads"
 
 [logging]
 level = "info"

@@ -1,496 +1,385 @@
-use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
 use clap::Parser;
-use serde::Serialize;
-use tokio::signal;
-use tokio::time;
-
-use file_guardian::config::{Config, SummaryLayout};
+use file_guardian::cli::{ActionMode, Args, AuthorizeArgs, Command, DaemonArgs};
+use file_guardian::config::{
+    ActionMode as ConfigActionMode, Config, DaemonJobConfig, DaemonJobKind, DaemonTarget,
+};
+use file_guardian::domain::{IssueCode, RunId};
 use file_guardian::logging::LoggingSettings;
-use file_guardian::rules::load_rules;
-use file_guardian::scanner::{format_violation, ScanError, Scanner, Violation};
-
-#[derive(Debug, Parser)]
-#[command(
-    author,
-    version,
-    about = "Scans directories for disallowed files based on rules"
-)]
-struct Args {
-    /// Path to configuration file
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    /// Run once and exit (don't loop)
-    #[arg(long)]
-    once: bool,
-
-    /// Dry-run mode: log violations but don't modify files
-    #[arg(long)]
-    dry_run: bool,
-}
+use file_guardian::report::{AuthorizationOutcome, AuthorizationReport, ReportIdentifier};
+use file_guardian::runtime::{
+    compile_invocation, report_from_result, secure_run_id, startup_error_report, ReportContext,
+};
+use file_guardian::service::AuthorizationService;
+use tokio::signal;
+use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+    match args.command {
+        Command::Authorize(authorize) => run_authorize_command(args.config.as_deref(), authorize),
+        Command::Daemon(daemon) => run_daemon_command(args.config.as_deref(), daemon).await,
+    }
+}
 
-    // Load configuration
-    let config = match Config::load_from_sources(args.config.as_deref()) {
+fn run_authorize_command(config_path: Option<&Path>, args: AuthorizeArgs) -> ExitCode {
+    let run_id = match secure_run_id() {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            eprintln!("failed to obtain secure randomness: {error}");
+            return emit_report(&startup_error_report(
+                fallback_report_id(),
+                request_id(&args),
+                IssueCode::InternalFailure,
+                "secure run identity could not be generated",
+            ));
+        }
+    };
+    let config = match Config::load_from_sources(config_path) {
         Ok(config) => config,
-        Err(err) => {
-            eprintln!("failed to load config: {err}");
-            return ExitCode::from(1);
+        Err(error) => {
+            eprintln!("failed to load authorization configuration: {error}");
+            return emit_report(&startup_error_report(
+                run_id,
+                request_id(&args),
+                IssueCode::ConfigurationFailure,
+                "authorization configuration could not be loaded",
+            ));
         }
     };
-
-    // Initialize logging
-    let logging_settings = match LoggingSettings::from_config(&config.logging) {
-        Ok(settings) => settings,
-        Err(err) => {
-            eprintln!("failed to validate logging config: {err}");
-            return ExitCode::from(1);
-        }
-    };
-
-    let _guards = match logging_settings.init_tracing() {
+    let _logging = match init_logging(&config) {
         Ok(guards) => guards,
-        Err(err) => {
-            eprintln!("failed to init logging: {err}");
-            return ExitCode::from(1);
+        Err(error) => {
+            eprintln!("failed to initialize logging: {error}");
+            return emit_report(&startup_error_report(
+                run_id,
+                request_id(&args),
+                IssueCode::ConfigurationFailure,
+                "authorization logging could not be initialized",
+            ));
         }
     };
-
-    tracing::info!("file-guardian starting");
-
-    if args.dry_run {
-        tracing::info!("running in dry-run mode - no files will be modified");
-    }
-
-    // Load rules
-    let rules = match load_rules(&config.rules) {
-        Ok(rules) => rules,
-        Err(err) => {
-            tracing::error!("failed to load rules: {err}");
-            return ExitCode::from(1);
-        }
-    };
-
-    tracing::info!("loaded {} rules", rules.len());
-    for rule in &rules {
-        tracing::debug!(
-            "rule: name={} glob={:?} regex={} source={}",
-            rule.name,
-            rule.filename_glob.as_ref().map(|p| p.as_str()),
-            rule.content_regex.is_some(),
-            rule.source
-        );
-    }
-
-    if rules.is_empty() {
-        tracing::warn!("no rules configured - nothing to scan for");
-    }
-
-    // Create scanner
-    let scanner = match Scanner::new(config.clone(), rules, args.dry_run) {
-        Ok(s) => s,
-        Err(err) => {
-            tracing::error!("failed to create scanner: {err}");
-            return ExitCode::from(1);
-        }
-    };
-
-    if args.once {
-        // Single scan mode
-        run_scan(&scanner, &config);
-        tracing::info!("file-guardian scan complete");
-    } else {
-        // Periodic scan mode
-        let interval = Duration::from_secs(config.scan.interval_secs);
-        tracing::info!("scanning every {} seconds", config.scan.interval_secs);
-
-        // Run initial scan
-        run_scan(&scanner, &config);
-
-        // Set up periodic scanning with graceful shutdown
-        let mut interval_timer = time::interval(interval);
-        interval_timer.tick().await; // Skip the first immediate tick (we just ran a scan)
-
-        loop {
-            tokio::select! {
-                _ = interval_timer.tick() => {
-                    run_scan(&scanner, &config);
-                }
-                _ = signal::ctrl_c() => {
-                    tracing::info!("received shutdown signal");
-                    break;
-                }
-            }
-        }
-
-        tracing::info!("file-guardian shutting down");
-    }
-
-    ExitCode::SUCCESS
-}
-
-fn run_scan(scanner: &Scanner, config: &Config) {
-    tracing::info!("starting scan");
-
-    let started_at = Local::now();
-    let run_id = started_at.format("%Y-%m-%dT%H-%M-%S").to_string();
-    let started = Instant::now();
-    let mut action_errors = HashMap::new();
-
-    let results = scanner.scan_with_handler(|result| match result {
-        Ok(violation) => {
-            tracing::warn!("violation: {}", format_violation(violation));
-
-            if let Err(err) = scanner.execute_action(violation) {
-                tracing::error!(
-                    "failed to execute action {} on {}: {err}",
-                    violation.action,
-                    violation.path.display()
-                );
-                action_errors.insert(violation.path.clone(), err.to_string());
-            }
-        }
-        Err(err) => {
-            tracing::error!("scan error: {err}");
-        }
-    });
-
-    let finished_at = Local::now();
-    let duration_ms = started.elapsed().as_millis() as u64;
-    let summary = build_summary(
-        &run_id,
-        &started_at,
-        &finished_at,
-        duration_ms,
-        &results,
-        &action_errors,
-    );
-
-    if config.scan.write_summaries {
-        match write_summary(config, &run_id, &started_at, &summary) {
-            Ok(path) => {
-                tracing::info!("wrote scan summary to {}", path.display());
-            }
-            Err(err) => {
-                tracing::error!("failed to write scan summary: {err}");
-            }
-        }
-    }
-
-    let error_count = summary.scan_error_count + summary.action_error_count;
-    tracing::info!(
-        "scan complete: {} violations found, {} errors",
-        summary.violation_count,
-        error_count
-    );
-}
-
-#[derive(Debug, Serialize)]
-struct ScanSummary {
-    run_id: String,
-    started_at: String,
-    finished_at: String,
-    duration_ms: u64,
-    violation_count: usize,
-    scan_error_count: usize,
-    action_error_count: usize,
-    violations: Vec<ViolationSummary>,
-    scan_errors: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ViolationSummary {
-    path: String,
-    rule: String,
-    match_type: String,
-    action: String,
-    owner: String,
-    size: u64,
-    mtime: String,
-    snippet: Option<String>,
-    dry_run: bool,
-    action_error: Option<String>,
-}
-
-impl ViolationSummary {
-    fn from_violation(violation: &Violation, action_error: Option<&String>) -> Self {
-        Self {
-            path: violation.path.display().to_string(),
-            rule: violation.rule_name.clone(),
-            match_type: violation.match_type.to_string(),
-            action: violation.action.to_string(),
-            owner: violation.file_info.owner_string(),
-            size: violation.file_info.size,
-            mtime: violation.file_info.mtime_string(),
-            snippet: violation.content_snippet.clone(),
-            dry_run: violation.dry_run,
-            action_error: action_error.cloned(),
+    match authorize_with_config(&config, &args, run_id) {
+        Ok(report) => emit_report(&report),
+        Err((run_id, message)) => {
+            eprintln!("authorization could not start: {message}");
+            emit_report(&startup_error_report(
+                run_id,
+                request_id(&args),
+                IssueCode::ConfigurationFailure,
+                "authorization request could not be compiled",
+            ))
         }
     }
 }
 
-fn build_summary(
-    run_id: &str,
-    started_at: &chrono::DateTime<chrono::Local>,
-    finished_at: &chrono::DateTime<chrono::Local>,
-    duration_ms: u64,
-    results: &[Result<Violation, ScanError>],
-    action_errors: &HashMap<PathBuf, String>,
-) -> ScanSummary {
-    let violations: Vec<ViolationSummary> = results
-        .iter()
-        .filter_map(|result| {
-            result.as_ref().ok().map(|violation| {
-                let action_error = action_errors.get(&violation.path);
-                ViolationSummary::from_violation(violation, action_error)
-            })
-        })
-        .collect();
-
-    let scan_errors: Vec<String> = results
-        .iter()
-        .filter_map(|result| result.as_ref().err().map(|err| err.to_string()))
-        .collect();
-
-    ScanSummary {
-        run_id: run_id.to_string(),
-        started_at: started_at.to_rfc3339(),
-        finished_at: finished_at.to_rfc3339(),
-        duration_ms,
-        violation_count: violations.len(),
-        scan_error_count: scan_errors.len(),
-        action_error_count: action_errors.len(),
-        violations,
-        scan_errors,
-    }
-}
-
-fn summary_parent_dir(config: &Config, started_at: &chrono::DateTime<chrono::Local>) -> PathBuf {
-    match config.scan.summary_layout {
-        SummaryLayout::Flat => config.scan.summary_dir.clone(),
-        SummaryLayout::Daily => {
-            let day = started_at.format("%Y-%m-%d").to_string();
-            config.scan.summary_dir.join(day)
-        }
-        SummaryLayout::Hourly => {
-            let day = started_at.format("%Y-%m-%d").to_string();
-            let hour = started_at.format("%H").to_string();
-            config.scan.summary_dir.join(day).join(hour)
-        }
-    }
-}
-
-fn write_summary(
+fn authorize_with_config(
     config: &Config,
-    run_id: &str,
-    started_at: &chrono::DateTime<chrono::Local>,
-    summary: &ScanSummary,
-) -> Result<PathBuf, String> {
-    let dir = summary_parent_dir(config, started_at);
-    fs::create_dir_all(&dir)
-        .map_err(|err| format!("create summary dir {}: {err}", dir.display()))?;
+    args: &AuthorizeArgs,
+    run_id: RunId,
+) -> Result<AuthorizationReport, (RunId, String)> {
+    let started = Instant::now();
+    let compiled = compile_invocation(
+        config,
+        args.profile.as_deref(),
+        args.action_mode.map(|mode| match mode {
+            ActionMode::Evaluate => ConfigActionMode::Evaluate,
+            ActionMode::Apply => ConfigActionMode::Apply,
+        }),
+        run_id.clone(),
+        args.path.clone(),
+    )
+    .map_err(|error| (run_id.clone(), error.to_string()))?;
+    let result = AuthorizationService::authorize(compiled.request);
+    report_from_result(
+        ReportContext {
+            run_id: run_id.clone(),
+            request_id: request_id(args),
+            policy: Some(compiled.policy),
+            duration_ms: elapsed_millis(started),
+        },
+        result,
+    )
+    .map_err(|error| (run_id, error.to_string()))
+}
 
-    let path = dir.join(format!("{run_id}.json"));
-    let payload =
-        serde_json::to_string_pretty(summary).map_err(|err| format!("serialize summary: {err}"))?;
-    fs::write(&path, payload).map_err(|err| format!("write summary {}: {err}", path.display()))?;
+fn emit_report(report: &AuthorizationReport) -> ExitCode {
+    let mut stdout = io::stdout().lock();
+    match write_report(&mut stdout, report) {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("failed to write authorization report: {error}");
+            ExitCode::from(30)
+        }
+    }
+}
 
-    Ok(path)
+fn write_report(
+    writer: &mut impl Write,
+    report: &AuthorizationReport,
+) -> Result<u8, file_guardian::report::ReportWriteError> {
+    report.write_json_line(writer)?;
+    writer.flush()?;
+    Ok(report.exit_code as u8)
+}
+
+async fn run_daemon_command(config_path: Option<&Path>, args: DaemonArgs) -> ExitCode {
+    let config = match Config::load_from_sources(config_path) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("failed to load daemon configuration: {error}");
+            return ExitCode::from(30);
+        }
+    };
+    let _logging = match init_logging(&config) {
+        Ok(guards) => guards,
+        Err(error) => {
+            eprintln!("failed to initialize logging: {error}");
+            return ExitCode::from(30);
+        }
+    };
+    let jobs = match config.validate_for_daemon(&args.jobs) {
+        Ok(jobs) => jobs.into_iter().cloned().collect::<Vec<_>>(),
+        Err(error) => {
+            tracing::error!("daemon configuration is invalid: {error}");
+            return ExitCode::from(30);
+        }
+    };
+    let config = Arc::new(config);
+    let (failed_tx, mut failed_rx) = mpsc::channel::<String>(jobs.len());
+    let mut handles = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let config = Arc::clone(&config);
+        let failed_tx = failed_tx.clone();
+        handles.push(tokio::spawn(async move {
+            run_daemon_loop(config, job, failed_tx).await;
+        }));
+    }
+    drop(failed_tx);
+
+    let status = tokio::select! {
+        result = signal::ctrl_c() => {
+            match result {
+                Ok(()) => {
+                    tracing::info!("received shutdown signal");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    tracing::error!("failed to listen for shutdown signal: {error}");
+                    ExitCode::from(30)
+                }
+            }
+        }
+        failed = failed_rx.recv() => {
+            if let Some(job_id) = failed {
+                tracing::error!(job_id, "daemon policy scan became unhealthy");
+            } else {
+                tracing::error!("all daemon jobs stopped unexpectedly");
+            }
+            ExitCode::from(30)
+        }
+    };
+    for handle in handles {
+        handle.abort();
+    }
+    status
+}
+
+async fn run_daemon_loop(config: Arc<Config>, job: DaemonJobConfig, failed: mpsc::Sender<String>) {
+    let DaemonJobKind::PolicyScan {
+        profile,
+        target,
+        every_secs,
+        run_on_start,
+    } = &job.kind;
+    if *run_on_start
+        && !run_daemon_scan_blocking(
+            Arc::clone(&config),
+            job.id.clone(),
+            profile.clone(),
+            target.clone(),
+        )
+        .await
+    {
+        let _ = failed.send(job.id).await;
+        return;
+    }
+    let mut interval = tokio::time::interval(Duration::from_secs(*every_secs));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if !run_daemon_scan_blocking(
+            Arc::clone(&config),
+            job.id.clone(),
+            profile.clone(),
+            target.clone(),
+        )
+        .await
+        {
+            let _ = failed.send(job.id).await;
+            return;
+        }
+    }
+}
+
+async fn run_daemon_scan_blocking(
+    config: Arc<Config>,
+    job_id: String,
+    profile: String,
+    target: DaemonTarget,
+) -> bool {
+    match tokio::task::spawn_blocking(move || run_daemon_scan(&config, &job_id, &profile, &target))
+        .await
+    {
+        Ok(healthy) => healthy,
+        Err(error) => {
+            tracing::error!("daemon policy scan task failed: {error}");
+            false
+        }
+    }
+}
+
+fn run_daemon_scan(config: &Config, job_id: &str, profile: &str, target: &DaemonTarget) -> bool {
+    let targets = match resolve_targets(target) {
+        Ok(targets) if !targets.is_empty() => targets,
+        Ok(_) => {
+            tracing::error!(job_id, "daemon target matched no inputs");
+            return false;
+        }
+        Err(error) => {
+            tracing::error!(job_id, "daemon targets could not be resolved: {error}");
+            return false;
+        }
+    };
+    for path in targets {
+        let run_id = match secure_run_id() {
+            Ok(run_id) => run_id,
+            Err(error) => {
+                tracing::error!(
+                    job_id,
+                    "secure run identity could not be generated: {error}"
+                );
+                return false;
+            }
+        };
+        let args = AuthorizeArgs {
+            profile: Some(profile.to_string()),
+            request_id: None,
+            action_mode: Some(ActionMode::Evaluate),
+            path,
+        };
+        let report = match authorize_with_config(config, &args, run_id) {
+            Ok(report) => report,
+            Err((_, error)) => {
+                tracing::error!(job_id, "daemon authorization could not start: {error}");
+                return false;
+            }
+        };
+        match report.to_json_line() {
+            Ok(line) => {
+                if let Err(error) = io::stderr().lock().write_all(&line) {
+                    tracing::error!(job_id, "daemon report could not be written: {error}");
+                    return false;
+                }
+            }
+            Err(error) => {
+                tracing::error!(job_id, "daemon report could not be serialized: {error}");
+                return false;
+            }
+        }
+        if report.outcome == AuthorizationOutcome::Error {
+            return false;
+        }
+    }
+    true
+}
+
+fn resolve_targets(target: &DaemonTarget) -> Result<Vec<PathBuf>, String> {
+    match target {
+        DaemonTarget::Literal { path } => Ok(vec![path.clone()]),
+        DaemonTarget::Patterns { patterns } => {
+            let mut paths = BTreeSet::new();
+            for pattern in patterns {
+                for entry in glob::glob(pattern).map_err(|error| error.to_string())? {
+                    let path = entry.map_err(|error| error.to_string())?;
+                    paths.insert(path);
+                }
+            }
+            Ok(paths.into_iter().collect())
+        }
+    }
+}
+
+fn request_id(args: &AuthorizeArgs) -> Option<ReportIdentifier> {
+    args.request_id
+        .as_ref()
+        .map(|value| ReportIdentifier::new(value.clone()).expect("Clap validated request ID"))
+}
+
+fn init_logging(config: &Config) -> Result<file_guardian::logging::LoggingGuards, String> {
+    LoggingSettings::from_config(&config.logging)
+        .map_err(|error| error.to_string())?
+        .init_tracing()
+        .map_err(|error| error.to_string())
+}
+
+fn fallback_report_id() -> RunId {
+    RunId::from_suffix("startup-error").expect("static fallback report ID is valid")
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use file_guardian::config::{LoggingConfig, PolicyConfig, RulesConfig, ScanConfig};
-    use file_guardian::rules::{CompiledRule, RuleSource};
-    use glob::Pattern;
-    use std::fs;
-    use std::path::Path;
-    use tempfile::tempdir;
+    use file_guardian::report::ReportIdentifier;
 
-    fn test_config(
-        root: &Path,
-        summary_dir: &Path,
-        write_summaries: bool,
-        summary_layout: SummaryLayout,
-    ) -> Config {
-        let scan = ScanConfig {
-            directories: vec![format!("{}/{}", root.display(), "*")],
-            summary_dir: summary_dir.to_path_buf(),
-            summary_layout,
-            write_summaries,
-            ..ScanConfig::default()
-        };
+    struct FailingWriter;
 
-        Config {
-            schema_version: "1".to_string(),
-            scan,
-            policy: PolicyConfig::default(),
-            rules: RulesConfig::default(),
-            logging: LoggingConfig::default(),
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
     #[test]
-    fn run_scan_writes_summary_when_enabled() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("bad.txt");
-        fs::write(&file_path, "bad").unwrap();
-
-        let summary_dir = dir.path().join("summaries");
-        let config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Flat);
-        let rules = vec![CompiledRule {
-            name: "all-txt".to_string(),
-            filename_glob: Some(Pattern::new("*.txt").unwrap()),
-            content_regex: None,
-            action: Some(file_guardian::config::PolicyAction::Warn),
-            source: RuleSource::Inline,
-        }];
-
-        let scanner = Scanner::new(config.clone(), rules, true).unwrap();
-        run_scan(&scanner, &config);
-
-        let entries: Vec<_> = fs::read_dir(&summary_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .collect();
-        assert_eq!(entries.len(), 1);
-
-        let summary_path = entries[0].path();
-        assert!(summary_path.is_file());
-
-        let payload = fs::read_to_string(&summary_path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(value["violation_count"].as_u64(), Some(1));
-        assert_eq!(value["scan_error_count"].as_u64(), Some(0));
-        let run_id = value["run_id"].as_str().unwrap();
-        let summary_name = summary_path
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-        assert_eq!(summary_name, format!("{run_id}.json"));
-    }
-
-    #[test]
-    fn run_scan_skips_summary_when_disabled() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("bad.txt");
-        fs::write(&file_path, "bad").unwrap();
-
-        let summary_dir = dir.path().join("summaries");
-        let config = test_config(dir.path(), &summary_dir, false, SummaryLayout::Flat);
-        let rules = vec![CompiledRule {
-            name: "all-txt".to_string(),
-            filename_glob: Some(Pattern::new("*.txt").unwrap()),
-            content_regex: None,
-            action: Some(file_guardian::config::PolicyAction::Warn),
-            source: RuleSource::Inline,
-        }];
-
-        let scanner = Scanner::new(config.clone(), rules, true).unwrap();
-        run_scan(&scanner, &config);
-
-        assert!(!summary_dir.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn run_scan_records_action_error() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("bad.txt");
-        fs::write(&file_path, "bad").unwrap();
-
-        let summary_dir = dir.path().join("summaries");
-        let mut config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Flat);
-        let recovery_target = dir.path().join("recovery-target");
-        fs::write(&recovery_target, "not a directory").unwrap();
-        config.policy.recovery_dir = recovery_target;
-
-        let rules = vec![CompiledRule {
-            name: "recover".to_string(),
-            filename_glob: Some(Pattern::new("*.txt").unwrap()),
-            content_regex: None,
-            action: Some(file_guardian::config::PolicyAction::Recover),
-            source: RuleSource::Inline,
-        }];
-
-        let scanner = Scanner::new(config.clone(), rules, false).unwrap();
-        run_scan(&scanner, &config);
-
-        let entries: Vec<_> = fs::read_dir(&summary_dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .collect();
-        assert_eq!(entries.len(), 1);
-
-        let summary_path = entries[0].path();
-        let payload = fs::read_to_string(&summary_path).unwrap();
-        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-        assert_eq!(value["action_error_count"].as_u64(), Some(1));
-        assert!(value["violations"][0]["action_error"].as_str().is_some());
-    }
-
-    #[test]
-    fn write_summary_uses_daily_layout() {
-        let dir = tempdir().unwrap();
-        let summary_dir = dir.path().join("summaries");
-        let config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Daily);
-
-        let started_at = Local::now();
-        let run_id = started_at.format("%Y-%m-%dT%H-%M-%S").to_string();
-        let summary = ScanSummary {
-            run_id: run_id.clone(),
-            started_at: started_at.to_rfc3339(),
-            finished_at: started_at.to_rfc3339(),
-            duration_ms: 0,
-            violation_count: 0,
-            scan_error_count: 0,
-            action_error_count: 0,
-            violations: Vec::new(),
-            scan_errors: Vec::new(),
+    fn target_resolution_is_sorted_and_deduplicated() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("b.txt"), b"b").unwrap();
+        std::fs::write(temp.path().join("a.txt"), b"a").unwrap();
+        let target = DaemonTarget::Patterns {
+            patterns: vec![
+                format!("{}/*.txt", temp.path().display()),
+                format!("{}/a.*", temp.path().display()),
+            ],
         };
-
-        let path = write_summary(&config, &run_id, &started_at, &summary).unwrap();
-
-        let expected_dir = summary_dir.join(started_at.format("%Y-%m-%d").to_string());
-        assert_eq!(path, expected_dir.join(format!("{run_id}.json")));
+        assert_eq!(
+            resolve_targets(&target).unwrap(),
+            vec![temp.path().join("a.txt"), temp.path().join("b.txt")]
+        );
     }
 
     #[test]
-    fn write_summary_uses_hourly_layout() {
-        let dir = tempdir().unwrap();
-        let summary_dir = dir.path().join("summaries");
-        let config = test_config(dir.path(), &summary_dir, true, SummaryLayout::Hourly);
-
-        let started_at = Local::now();
-        let run_id = started_at.format("%Y-%m-%dT%H-%M-%S").to_string();
-        let summary = ScanSummary {
-            run_id: run_id.clone(),
-            started_at: started_at.to_rfc3339(),
-            finished_at: started_at.to_rfc3339(),
-            duration_ms: 0,
-            violation_count: 0,
-            scan_error_count: 0,
-            action_error_count: 0,
-            violations: Vec::new(),
-            scan_errors: Vec::new(),
-        };
-
-        let path = write_summary(&config, &run_id, &started_at, &summary).unwrap();
-
-        let expected_dir = summary_dir
-            .join(started_at.format("%Y-%m-%d").to_string())
-            .join(started_at.format("%H").to_string());
-        assert_eq!(path, expected_dir.join(format!("{run_id}.json")));
+    fn report_writer_failure_is_detectable_before_success_exit() {
+        let report = startup_error_report(
+            RunId::from_suffix("write-error").unwrap(),
+            Some(ReportIdentifier::new("request").unwrap()),
+            IssueCode::InternalFailure,
+            "test report",
+        );
+        assert!(write_report(&mut FailingWriter, &report).is_err());
     }
 }

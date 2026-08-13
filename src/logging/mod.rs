@@ -108,7 +108,7 @@ impl LoggingSettings {
                 )?;
 
             let sink: Box<dyn Write + Send> = if self.console {
-                Box::new(TeeWriter::new(file_writer, io::stdout()))
+                Box::new(TeeWriter::new(file_writer, io::stderr()))
             } else {
                 Box::new(file_writer)
             };
@@ -126,7 +126,7 @@ impl LoggingSettings {
             })
         } else if self.console {
             builder
-                .with_writer(io::stdout)
+                .with_writer(io::stderr)
                 .try_init()
                 .map_err(LoggingError::InitFailed)?;
 

@@ -1,3 +1,11 @@
+//! Strict, versioned service configuration.
+//!
+//! Schema 2 is an intentional replacement for the original implicit scanner
+//! configuration.  It has no aliases, legacy parser, or semantic environment
+//! overrides: the environment may select the configuration file and nothing
+//! else.
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -5,9 +13,10 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::logging::LoggingSettings;
+use crate::policy::PolicyDirective;
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/file-guardian/config.toml";
-const DEFAULT_SCHEMA_VERSION: &str = "1";
+pub const CONFIG_SCHEMA_VERSION: &str = "2";
+pub const DEFAULT_CONFIG_PATH: &str = "/etc/file-guardian/config.toml";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -17,14 +26,12 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-
     #[error("failed to parse config {path}: {source}")]
     ParseToml {
         path: PathBuf,
         #[source]
         source: toml::de::Error,
     },
-
     #[error("invalid configuration: {0}")]
     Invalid(String),
 }
@@ -36,333 +43,924 @@ pub enum ConfigPathKind {
     Default,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default = "default_schema_version")]
     pub schema_version: String,
-
+    pub authorization: AuthorizationConfig,
+    pub pipelines: Vec<PipelineConfig>,
+    pub analyzers: Vec<AnalyzerConfig>,
     #[serde(default)]
-    pub scan: ScanConfig,
-
+    pub policy_bindings: Vec<PolicyBindingConfig>,
     #[serde(default)]
-    pub policy: PolicyConfig,
-
-    #[serde(default)]
-    pub rules: RulesConfig,
-
+    pub daemon: DaemonConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
 }
 
 impl Config {
     pub fn load_from_sources(cli_path: Option<&Path>) -> Result<Self, ConfigError> {
-        let (path, _kind) = Self::resolve_path(cli_path);
+        let (path, _) = Self::resolve_path(cli_path);
         let raw = fs::read_to_string(&path).map_err(|source| ConfigError::Io {
             path: path.clone(),
             source,
         })?;
-
-        let mut config: Config = toml::from_str(&raw).map_err(|source| ConfigError::ParseToml {
-            path: path.clone(),
-            source,
-        })?;
-
-        config.apply_env_overrides();
+        let config = toml::from_str::<Self>(&raw)
+            .map_err(|source| ConfigError::ParseToml { path, source })?;
         config.validate()?;
-
         Ok(config)
     }
 
     pub fn resolve_path(cli_path: Option<&Path>) -> (PathBuf, ConfigPathKind) {
-        if let Some(p) = cli_path {
-            (p.to_path_buf(), ConfigPathKind::Explicit)
-        } else if let Ok(env_path) = env::var("FILE_GUARDIAN_CONFIG") {
-            (PathBuf::from(env_path), ConfigPathKind::Env)
+        if let Some(path) = cli_path {
+            (path.to_path_buf(), ConfigPathKind::Explicit)
+        } else if let Some(path) = env::var_os("FILE_GUARDIAN_CONFIG") {
+            (PathBuf::from(path), ConfigPathKind::Env)
         } else {
             (PathBuf::from(DEFAULT_CONFIG_PATH), ConfigPathKind::Default)
         }
     }
 
-    fn apply_env_overrides(&mut self) {
-        if let Ok(level) = env::var("FILE_GUARDIAN_LOG_LEVEL") {
-            if !level.trim().is_empty() {
-                self.logging.level = level;
-            }
-        }
-    }
-
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.schema_version != DEFAULT_SCHEMA_VERSION {
-            return Err(ConfigError::Invalid(format!(
-                "unsupported schema_version {}, expected {}",
-                self.schema_version, DEFAULT_SCHEMA_VERSION
-            )));
-        }
-
-        if self.scan.directories.is_empty() {
-            return Err(ConfigError::Invalid(
-                "scan.directories must contain at least one glob pattern".to_string(),
+        if self.schema_version != CONFIG_SCHEMA_VERSION {
+            return invalid(format!(
+                "unsupported schema_version '{}'; expected '{CONFIG_SCHEMA_VERSION}'",
+                self.schema_version
             ));
         }
-
-        if self.scan.interval_secs == 0 {
-            return Err(ConfigError::Invalid(
-                "scan.interval_secs must be greater than zero".to_string(),
-            ));
+        validate_absolute(
+            "authorization.workspace.root",
+            &self.authorization.workspace.root,
+        )?;
+        let limits = &self.authorization.workspace.capture;
+        if limits.max_files == 0
+            || limits.max_file_bytes == 0
+            || limits.max_total_bytes == 0
+            || limits.max_depth == 0
+        {
+            return invalid("authorization.workspace.capture limits must all be greater than zero");
+        }
+        if limits.max_file_bytes > limits.max_total_bytes {
+            return invalid(
+                "authorization.workspace.capture.max_file_bytes must not exceed max_total_bytes",
+            );
         }
 
-        if !self.policy.recovery_dir.is_absolute() {
-            return Err(ConfigError::Invalid(
-                "policy.recovery_dir must be an absolute path".to_string(),
+        let profiles = unique_by(
+            "authorization.profiles",
+            &self.authorization.profiles,
+            |p| &p.id,
+        )?;
+        let pipelines = unique_by("pipelines", &self.pipelines, |p| &p.id)?;
+        let analyzers = unique_by("analyzers", &self.analyzers, |a| &a.id)?;
+        unique_by("policy_bindings", &self.policy_bindings, |b| &b.id)?;
+        unique_by("daemon.jobs", &self.daemon.jobs, |j| &j.id)?;
+
+        validate_id(
+            "authorization.default_profile",
+            &self.authorization.default_profile,
+        )?;
+        if !profiles.contains_key(self.authorization.default_profile.as_str()) {
+            return invalid(format!(
+                "authorization.default_profile '{}' does not resolve",
+                self.authorization.default_profile
             ));
         }
-
-        if self.scan.write_summaries && !self.scan.summary_dir.is_absolute() {
-            return Err(ConfigError::Invalid(
-                "scan.summary_dir must be an absolute path".to_string(),
-            ));
+        if profiles.is_empty() || pipelines.is_empty() || analyzers.is_empty() {
+            return invalid("profiles, pipelines, and analyzers must not be empty");
         }
 
-        if let Some(ref rules_d) = self.rules.rules_d {
-            if !rules_d.is_absolute() {
-                return Err(ConfigError::Invalid(
-                    "rules.rules_d must be an absolute path".to_string(),
+        for profile in &self.authorization.profiles {
+            validate_id("authorization.profiles.id", &profile.id)?;
+            if !pipelines.contains_key(profile.pipeline.as_str()) {
+                return invalid(format!(
+                    "profile '{}' references unknown pipeline '{}'",
+                    profile.id, profile.pipeline
                 ));
             }
         }
 
-        for (i, rule) in self.rules.inline.iter().enumerate() {
-            rule.validate()
-                .map_err(|e| ConfigError::Invalid(format!("rules.inline[{i}]: {e}")))?;
+        let mut used_analyzers = BTreeSet::new();
+        for pipeline in &self.pipelines {
+            validate_id("pipelines.id", &pipeline.id)?;
+            if pipeline.stages.is_empty() {
+                return invalid(format!(
+                    "pipeline '{}' must contain at least one stage",
+                    pipeline.id
+                ));
+            }
+            unique_by("pipelines.stages", &pipeline.stages, |stage| &stage.id)?;
+            for stage in &pipeline.stages {
+                validate_id("pipelines.stages.id", &stage.id)?;
+                if stage.analyzers.is_empty() {
+                    return invalid(format!(
+                        "pipeline '{}' stage '{}' must contain at least one analyzer",
+                        pipeline.id, stage.id
+                    ));
+                }
+                if stage.execution == StageExecution::Parallel && stage.max_concurrency == 0 {
+                    return invalid(format!(
+                        "pipeline '{}' stage '{}' max_concurrency must be greater than zero",
+                        pipeline.id, stage.id
+                    ));
+                }
+                for analyzer in &stage.analyzers {
+                    if !analyzers.contains_key(analyzer.as_str()) {
+                        return invalid(format!(
+                            "pipeline '{}' stage '{}' references unknown analyzer '{}'",
+                            pipeline.id, stage.id, analyzer
+                        ));
+                    }
+                    if !used_analyzers.insert((pipeline.id.as_str(), analyzer.as_str())) {
+                        return invalid(format!(
+                            "pipeline '{}' uses analyzer '{}' more than once",
+                            pipeline.id, analyzer
+                        ));
+                    }
+                }
+            }
         }
 
-        if let Err(err) = LoggingSettings::from_config(&self.logging) {
-            return Err(ConfigError::Invalid(format!("{err}")));
+        for analyzer in &self.analyzers {
+            analyzer.validate()?;
+            for path in analyzer.administrator_paths() {
+                validate_disjoint(
+                    "authorization.workspace.root",
+                    &self.authorization.workspace.root,
+                    "analyzer administrator path",
+                    path,
+                )?;
+            }
         }
-
+        for binding in &self.policy_bindings {
+            binding.validate(&profiles, &analyzers)?;
+            let bound_analyzer = &self.analyzers[analyzers[binding.analyzer.as_str()]];
+            match (&binding.rule, &binding.classification, &bound_analyzer.kind) {
+                (Some(_), None, AnalyzerKind::PiClassifier { .. }) => {
+                    return invalid(format!(
+                        "policy binding '{}' uses a rule selector for Pi analyzer '{}'",
+                        binding.id, binding.analyzer
+                    ));
+                }
+                (None, Some(code), AnalyzerKind::PiClassifier { vocabulary, .. }) => {
+                    if !vocabulary.classifications.contains(code) {
+                        return invalid(format!(
+                            "policy binding '{}' classification '{}' is outside analyzer '{}' vocabulary",
+                            binding.id, code, binding.analyzer
+                        ));
+                    }
+                }
+                (None, Some(_), _) => {
+                    return invalid(format!(
+                        "policy binding '{}' uses a classification selector for non-Pi analyzer '{}'",
+                        binding.id, binding.analyzer
+                    ));
+                }
+                _ => {}
+            }
+            let profile = &self.authorization.profiles[profiles[binding.profile.as_str()]];
+            let pipeline = &self.pipelines[pipelines[profile.pipeline.as_str()]];
+            if !pipeline
+                .stages
+                .iter()
+                .any(|stage| stage.analyzers.contains(&binding.analyzer))
+            {
+                return invalid(format!(
+                    "policy binding '{}' references analyzer '{}' outside profile '{}' pipeline",
+                    binding.id, binding.analyzer, binding.profile
+                ));
+            }
+        }
+        validate_binding_ambiguity(&self.policy_bindings)?;
+        for job in &self.daemon.jobs {
+            job.validate(&profiles)?;
+        }
+        if let Some(directory) = &self.logging.directory {
+            validate_absolute("logging.directory", directory)?;
+            validate_disjoint(
+                "authorization.workspace.root",
+                &self.authorization.workspace.root,
+                "logging.directory",
+                directory,
+            )?;
+        }
+        LoggingSettings::from_config(&self.logging)
+            .map_err(|error| ConfigError::Invalid(error.to_string()))?;
         Ok(())
     }
+
+    pub fn validate_for_authorize(
+        &self,
+        profile_id: Option<&str>,
+    ) -> Result<AuthorizationSelection<'_>, ConfigError> {
+        self.validate_for_authorize_mode(profile_id, None)
+    }
+
+    /// Validate a one-shot selection and resolve requested authority. Passing
+    /// `evaluate` may downgrade an apply-capable profile; it can never upgrade
+    /// an evaluate-only profile.
+    pub fn validate_for_authorize_mode(
+        &self,
+        profile_id: Option<&str>,
+        requested_mode: Option<ActionMode>,
+    ) -> Result<AuthorizationSelection<'_>, ConfigError> {
+        self.validate()?;
+        let requested = profile_id.unwrap_or(&self.authorization.default_profile);
+        let profile = self
+            .authorization
+            .profiles
+            .iter()
+            .find(|profile| profile.id == requested)
+            .ok_or_else(|| {
+                ConfigError::Invalid(format!("unknown authorization profile '{requested}'"))
+            })?;
+        let pipeline = self
+            .pipelines
+            .iter()
+            .find(|pipeline| pipeline.id == profile.pipeline)
+            .expect("validated pipeline reference");
+        if pipeline.stages.iter().any(|stage| {
+            stage.execution != StageExecution::Serial
+                || stage.prior_observations != PriorObservations::None
+        }) {
+            return invalid(format!(
+                "profile '{}' selects stage execution semantics unavailable in this authorization phase",
+                profile.id
+            ));
+        }
+        if profile.action_mode == ActionMode::Evaluate && requested_mode == Some(ActionMode::Apply)
+        {
+            return invalid(format!(
+                "profile '{}' does not grant requested apply authority",
+                profile.id
+            ));
+        }
+        let effective_mode = requested_mode.unwrap_or(profile.action_mode);
+        if effective_mode != ActionMode::Evaluate {
+            return invalid(format!(
+                "profile '{}' requires apply mode, which is unavailable in evaluate-only authorization; request evaluate explicitly to downgrade",
+                profile.id
+            ));
+        }
+        for analyzer_id in pipeline.stages.iter().flat_map(|stage| &stage.analyzers) {
+            let analyzer = self
+                .analyzer(analyzer_id)
+                .expect("validated analyzer reference");
+            if !matches!(analyzer.kind, AnalyzerKind::BuiltinRules { .. }) {
+                return invalid(format!(
+                    "profile '{}' selects analyzer '{}' whose kind is not available in this authorization phase",
+                    profile.id, analyzer.id
+                ));
+            }
+            if analyzer.selection.include != ["**"]
+                || !analyzer.selection.exclude.is_empty()
+                || analyzer.selection.artifact_kinds != [ArtifactKindConfig::PhysicalFile]
+            {
+                return invalid(format!(
+                    "profile '{}' selects analyzer '{}' with selection semantics unavailable in this authorization phase",
+                    profile.id, analyzer.id
+                ));
+            }
+        }
+        Ok(AuthorizationSelection {
+            profile,
+            pipeline,
+            effective_mode,
+        })
+    }
+
+    pub fn analyzer(&self, id: &str) -> Option<&AnalyzerConfig> {
+        self.analyzers.iter().find(|analyzer| analyzer.id == id)
+    }
+
+    pub fn bindings_for_profile<'a>(
+        &'a self,
+        profile: &'a str,
+    ) -> impl Iterator<Item = &'a PolicyBindingConfig> + 'a {
+        self.policy_bindings
+            .iter()
+            .filter(move |binding| binding.profile == profile)
+    }
+
+    /// Select enabled daemon jobs. An empty selector means every enabled job.
+    pub fn validate_for_daemon(
+        &self,
+        selected: &[String],
+    ) -> Result<Vec<&DaemonJobConfig>, ConfigError> {
+        self.validate()?;
+        let wanted = selected.iter().collect::<BTreeSet<_>>();
+        for id in &wanted {
+            if !self.daemon.jobs.iter().any(|job| &job.id == *id) {
+                return invalid(format!("unknown daemon job '{id}'"));
+            }
+        }
+        let jobs = self
+            .daemon
+            .jobs
+            .iter()
+            .filter(|job| job.enabled && (wanted.is_empty() || wanted.contains(&job.id)))
+            .collect::<Vec<_>>();
+        if jobs.is_empty() {
+            return invalid("daemon selection contains no enabled jobs");
+        }
+        for job in &jobs {
+            let DaemonJobKind::PolicyScan { profile, .. } = &job.kind;
+            self.validate_for_authorize(Some(profile))?;
+        }
+        Ok(jobs)
+    }
 }
 
-fn default_schema_version() -> String {
-    DEFAULT_SCHEMA_VERSION.to_string()
+#[derive(Clone, Copy, Debug)]
+pub struct AuthorizationSelection<'a> {
+    pub profile: &'a AuthorizationProfile,
+    pub pipeline: &'a PipelineConfig,
+    pub effective_mode: ActionMode,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SummaryLayout {
-    #[default]
-    Flat,
-    Daily,
-    Hourly,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationConfig {
+    pub default_profile: String,
+    pub workspace: WorkspaceConfig,
+    pub profiles: Vec<AuthorizationProfile>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScanConfig {
-    #[serde(default = "default_directories")]
-    pub directories: Vec<String>,
-
-    #[serde(default = "default_interval_secs")]
-    pub interval_secs: u64,
-
-    #[serde(default = "default_max_file_size")]
-    pub max_file_size: u64,
-
-    #[serde(default = "default_summary_dir", alias = "results_dir")]
-    pub summary_dir: PathBuf,
-
-    #[serde(default = "default_summary_layout")]
-    pub summary_layout: SummaryLayout,
-
-    #[serde(default = "default_write_summaries")]
-    pub write_summaries: bool,
-
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    pub root: PathBuf,
     #[serde(default)]
-    pub exclude_patterns: Vec<String>,
+    pub capture: CaptureConfig,
 }
 
-impl Default for ScanConfig {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureConfig {
+    #[serde(default = "default_max_files")]
+    pub max_files: u64,
+    #[serde(default = "default_max_file_bytes")]
+    pub max_file_bytes: u64,
+    #[serde(default = "default_max_total_bytes")]
+    pub max_total_bytes: u64,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+}
+
+impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
-            directories: default_directories(),
-            interval_secs: default_interval_secs(),
-            max_file_size: default_max_file_size(),
-            summary_dir: default_summary_dir(),
-            summary_layout: default_summary_layout(),
-            write_summaries: default_write_summaries(),
-            exclude_patterns: Vec::new(),
+            max_files: default_max_files(),
+            max_file_bytes: default_max_file_bytes(),
+            max_total_bytes: default_max_total_bytes(),
+            max_depth: default_max_depth(),
         }
     }
 }
 
-fn default_directories() -> Vec<String> {
-    vec!["/home/*".to_string()]
+fn default_max_files() -> u64 {
+    100_000
+}
+fn default_max_file_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_max_total_bytes() -> u64 {
+    10 * 1024 * 1024 * 1024
+}
+fn default_max_depth() -> usize {
+    64
 }
 
-fn default_interval_secs() -> u64 {
-    3600
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthorizationProfile {
+    pub id: String,
+    pub pipeline: String,
+    #[serde(default)]
+    pub action_mode: ActionMode,
+    #[serde(default)]
+    pub default_unbound_observation: UnboundObservation,
 }
 
-fn default_max_file_size() -> u64 {
-    10 * 1024 * 1024 // 10 MiB
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionMode {
+    #[default]
+    Evaluate,
+    Apply,
 }
 
-fn default_summary_dir() -> PathBuf {
-    PathBuf::from("/var/log/file-guardian/summaries")
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnboundObservation {
+    Audit,
+    Deny,
+    #[default]
+    Error,
 }
 
-fn default_summary_layout() -> SummaryLayout {
-    SummaryLayout::Flat
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineConfig {
+    pub id: String,
+    pub stages: Vec<StageConfig>,
 }
 
-fn default_write_summaries() -> bool {
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageConfig {
+    pub id: String,
+    #[serde(default)]
+    pub execution: StageExecution,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+    pub analyzers: Vec<String>,
+    #[serde(default)]
+    pub prior_observations: PriorObservations,
+}
+
+fn default_max_concurrency() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageExecution {
+    #[default]
+    Serial,
+    Parallel,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorObservations {
+    #[default]
+    None,
+    FindingsSummary,
+    AllSummary,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnalyzerConfig {
+    pub id: String,
+    #[serde(default = "default_required")]
+    pub required: bool,
+    #[serde(flatten)]
+    pub kind: AnalyzerKind,
+    #[serde(default)]
+    pub selection: SelectionConfig,
+    #[serde(default)]
+    pub limits: AnalyzerLimits,
+}
+
+fn default_required() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PolicyAction {
-    #[default]
-    Warn,
-    Remove,
-    Recover,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AnalyzerKind {
+    BuiltinRules {
+        rule_files: Vec<PathBuf>,
+        #[serde(default = "default_builtin_max_content_bytes")]
+        max_content_bytes: u64,
+        #[serde(default)]
+        content_applicability: ContentApplicabilityConfig,
+    },
+    PiClassifier {
+        #[serde(default)]
+        scope: ClassifierScope,
+        pi: Box<PiConfig>,
+        vocabulary: Box<VocabularyConfig>,
+    },
+    ExternalTool {
+        adapter: PathBuf,
+        #[serde(default)]
+        args: Vec<String>,
+        protocol: String,
+        sandbox: String,
+    },
 }
 
-impl std::fmt::Display for PolicyAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Warn => write!(f, "warn"),
-            Self::Remove => write!(f, "remove"),
-            Self::Recover => write!(f, "recover"),
-        }
-    }
+fn default_builtin_max_content_bytes() -> u64 {
+    16 * 1024 * 1024
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplacementConfig {
-    #[serde(default)]
-    pub enabled: bool,
-
-    #[serde(default = "default_replacement_content")]
-    pub content: String,
-
-    #[serde(default)]
-    pub marker: Option<String>,
-}
-
-impl Default for ReplacementConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            content: default_replacement_content(),
-            marker: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PolicyConfig {
-    #[serde(default)]
-    pub default_action: PolicyAction,
-
-    #[serde(default = "default_recovery_dir")]
-    pub recovery_dir: PathBuf,
-
-    #[serde(default)]
-    pub replacement: ReplacementConfig,
-}
-
-impl Default for PolicyConfig {
-    fn default() -> Self {
-        Self {
-            default_action: PolicyAction::default(),
-            recovery_dir: default_recovery_dir(),
-            replacement: ReplacementConfig::default(),
-        }
-    }
-}
-
-fn default_recovery_dir() -> PathBuf {
-    PathBuf::from("/var/lib/file-guardian/recovered")
-}
-
-fn default_replacement_content() -> String {
-    "This file has been removed by file-guardian due to policy violation.\n".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RulesConfig {
-    #[serde(default)]
-    pub rules_d: Option<PathBuf>,
-
-    #[serde(default)]
-    pub inline: Vec<InlineRule>,
-}
-
-impl Default for RulesConfig {
-    fn default() -> Self {
-        Self {
-            rules_d: Some(PathBuf::from("/etc/file-guardian/rules.d")),
-            inline: Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InlineRule {
-    pub name: String,
-
-    #[serde(default)]
-    pub filename_glob: Option<String>,
-
-    #[serde(default)]
-    pub content_regex: Option<String>,
-
-    #[serde(default)]
-    pub action: Option<PolicyAction>,
-}
-
-impl InlineRule {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.name.trim().is_empty() {
-            return Err("rule name must not be empty".to_string());
-        }
-
-        if self.filename_glob.is_none() && self.content_regex.is_none() {
-            return Err(format!(
-                "rule '{}' must have at least filename_glob or content_regex",
-                self.name
+impl AnalyzerConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_id("analyzers.id", &self.id)?;
+        if !self.required {
+            return invalid(format!(
+                "analyzer '{}' is optional, but incomplete advisory coverage is not enabled in schema 2",
+                self.id
             ));
         }
-
-        if let Some(ref pattern) = self.filename_glob {
-            glob::Pattern::new(pattern)
-                .map_err(|e| format!("rule '{}' has invalid filename_glob: {e}", self.name))?;
+        self.selection.validate(&self.id)?;
+        self.limits.validate(&self.id)?;
+        match &self.kind {
+            AnalyzerKind::BuiltinRules {
+                rule_files,
+                max_content_bytes,
+                ..
+            } => {
+                if rule_files.is_empty() || *max_content_bytes == 0 {
+                    return invalid(format!("built-in analyzer '{}' requires rule files and a positive max_content_bytes", self.id));
+                }
+                for path in rule_files {
+                    validate_absolute("analyzers.rule_files", path)?;
+                }
+            }
+            AnalyzerKind::PiClassifier { pi, vocabulary, .. } => {
+                pi.validate(&self.id)?;
+                vocabulary.validate(&self.id)?;
+            }
+            AnalyzerKind::ExternalTool {
+                adapter,
+                protocol,
+                sandbox,
+                ..
+            } => {
+                validate_absolute("analyzers.adapter", adapter)?;
+                if protocol.trim().is_empty() || sandbox != "required" {
+                    return invalid(format!(
+                        "external analyzer '{}' requires a protocol and sandbox = 'required'",
+                        self.id
+                    ));
+                }
+            }
         }
+        Ok(())
+    }
 
-        if let Some(ref pattern) = self.content_regex {
-            regex::Regex::new(pattern)
-                .map_err(|e| format!("rule '{}' has invalid content_regex: {e}", self.name))?;
+    fn administrator_paths(&self) -> Vec<&Path> {
+        match &self.kind {
+            AnalyzerKind::BuiltinRules { rule_files, .. } => {
+                rule_files.iter().map(PathBuf::as_path).collect()
+            }
+            AnalyzerKind::PiClassifier { pi, .. } => vec![
+                pi.executable.as_path(),
+                pi.instruction_file.as_path(),
+                pi.trusted_extension.as_path(),
+                pi.isolated_agent_dir.as_path(),
+            ],
+            AnalyzerKind::ExternalTool { adapter, .. } => vec![adapter.as_path()],
         }
+    }
+}
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClassifierScope {
+    Artifact,
+    #[default]
+    Tree,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContentApplicabilityConfig {
+    #[serde(default)]
+    pub invalid_utf8: ApplicabilityPolicy,
+    #[serde(default)]
+    pub over_max_bytes: ApplicabilityPolicy,
+}
+
+impl Default for ContentApplicabilityConfig {
+    fn default() -> Self {
+        Self {
+            invalid_utf8: ApplicabilityPolicy::Fail,
+            over_max_bytes: ApplicabilityPolicy::Fail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicabilityPolicy {
+    #[default]
+    Fail,
+    Exclude,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PiConfig {
+    pub executable: PathBuf,
+    pub expected_version: String,
+    pub provider: String,
+    pub model: String,
+    pub thinking: String,
+    pub instruction_file: PathBuf,
+    pub trusted_extension: PathBuf,
+    pub isolated_agent_dir: PathBuf,
+    pub output_schema: String,
+    pub tool_grant: String,
+    pub sandbox: String,
+}
+
+impl PiConfig {
+    fn validate(&self, id: &str) -> Result<(), ConfigError> {
+        for (field, path) in [
+            ("executable", &self.executable),
+            ("instruction_file", &self.instruction_file),
+            ("trusted_extension", &self.trusted_extension),
+            ("isolated_agent_dir", &self.isolated_agent_dir),
+        ] {
+            validate_absolute(field, path)?;
+        }
+        for value in [
+            &self.expected_version,
+            &self.provider,
+            &self.model,
+            &self.thinking,
+            &self.output_schema,
+            &self.tool_grant,
+            &self.sandbox,
+        ] {
+            if value.trim().is_empty() {
+                return invalid(format!(
+                    "Pi analyzer '{id}' contains an empty required field"
+                ));
+            }
+        }
+        if self.sandbox != "bubblewrap-v1" {
+            return invalid(format!(
+                "Pi analyzer '{id}' requires the bubblewrap-v1 sandbox"
+            ));
+        }
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VocabularyConfig {
+    pub classifications: Vec<String>,
+    pub confidences: Vec<String>,
+    pub reason_codes: Vec<String>,
+}
+
+impl VocabularyConfig {
+    fn validate(&self, id: &str) -> Result<(), ConfigError> {
+        for (name, values) in [
+            ("classifications", &self.classifications),
+            ("confidences", &self.confidences),
+            ("reason_codes", &self.reason_codes),
+        ] {
+            if values.is_empty() {
+                return invalid(format!(
+                    "Pi analyzer '{id}' vocabulary.{name} must not be empty"
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            for value in values {
+                validate_id("vocabulary value", value)?;
+                if !seen.insert(value) {
+                    return invalid(format!(
+                        "Pi analyzer '{id}' has duplicate vocabulary.{name} value '{value}'"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectionConfig {
+    #[serde(default = "default_include")]
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    #[serde(default = "default_artifact_kinds")]
+    pub artifact_kinds: Vec<ArtifactKindConfig>,
+}
+
+impl Default for SelectionConfig {
+    fn default() -> Self {
+        Self {
+            include: default_include(),
+            exclude: Vec::new(),
+            artifact_kinds: default_artifact_kinds(),
+        }
+    }
+}
+fn default_include() -> Vec<String> {
+    vec!["**".to_string()]
+}
+fn default_artifact_kinds() -> Vec<ArtifactKindConfig> {
+    vec![ArtifactKindConfig::PhysicalFile]
+}
+
+impl SelectionConfig {
+    fn validate(&self, id: &str) -> Result<(), ConfigError> {
+        if self.include.is_empty() || self.artifact_kinds.is_empty() {
+            return invalid(format!(
+                "analyzer '{id}' selection include and artifact_kinds must not be empty"
+            ));
+        }
+        for pattern in self.include.iter().chain(&self.exclude) {
+            glob::Pattern::new(pattern).map_err(|error| {
+                ConfigError::Invalid(format!(
+                    "analyzer '{id}' has invalid selection glob '{pattern}': {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKindConfig {
+    PhysicalFile,
+    ArchiveMember,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalyzerLimits {
+    pub wall_timeout_secs: Option<u64>,
+    pub memory_bytes: Option<u64>,
+    pub max_output_bytes: Option<u64>,
+    pub max_findings: Option<u64>,
+    pub max_tool_calls: Option<u64>,
+    pub max_bytes_read: Option<u64>,
+}
+
+impl AnalyzerLimits {
+    fn validate(&self, id: &str) -> Result<(), ConfigError> {
+        if [
+            self.wall_timeout_secs,
+            self.memory_bytes,
+            self.max_output_bytes,
+            self.max_findings,
+            self.max_tool_calls,
+            self.max_bytes_read,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| value == 0)
+        {
+            return invalid(format!("analyzer '{id}' limits must be greater than zero"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyBindingConfig {
+    pub id: String,
+    pub profile: String,
+    pub analyzer: String,
+    #[serde(default)]
+    pub rule: Option<String>,
+    #[serde(default)]
+    pub classification: Option<String>,
+    pub directive: PolicyDirective,
+}
+
+impl PolicyBindingConfig {
+    fn validate(
+        &self,
+        profiles: &BTreeMap<&str, usize>,
+        analyzers: &BTreeMap<&str, usize>,
+    ) -> Result<(), ConfigError> {
+        validate_id("policy_bindings.id", &self.id)?;
+        if !profiles.contains_key(self.profile.as_str()) {
+            return invalid(format!(
+                "policy binding '{}' references unknown profile '{}'",
+                self.id, self.profile
+            ));
+        }
+        if !analyzers.contains_key(self.analyzer.as_str()) {
+            return invalid(format!(
+                "policy binding '{}' references unknown analyzer '{}'",
+                self.id, self.analyzer
+            ));
+        }
+        if self.rule.is_some() == self.classification.is_some() {
+            return invalid(format!(
+                "policy binding '{}' must set exactly one of rule or classification",
+                self.id
+            ));
+        }
+        if let Some(value) = self.rule.as_deref().filter(|value| *value != "*") {
+            validate_id("policy_bindings.rule", value)?;
+        }
+        if let Some(value) = &self.classification {
+            validate_id("policy_bindings.classification", value)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    #[serde(default)]
+    pub jobs: Vec<DaemonJobConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DaemonJobConfig {
+    pub id: String,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub kind: DaemonJobKind,
+}
+fn default_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DaemonJobKind {
+    PolicyScan {
+        profile: String,
+        target: DaemonTarget,
+        every_secs: u64,
+        #[serde(default)]
+        run_on_start: bool,
+    },
+}
+
+impl DaemonJobConfig {
+    fn validate(&self, profiles: &BTreeMap<&str, usize>) -> Result<(), ConfigError> {
+        validate_id("daemon.jobs.id", &self.id)?;
+        match &self.kind {
+            DaemonJobKind::PolicyScan {
+                profile,
+                target,
+                every_secs,
+                ..
+            } => {
+                if !profiles.contains_key(profile.as_str()) {
+                    return invalid(format!(
+                        "daemon job '{}' references unknown profile '{profile}'",
+                        self.id
+                    ));
+                }
+                if *every_secs == 0 {
+                    return invalid(format!(
+                        "daemon job '{}' every_secs must be greater than zero",
+                        self.id
+                    ));
+                }
+                target.validate(&self.id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DaemonTarget {
+    Literal { path: PathBuf },
+    Patterns { patterns: Vec<String> },
+}
+
+impl DaemonTarget {
+    fn validate(&self, job: &str) -> Result<(), ConfigError> {
+        match self {
+            Self::Literal { path } => validate_absolute("daemon target", path),
+            Self::Patterns { patterns } => {
+                if patterns.is_empty() {
+                    return invalid(format!("daemon job '{job}' patterns must not be empty"));
+                }
+                for pattern in patterns {
+                    if !Path::new(pattern).is_absolute() {
+                        return invalid(format!(
+                            "daemon job '{job}' pattern must be absolute: {pattern}"
+                        ));
+                    }
+                    glob::Pattern::new(pattern).map_err(|error| {
+                        ConfigError::Invalid(format!(
+                            "daemon job '{job}' has invalid target pattern '{pattern}': {error}"
+                        ))
+                    })?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default)]
     pub directory: Option<PathBuf>,
-
     #[serde(default = "default_logging_level")]
     pub level: String,
-
     #[serde(default = "default_logging_max_bytes")]
     pub max_bytes: u64,
-
     #[serde(default = "default_logging_max_files")]
     pub max_files: usize,
-
     #[serde(default = "default_logging_console")]
     pub console: bool,
 }
@@ -378,124 +976,312 @@ impl Default for LoggingConfig {
         }
     }
 }
-
 fn default_logging_level() -> String {
     "info".to_string()
 }
-
 fn default_logging_max_bytes() -> u64 {
     104_857_600
 }
-
 fn default_logging_max_files() -> usize {
     5
 }
-
 fn default_logging_console() -> bool {
     true
+}
+
+fn unique_by<'a, T, F>(
+    label: &str,
+    values: &'a [T],
+    key: F,
+) -> Result<BTreeMap<&'a str, usize>, ConfigError>
+where
+    F: Fn(&'a T) -> &'a String,
+{
+    let mut found = BTreeMap::new();
+    for (index, value) in values.iter().enumerate() {
+        let id = key(value);
+        validate_id(label, id)?;
+        if found.insert(id.as_str(), index).is_some() {
+            return invalid(format!("duplicate {label} id '{id}'"));
+        }
+    }
+    Ok(found)
+}
+
+fn validate_id(field: &str, value: &str) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return invalid(format!(
+            "{field} must contain 1 to 128 safe identifier characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_absolute(field: &str, path: &Path) -> Result<(), ConfigError> {
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return invalid(format!("{field} must be an absolute path"));
+    }
+    Ok(())
+}
+
+fn validate_binding_ambiguity(bindings: &[PolicyBindingConfig]) -> Result<(), ConfigError> {
+    let mut exact = BTreeSet::new();
+    let mut wildcard = BTreeSet::new();
+    let mut classification = BTreeSet::new();
+    for binding in bindings {
+        let group = (binding.profile.as_str(), binding.analyzer.as_str());
+        if let Some(rule) = &binding.rule {
+            if rule == "*" {
+                if !wildcard.insert(group) {
+                    return invalid(format!(
+                        "multiple wildcard rule bindings exist for profile '{}' analyzer '{}'",
+                        binding.profile, binding.analyzer
+                    ));
+                }
+            } else if !exact.insert((group.0, group.1, rule.as_str())) {
+                return invalid(format!(
+                    "duplicate rule binding for profile '{}' analyzer '{}' rule '{}'",
+                    binding.profile, binding.analyzer, rule
+                ));
+            }
+        } else if let Some(code) = &binding.classification {
+            if !classification.insert((group.0, group.1, code.as_str())) {
+                return invalid(format!(
+                    "duplicate classification binding for profile '{}' analyzer '{}' classification '{}'",
+                    binding.profile, binding.analyzer, code
+                ));
+            }
+        }
+    }
+    for (profile, analyzer, _) in exact {
+        if wildcard.contains(&(profile, analyzer)) {
+            return invalid(format!(
+                "wildcard and exact rule bindings overlap for profile '{profile}' analyzer '{analyzer}'"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_disjoint(
+    left_name: &str,
+    left: &Path,
+    right_name: &str,
+    right: &Path,
+) -> Result<(), ConfigError> {
+    if left.starts_with(right) || right.starts_with(left) {
+        return invalid(format!("{left_name} and {right_name} must be disjoint"));
+    }
+    Ok(())
+}
+
+fn invalid<T>(message: impl Into<String>) -> Result<T, ConfigError> {
+    Err(ConfigError::Invalid(message.into()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn minimal_config() -> Config {
-        Config {
-            schema_version: DEFAULT_SCHEMA_VERSION.to_string(),
-            scan: ScanConfig::default(),
-            policy: PolicyConfig::default(),
-            rules: RulesConfig {
-                rules_d: None,
-                inline: vec![InlineRule {
-                    name: "test".to_string(),
-                    filename_glob: Some("*.exe".to_string()),
-                    content_regex: None,
-                    action: None,
-                }],
-            },
-            logging: LoggingConfig::default(),
-        }
+    const MINIMAL: &str = r#"
+schema_version = "2"
+
+[authorization]
+default_profile = "publication"
+
+[authorization.workspace]
+root = "/var/lib/file-guardian/runs"
+
+[[authorization.profiles]]
+id = "publication"
+pipeline = "publication"
+action_mode = "evaluate"
+default_unbound_observation = "error"
+
+[[pipelines]]
+id = "publication"
+
+[[pipelines.stages]]
+id = "rules"
+analyzers = ["rules"]
+
+[[analyzers]]
+id = "rules"
+kind = "builtin_rules"
+rule_files = ["/etc/file-guardian/rules.d/publication.toml"]
+
+[[policy_bindings]]
+id = "blocked"
+profile = "publication"
+analyzer = "rules"
+rule = "*"
+directive = "deny"
+"#;
+
+    fn parse(value: &str) -> Result<Config, toml::de::Error> {
+        toml::from_str(value)
     }
 
     #[test]
-    fn validate_accepts_minimal_config() {
-        let config = minimal_config();
-        assert!(config.validate().is_ok());
+    fn accepts_strict_minimal_v2() {
+        let config = parse(MINIMAL).unwrap();
+        config.validate().unwrap();
+        let selected = config.validate_for_authorize(None).unwrap();
+        assert_eq!(selected.pipeline.id, "publication");
     }
 
     #[test]
-    fn validate_rejects_bad_schema_version() {
-        let mut config = minimal_config();
-        config.schema_version = "999".to_string();
-        let err = config.validate().expect_err("should fail");
-        assert!(err.to_string().contains("schema_version"));
+    fn rejects_v1_and_unknown_fields() {
+        let v1 = MINIMAL.replacen("schema_version = \"2\"", "schema_version = \"1\"", 1);
+        assert!(parse(&v1).unwrap().validate().is_err());
+        assert!(parse(&MINIMAL.replace("root = \"/var", "legacy = true\nroot = \"/var")).is_err());
+        let analyzer_unknown = MINIMAL.replace(
+            "rule_files = [",
+            "legacy_action = \"remove\"\nrule_files = [",
+        );
+        assert!(parse(&analyzer_unknown).is_err());
     }
 
     #[test]
-    fn validate_rejects_empty_directories() {
-        let mut config = minimal_config();
-        config.scan.directories.clear();
-        let err = config.validate().expect_err("should fail");
-        assert!(err.to_string().contains("directories"));
+    fn rejects_duplicate_and_dangling_references() {
+        let duplicate = MINIMAL.replace(
+            "[[pipelines]]",
+            "[[pipelines]]\nid = \"publication\"\nstages = []\n\n[[pipelines]]",
+        );
+        assert!(parse(&duplicate).unwrap().validate().is_err());
+        let dangling = MINIMAL.replace("analyzers = [\"rules\"]", "analyzers = [\"missing\"]");
+        assert!(parse(&dangling).unwrap().validate().is_err());
     }
 
     #[test]
-    fn validate_rejects_zero_interval() {
-        let mut config = minimal_config();
-        config.scan.interval_secs = 0;
-        let err = config.validate().expect_err("should fail");
-        assert!(err.to_string().contains("interval_secs"));
+    fn config_path_precedence_is_cli_then_env_then_default() {
+        let explicit = Path::new("/tmp/explicit.toml");
+        assert_eq!(
+            Config::resolve_path(Some(explicit)),
+            (explicit.to_path_buf(), ConfigPathKind::Explicit)
+        );
     }
 
     #[test]
-    fn validate_rejects_relative_recovery_dir() {
-        let mut config = minimal_config();
-        config.policy.recovery_dir = PathBuf::from("relative/path");
-        let err = config.validate().expect_err("should fail");
-        assert!(err.to_string().contains("recovery_dir"));
+    fn daemon_selection_is_explicit_and_enabled_only() {
+        let extra = r#"
+
+[[daemon.jobs]]
+id = "uploads"
+kind = "policy_scan"
+enabled = true
+profile = "publication"
+every_secs = 300
+run_on_start = true
+
+[daemon.jobs.target]
+kind = "literal"
+path = "/srv/uploads"
+"#;
+        let config = parse(&format!("{MINIMAL}{extra}")).unwrap();
+        let jobs = config
+            .validate_for_daemon(&["uploads".to_string()])
+            .unwrap();
+        assert_eq!(jobs[0].id, "uploads");
     }
 
     #[test]
-    fn validate_rejects_relative_summary_dir() {
-        let mut config = minimal_config();
-        config.scan.summary_dir = PathBuf::from("relative/path");
-        let err = config.validate().expect_err("should fail");
-        assert!(err.to_string().contains("summary_dir"));
+    fn evaluate_can_downgrade_but_never_upgrade_authority() {
+        let mut config = parse(MINIMAL).unwrap();
+        config.authorization.profiles[0].action_mode = ActionMode::Apply;
+        assert!(config.validate_for_authorize(None).is_err());
+        assert_eq!(
+            config
+                .validate_for_authorize_mode(None, Some(ActionMode::Evaluate))
+                .unwrap()
+                .effective_mode,
+            ActionMode::Evaluate
+        );
+        assert!(config
+            .validate_for_authorize_mode(None, Some(ActionMode::Apply))
+            .is_err());
+        config.authorization.profiles[0].action_mode = ActionMode::Evaluate;
+        assert!(config
+            .validate_for_authorize_mode(None, Some(ActionMode::Apply))
+            .is_err());
     }
 
     #[test]
-    fn inline_rule_requires_pattern() {
-        let rule = InlineRule {
-            name: "empty".to_string(),
-            filename_glob: None,
-            content_regex: None,
-            action: None,
+    fn phase_two_rejects_unimplemented_pipeline_semantics() {
+        let mut config = parse(MINIMAL).unwrap();
+        config.pipelines[0].stages[0].execution = StageExecution::Parallel;
+        assert!(config.validate_for_authorize(None).is_err());
+        config.pipelines[0].stages[0].execution = StageExecution::Serial;
+        config.pipelines[0].stages[0].prior_observations = PriorObservations::AllSummary;
+        assert!(config.validate_for_authorize(None).is_err());
+        config.pipelines[0].stages[0].prior_observations = PriorObservations::None;
+        config.analyzers[0]
+            .selection
+            .exclude
+            .push("vendor/**".to_string());
+        assert!(config.validate_for_authorize(None).is_err());
+        config.analyzers[0].selection = SelectionConfig::default();
+        config.analyzers[0].kind = AnalyzerKind::ExternalTool {
+            adapter: PathBuf::from("/usr/libexec/file-guardian/scanner"),
+            args: Vec::new(),
+            protocol: "file-guardian-delegate/1".to_string(),
+            sandbox: "required".to_string(),
         };
-        let err = rule.validate().expect_err("should fail");
-        assert!(err.contains("filename_glob or content_regex"));
+        assert!(config.validate_for_authorize(None).is_err());
     }
 
     #[test]
-    fn inline_rule_validates_glob() {
-        let rule = InlineRule {
-            name: "bad-glob".to_string(),
-            filename_glob: Some("[invalid".to_string()),
-            content_regex: None,
-            action: None,
-        };
-        let err = rule.validate().expect_err("should fail");
-        assert!(err.contains("filename_glob"));
+    fn rejects_ambiguous_bindings_and_non_normal_admin_paths() {
+        let mut config = parse(MINIMAL).unwrap();
+        config.policy_bindings.push(PolicyBindingConfig {
+            id: "exact".to_string(),
+            profile: "publication".to_string(),
+            analyzer: "rules".to_string(),
+            rule: Some("specific".to_string()),
+            classification: None,
+            directive: PolicyDirective::Deny,
+        });
+        assert!(config.validate().is_err());
+
+        let mut config = parse(MINIMAL).unwrap();
+        config.authorization.workspace.root = PathBuf::from("/var/lib/../runs");
+        assert!(config.validate().is_err());
     }
 
     #[test]
-    fn inline_rule_validates_regex() {
-        let rule = InlineRule {
-            name: "bad-regex".to_string(),
-            filename_glob: None,
-            content_regex: Some("(unclosed".to_string()),
-            action: None,
-        };
-        let err = rule.validate().expect_err("should fail");
-        assert!(err.contains("content_regex"));
+    fn daemon_jobs_inherit_authorize_compatibility_checks() {
+        let extra = r#"
+
+[[daemon.jobs]]
+id = "uploads"
+kind = "policy_scan"
+profile = "publication"
+every_secs = 300
+
+[daemon.jobs.target]
+kind = "literal"
+path = "/srv/uploads"
+"#;
+        let mut config = parse(&format!("{MINIMAL}{extra}")).unwrap();
+        config.authorization.profiles[0].action_mode = ActionMode::Apply;
+        assert!(config.validate_for_daemon(&[]).is_err());
+    }
+
+    #[test]
+    fn checked_in_example_is_valid_strict_v2() {
+        let config = parse(include_str!("../../config/config.toml")).unwrap();
+        config.validate().unwrap();
     }
 }

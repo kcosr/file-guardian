@@ -128,12 +128,14 @@ pub enum ValidatedLocationError {
 
 /// Evidence safe for reports: reason codes only, never matched bytes or snippets.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SafeEvidence {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reason_codes: Vec<ReasonCode>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Finding {
     pub id: ObservationId,
     pub analyzer_id: AnalyzerId,
@@ -163,6 +165,7 @@ pub enum ConfiguredConfidence {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Classification {
     pub id: ObservationId,
     pub analyzer_id: AnalyzerId,

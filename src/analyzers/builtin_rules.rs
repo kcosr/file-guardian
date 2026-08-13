@@ -97,8 +97,6 @@ pub enum BuiltinAnalyzerError {
     },
     #[error("duplicate built-in rule id {0}")]
     DuplicateRule(RuleId),
-    #[error("built-in rule {0} embeds an action; authorization actions belong to policy")]
-    EmbeddedAction(RuleId),
     #[error("max_content_bytes and max_findings must both be nonzero")]
     InvalidLimits,
 }
@@ -153,9 +151,6 @@ impl BuiltinRulesAnalyzer {
                     name: rule.name.clone(),
                     source,
                 })?;
-            if rule.action.is_some() {
-                return Err(BuiltinAnalyzerError::EmbeddedAction(rule_id));
-            }
             if !seen.insert(rule_id.clone()) {
                 return Err(BuiltinAnalyzerError::DuplicateRule(rule_id));
             }
@@ -517,8 +512,7 @@ mod tests {
             name: name.to_owned(),
             filename_glob: glob.map(|value| Pattern::new(value).unwrap()),
             content_regex: regex.map(|value| Regex::new(value).unwrap()),
-            action: None,
-            source: RuleSource::Inline,
+            source: RuleSource::new("<test>"),
         }
     }
 
@@ -788,15 +782,5 @@ mod tests {
         assert!(!corrupt.coverage.is_complete());
         assert_eq!(corrupt.coverage.excluded, 0);
         assert_eq!(corrupt.issues[0].code, IssueCode::AnalyzerFailure);
-    }
-
-    #[test]
-    fn legacy_action_rules_are_rejected() {
-        let mut legacy = rule("legacy", Some("*"), None);
-        legacy.action = Some(crate::config::PolicyAction::Remove);
-        assert!(matches!(
-            BuiltinRulesAnalyzer::new("builtin", vec![legacy], BuiltinAnalyzerLimits::default()),
-            Err(BuiltinAnalyzerError::EmbeddedAction(_))
-        ));
     }
 }

@@ -27,6 +27,18 @@
     "initial_manifest_identity": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
     "final_manifest_identity": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
   },
+  "artifacts": [
+    {
+      "artifact_id": "a_07",
+      "subject_id": "subject_07",
+      "kind": "physical_file",
+      "relative_path": {
+        "segments": [{"encoding": "utf8", "value": "private-key.pem"}]
+      },
+      "byte_len": 32,
+      "content_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+    }
+  ],
   "pipeline_runs": [
     {
       "phase": "initial",
@@ -65,8 +77,8 @@
   "actions": [],
   "issues": [],
   "statistics": {
-    "physical_artifacts": 12,
-    "logical_artifacts": 12,
+    "physical_artifacts": 1,
+    "logical_artifacts": 1,
     "observations": 1,
     "duration_ms": 2310
   }

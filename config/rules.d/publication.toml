@@ -1,0 +1,17 @@
+schema_version = "file-guardian-rules/1"
+
+[[rules]]
+id = "windows-executable"
+filename_glob = "*.exe"
+
+[[rules]]
+id = "hardcoded-password"
+content_regex = "(?i)password\\s*[:=]\\s*[\\\"'][^\\\"']{4,}[\\\"']"
+
+[[rules]]
+id = "aws-access-key"
+content_regex = "AKIA[0-9A-Z]{16}"
+
+[[rules]]
+id = "private-key"
+content_regex = "-----BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----"

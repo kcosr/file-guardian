@@ -68,7 +68,14 @@ impl Default for CaptureLimits {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Snapshot {
+    pub input_kind: SnapshotInputKind,
     pub manifest: ArtifactManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotInputKind {
+    File,
+    Directory,
 }
 
 pub struct Snapshotter<'a> {
@@ -164,7 +171,14 @@ impl<'a> Snapshotter<'a> {
                 return Err(CaptureError::Manifest(error));
             }
         };
-        Ok(Snapshot { manifest })
+        Ok(Snapshot {
+            input_kind: if kind.is_dir() {
+                SnapshotInputKind::Directory
+            } else {
+                SnapshotInputKind::File
+            },
+            manifest,
+        })
     }
 }
 

@@ -27,6 +27,7 @@
     "initial_manifest_identity": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
     "final_manifest_identity": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
   },
+  "artifacts": [],
   "pipeline_runs": [
     {
       "phase": "initial",
@@ -40,8 +41,8 @@
   "actions": [],
   "issues": [],
   "statistics": {
-    "physical_artifacts": 12,
-    "logical_artifacts": 12,
+    "physical_artifacts": 0,
+    "logical_artifacts": 0,
     "observations": 0,
     "duration_ms": 1840
   }

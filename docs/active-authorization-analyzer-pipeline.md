@@ -89,6 +89,11 @@ Report schema `1` contains these top-level fields:
 - `pipeline_runs`, normalized `observations`, policy `resolutions`, centralized
   `actions`, typed `issues`, and bounded `statistics`.
 
+Issues discovered before capture or analyzer execution use the `initial` phase;
+the typed issue code distinguishes configuration, input, workspace, policy, and
+pipeline failures. This keeps the two-phase report vocabulary closed while
+still permitting startup error reports with null `policy` and `input` fields.
+
 Invariants:
 
 - Exits `0`, `10`, and `20` require complete initial coverage.
@@ -98,6 +103,10 @@ Invariants:
 - Exit `20` represents a complete policy decision, not operational ambiguity.
 - Exit `30` has an unknown final decision and may retain safely known partial
   state.
+- `input.final_manifest_identity` is null when initial capture succeeded but
+  final live-input revalidation could not produce a trustworthy manifest. An
+  error report may retain a differing final identity when it proves the input
+  changed. Allow and deny require equal initial and final identities.
 - Initial observations remain visible after successful remediation.
 
 Reports never contain matched passwords, credentials, raw content snippets,

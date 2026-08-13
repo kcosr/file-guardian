@@ -12,8 +12,8 @@
         {
           "analyzer_id": "publication-llm",
           "phase": "initial",
-          "eligible": 12,
-          "assigned": 12,
+          "eligible": 0,
+          "assigned": 0,
           "completed": 0,
           "excluded": 0,
           "status": "incomplete"
@@ -35,8 +35,9 @@
   "input": {
     "kind": "directory",
     "initial_manifest_identity": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
-    "final_manifest_identity": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    "final_manifest_identity": null
   },
+  "artifacts": [],
   "pipeline_runs": [
     {
       "phase": "initial",
@@ -57,8 +58,8 @@
     }
   ],
   "statistics": {
-    "physical_artifacts": 12,
-    "logical_artifacts": 12,
+    "physical_artifacts": 0,
+    "logical_artifacts": 0,
     "observations": 0,
     "duration_ms": 180014
   }

@@ -1,7 +1,11 @@
 pub mod analyzers;
 pub mod authorization;
+pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod logging;
+pub mod policy;
+pub mod report;
 pub mod rules;
-pub mod scanner;
+pub mod runtime;
+pub mod service;

@@ -1,435 +1,339 @@
-# File Guardian
+# File Guardian Requirements
 
-A policy enforcement service that periodically scans directories for disallowed files based on configurable rules, taking automatic remediation actions when violations are found.
+## Product purpose
 
-## Reference Implementation
+File Guardian is a reusable file-policy and authorization engine. Its primary
+interface evaluates a caller-owned, private staging tree as one transaction and
+returns a fail-closed decision suitable for an upload, build, or publication
+workflow. Its daemon interface runs explicitly configured policy scans on a
+schedule; daemon operation is not an implicit mode.
 
-For Rust conventions (config, logging, error handling), reference the build-service project:
+Milestone 2 is read-only. It captures immutable artifacts, runs the built-in
+rules analyzer, resolves policy, and reports `allow`, `deny`, or `error` without
+modifying the input. Later milestones add an internal LLM classifier,
+deterministic scanner delegates, verified actions, recursive archives, and
+fingerprint indexes.
 
-```
-/home/kevin/worktrees/build-service
-```
+## Operating assumptions
 
-Key patterns to follow:
+- Linux is the primary service platform; macOS ARM64 is also a supported
+  release target.
+- The service account must be able to read configured inputs, create its
+  workspace, and write configured logs. Root is deployment-dependent rather
+  than an inherent requirement.
+- The caller exclusively owns a one-shot staging tree and prevents all other
+  writers from changing it from capture through the final decision.
+- File Guardian is a policy gate. It does not intercept filesystem access and
+  cannot protect content an unconfined process reads before authorization.
 
-- **Config** (`src/config/mod.rs`):
-  - TOML with `serde::Deserialize` structs
-  - `schema_version` field for forward compatibility
-  - Default values via `#[serde(default = "default_fn")]` and standalone `fn default_*()` functions
-  - Separate `validate()` method called after parsing
-  - `ConfigError` enum with `thiserror` for typed errors
+## Command-line contract
 
-- **Logging** (`src/logging/mod.rs`):
-  - `tracing` + `tracing-subscriber` for structured logging
-  - `RotatingFileWriter` for size-based log rotation
-  - Optional console + file output via `TeeWriter`
-  - Non-blocking writes via channel + worker thread
-  - Plain text format (not JSON)
+File Guardian requires an explicit subcommand:
 
-- **Error handling**:
-  - Custom error enums with `#[derive(Debug, thiserror::Error)]`
-  - `#[error("message with {field}")]` for Display impl
-  - `#[source]` attribute for error chaining
+```text
+file-guardian [--config FILE] authorize
+    [--profile PROFILE_ID]
+    [--request-id ID]
+    [--action-mode evaluate|apply]
+    PATH
 
-## Purpose
-
-- Enforce file policies across user directories (e.g., no executables, no hardcoded secrets)
-- Detect sensitive content that shouldn't be stored in plaintext
-- Provide configurable remediation: warn, remove, recover files, with optional replacement stubs
-- Run as a system service with periodic scanning
-
-## Environment
-
-- Host OS: Linux (Rocky Linux, Ubuntu, etc.)
-- Runs as: root (to read/modify files across all user directories)
-- Target directories: User home directories, shared storage, etc.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  file-guardian                                              │
-│                                                             │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────────┐  │
-│  │ Config      │───►│ Rules       │───►│ Scanner         │  │
-│  │ Loader      │    │ Compiler    │    │                 │  │
-│  └─────────────┘    └─────────────┘    │  - Glob expand  │  │
-│        │                   │           │  - Walk dirs    │  │
-│        ▼                   ▼           │  - Match rules  │  │
-│  ┌─────────────┐    ┌─────────────┐    │  - Execute act  │  │
-│  │ TOML Config │    │ .rules      │    └─────────────────┘  │
-│  │             │    │ files       │             │           │
-│  └─────────────┘    └─────────────┘             ▼           │
-│                                        ┌─────────────────┐  │
-│                                        │ Actions         │  │
-│                                        │  - warn         │  │
-│                                        │  - remove       │  │
-│                                        │  - recover      │  │
-│                                        └─────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+file-guardian [--config FILE] daemon [--job JOB_ID ...]
 ```
 
-## Components
-
-### 1. file-guardian (Daemon)
-
-Rust binary running as root under systemd.
-
-**Responsibilities:**
-- Load configuration from TOML file
-- Compile rules from inline config and `.rules` files
-- Periodically scan directories matching configured glob patterns
-- Match files against rules (filename globs, content regexes)
-- Execute configured actions on violations
-- Log all violations with detailed metadata
-
-### 2. Rule Sources
-
-Rules are loaded from two sources:
-
-1. **Inline rules** in the main config file
-2. **External `.rules` files** in a configurable `rules.d` directory
-
-This allows base rules in config with drop-in additions via separate files.
-
-## Configuration
-
-**Location:** `/etc/file-guardian/config.toml`
-
-**Environment variable override:** `FILE_GUARDIAN_CONFIG`
-
-```toml
-schema_version = "1"
-
-[scan]
-# Glob patterns for directories to scan
-directories = ["/home/*"]
-
-# Scan interval in seconds (default: 1 hour)
-interval_secs = 3600
-
-# Maximum file size to scan in bytes (skip larger files)
-max_file_size = 10485760  # 10 MiB
-
-# Write summary files after each scan
-write_summaries = true
-
-# Directory to store scan summaries
-summary_dir = "/var/log/file-guardian/summaries"
-
-# Layout for summary files: flat, daily, hourly
-summary_layout = "flat"
-
-# Patterns to exclude from scanning (glob syntax)
-exclude_patterns = [
-    "*.git*",
-    "node_modules",
-    ".cache",
-]
-
-[policy]
-# Default action when a rule doesn't specify one: warn, remove, recover
-default_action = "warn"
-
-# Directory for recovered files (used with 'recover' action)
-recovery_dir = "/var/lib/file-guardian/recovered"
-
-[policy.replacement]
-# Apply a replacement stub after remove/recover actions
-enabled = false
-
-# Replacement content to write
-content = """
-This file has been removed by file-guardian due to policy violation.
-Contact your system administrator for more information.
-"""
-
-# Optional marker used to suppress violations on replacement files
-# marker = "FILE_GUARDIAN_REPLACEMENT"
-
-[rules]
-# Directory containing .rules files (one rule per line)
-rules_d = "/etc/file-guardian/rules.d"
-
-# Inline rules defined in this config file
-[[rules.inline]]
-name = "no-exe"
-filename_glob = "*.exe"
-action = "remove"
-
-[[rules.inline]]
-name = "detect-passwords"
-content_regex = "(?i)password\\s*=\\s*[\"'][^\"']+[\"']"
-action = "warn"
-
-[logging]
-level = "info"
-directory = "/var/log/file-guardian"
-max_bytes = 104857600   # 100MB
-max_files = 5
-console = false
-```
-
-## Rules Format
-
-### Inline Rules (TOML)
-
-```toml
-[[rules.inline]]
-name = "rule-name"           # Required: unique identifier
-filename_glob = "*.exe"      # Optional: glob pattern for filename matching
-content_regex = "pattern"    # Optional: regex pattern for content matching
-action = "warn"              # Optional: override default_action
-```
-
-At least one of `filename_glob` or `content_regex` must be specified.
-
-### External Rules Files
-
-**Location:** `/etc/file-guardian/rules.d/*.rules`
-
-**Format:** One rule per line
-
-```
-name:type:pattern[:action]
-```
-
-- `name` - Unique identifier for the rule
-- `type` - `glob` (filename matching) or `regex` (content matching)
-- `pattern` - The glob or regex pattern
-- `action` - Optional, one of: `warn`, `remove`, `recover`
-
-**Example file:** `/etc/file-guardian/rules.d/security.rules`
-
-```
-# Block Windows executables
-no-exe:glob:*.exe:remove
-no-dll:glob:*.dll:remove
-no-msi:glob:*.msi:remove
-
-# Detect secrets in files
-passwords:regex:(?i)password\s*[:=]\s*["'][^"']{4,}["']:warn
-aws-access-key:regex:AKIA[0-9A-Z]{16}:recover
-private-ssh-key:regex:-----BEGIN (RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----:recover
-```
-
-Lines starting with `#` are comments. Empty lines are ignored.
-
-## Rule Matching
-
-### Filename Matching (Glob)
-
-Uses standard glob syntax:
-- `*` matches any sequence of characters
-- `?` matches any single character
-- `[abc]` matches any character in the set
-- `[!abc]` matches any character not in the set
-
-Matching is performed against the filename only (not the full path).
-
-### Content Matching (Regex)
-
-Uses Rust regex syntax (similar to PCRE). Content scanning:
-- Only performed on text files (binary files are skipped)
-- Binary detection: files containing null bytes in the first 8KB are considered binary
-- Files larger than `max_file_size` are skipped
-
-## Actions
-
-| Action | Description |
-|--------|-------------|
-| `warn` | Log the violation, take no other action |
-| `remove` | Delete the file |
-| `recover` | Move file to recovery directory with timestamped path |
-
-### Replacement Stubs
-
-If `policy.replacement.enabled = true`, a replacement file is written after
-`remove` or `recover` actions. Replacement is skipped for `warn` actions and
-binary files. If a file's content exactly matches the replacement marker (or
-content when `marker` is unset), the scanner suppresses the violation.
-
-### Recovery Directory Structure
-
-When using the `recover` action, files are moved to a timestamped subdirectory with the original path encoded in the filename:
-
-```
-/var/lib/file-guardian/recovered/
-└── 2026-01-14T10-36-40/
-    ├── --home--kevin--sensitive.txt
-    └── --home--alice--secrets.conf
-```
-
-Path encoding: `/` characters are replaced with `--`
-
-Example: `/home/kevin/sensitive.txt` → `--home--kevin--sensitive.txt`
-
-This preserves the original location information while creating a flat, safe filename.
-
-The recovery directory is created on-demand when a `recover` action executes.
-
-## Violation Logging
-
-Each violation is logged with detailed metadata:
-
-```
-WARN file_guardian::scanner: violation: path=/home/kevin/secrets.txt rule=passwords match=content action=warn owner=1000:1000 size=1234 mtime=2026-01-14 10:30:00 snippet="password = \"secret123\"..."
-```
-
-Fields logged:
-- `path` - Full path to the violating file
-- `rule` - Name of the matched rule
-- `match` - Match type: `filename` or `content`
-- `action` - Action taken (or would be taken in dry-run)
-- `owner` - File owner as `uid:gid`
-- `size` - File size in bytes
-- `mtime` - File modification time
-- `snippet` - For content matches, truncated matched text (max 100 chars)
-- `dry_run` - Present and `true` if running in dry-run mode
-
-## Scan Summaries
-
-When `scan.write_summaries = true`, each scan writes a summary file to
-`scan.summary_dir`. The filename uses the run timestamp (for example,
-`2026-01-14T10-36-40.json`), and the parent directory is controlled by
-`scan.summary_layout` (`flat`, `daily`, or `hourly`). For example, `daily`
-layout produces:
-
-```
-/var/log/file-guardian/summaries/
-└── 2026-01-14/
-    └── 2026-01-14T10-36-40.json
-```
-
-The summary contains counts, timestamps, and a list of violations (with action errors, if any).
-
-Set `scan.write_summaries = false` to disable summary file creation.
-
-## CLI Interface
-
-```
-file-guardian [OPTIONS]
-
-Options:
-    --config <PATH>    Path to configuration file
-    --once             Run a single scan and exit (don't loop)
-    --dry-run          Log violations but don't modify any files
-    -h, --help         Print help
-    -V, --version      Print version
-```
-
-### Usage Examples
-
-```bash
-# Run as daemon (periodic scanning)
-sudo file-guardian
-
-# Run with custom config
-sudo file-guardian --config /path/to/config.toml
-
-# Single scan, no modifications (testing)
-sudo file-guardian --once --dry-run
-
-# Single scan with enforcement
-sudo file-guardian --once
-```
-
-## Deployment
-
-### Systemd Service
-
-**File:** `/etc/systemd/system/file-guardian.service`
-
-```ini
-[Unit]
-Description=File Guardian - Policy enforcement scanner
-After=local-fs.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/file-guardian
-Restart=on-failure
-RestartSec=10
-
-# Hardening (optional)
-NoNewPrivileges=true
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Installation
-
-```bash
-# Build
-cargo build --release
-
-# Install binary
-sudo cp target/release/file-guardian /usr/local/bin/
-sudo chmod 755 /usr/local/bin/file-guardian
-
-# Install config
-sudo mkdir -p /etc/file-guardian/rules.d
-sudo cp config/config.toml /etc/file-guardian/
-sudo cp config/rules.d/*.rules /etc/file-guardian/rules.d/
-
-# Create directories
-sudo mkdir -p /var/log/file-guardian
-# Optional if scan.write_summaries = true
-sudo mkdir -p /var/log/file-guardian/summaries
-# Optional if recover action is used
-sudo mkdir -p /var/lib/file-guardian/recovered
-
-# Enable and start
-sudo systemctl daemon-reload
-sudo systemctl enable file-guardian
-sudo systemctl start file-guardian
-```
-
-## Error Handling
-
-| Error | Behavior |
-|-------|----------|
-| Config file not found | Exit with error |
-| Invalid config syntax | Exit with error |
-| Invalid rule pattern | Exit with error (fail fast) |
-| Cannot read directory | Log warning, continue scanning |
-| Cannot read file | Log debug, skip file |
-| Cannot execute action | Log error, continue scanning |
-| Recovery dir creation fails | Log error, skip recovery |
-
-The scanner continues on per-file errors to ensure one problematic file doesn't halt the entire scan.
-
-## Security Considerations
-
-- **Runs as root**: Required to read/modify files across user directories
-- **No shell execution**: All file operations use direct syscalls
-- **Path validation**: Recovery paths are encoded to prevent directory traversal
-- **Atomic operations**: File moves use `rename()` for atomicity where possible
-- **Audit trail**: All actions are logged with full context
-
-## Testing
-
-### Dry-Run Mode
-
-Always test new rules with `--dry-run` first:
-
-```bash
-sudo file-guardian --once --dry-run 2>&1 | grep violation
-```
-
-This logs what would happen without modifying any files.
-
-### Rule Validation
-
-Rules are validated at startup. Invalid glob or regex patterns cause immediate exit with a descriptive error message.
-
-## Future Considerations
-
-- **Checksums**: Option to log file checksums for forensic purposes
-- **Notifications**: Webhook or email alerts on violations
-- **Rate limiting**: Limit actions per scan to prevent mass deletions
-- **Allowlists**: Per-directory or per-user rule overrides
-- **Metrics**: Prometheus endpoint for monitoring scan stats
-- **Inotify mode**: Real-time scanning via filesystem events instead of periodic
+Requirements:
+
+- `authorize` accepts exactly one literal regular file or directory.
+- The transaction root must exist and must not be a symlink or special file.
+- The command does not expand globs. A directory is one authorization
+  transaction.
+- A configured default profile is used when `--profile` is absent.
+- A CLI action mode may reduce configured authority from `apply` to `evaluate`
+  but must never increase it. Milestone 2 supports only evaluate execution.
+- Request IDs are bounded, log-safe correlation values; they are not paths,
+  credentials, or authorization tokens.
+- Missing subcommands, invalid syntax, and help use conventional CLI behavior,
+  including exit `2` for syntax errors.
+- After recognizing a valid `authorize` shape, operational failures attempt to
+  emit a schema-valid error report and exit `30`.
+- Obsolete implicit invocation, `--once`, and `--dry-run` are rejected. No
+  compatibility parser or environment-based semantic override is retained.
+
+## Caller protocol
+
+The caller must:
+
+1. Finish writing a private staging tree.
+2. Prevent any other writer from modifying it during authorization.
+3. Invoke File Guardian once for the entire tree.
+4. Parse exactly one supported JSON value from stdout.
+5. Verify that the report's `exit_code` equals the process exit status.
+6. Publish only exits `0` and, after verified actions exist, `10`.
+7. Atomically promote or consume the exact authorized staging tree.
+
+The manifest identity is for audit and correlation. It does not authorize a
+separately copied or subsequently changed tree. Callers should scan staged
+copies rather than active build or upload workspaces.
+
+## Exit and report contract
+
+Authorization report schema `1` uses these exits:
+
+| Exit | Outcome | Meaning |
+| ---: | --- | --- |
+| `0` | `allow` | Complete required analysis; input is allowed and unchanged. |
+| `10` | `allow_modified` | Reserved for verified actions; unavailable in Milestone 2. |
+| `20` | `deny` | Complete required analysis; policy rejects the transaction. |
+| `30` | `error` | The authorization result is incomplete or untrustworthy. |
+
+Required behavior:
+
+- Required analyzer failure is `30`, including when another analyzer found a
+  deny.
+- Evaluate mode returns `20` when allowing the tree would require mutation.
+- Exit `20` is a complete policy decision, never a substitute for operational
+  uncertainty.
+- File Guardian emits exactly one compact JSON document plus a newline on
+  stdout. Diagnostics and logs go to stderr or protected log files.
+- Missing, malformed, truncated, unsupported, or exit-inconsistent output is a
+  caller-side failure.
+- Reports use relative logical artifact paths and safe codes. They must not
+  contain matched credentials, raw snippets, raw prompts or transcripts,
+  native scanner output, absolute staging or workspace paths, environment
+  values, credentials, or chain-of-thought.
+
+The report carries run and optional request identities, outcome, exit, modified
+state, phase-aware coverage, compiled policy and pipeline identities, immutable
+manifest identities, analyzer runs, normalized observations, resolutions,
+centralized actions, typed issues, and bounded statistics. Golden examples live
+under [`docs/examples/reports`](docs/examples/reports).
+
+## Configuration schema 2
+
+Schema `2` is a strict end-state contract rather than a migration layer.
+Unknown fields are rejected. IDs must be unique, references must resolve,
+administrator paths must be absolute, requested modes must be supported, and
+all workspace and protected roots must be safe and disjoint.
+
+The main configuration defines:
+
+- a private authorization workspace and named profiles;
+- ordered pipelines, stages, analyzer references, and execution settings;
+- built-in analyzer applicability and resource ceilings;
+- policy bindings that map observations to directives;
+- explicit `policy_scan` daemon jobs and schedules;
+- protected stderr/file logging.
+
+Configuration path precedence is `--config`, then `FILE_GUARDIAN_CONFIG`, then
+`/etc/file-guardian/config.toml`. Environment variables do not override fields
+inside the selected configuration or otherwise change policy, paths, analyzer
+selection, or logging semantics.
+
+The shipped [`config/config.toml`](config/config.toml) is the source of truth
+for the implemented schema-v2 subset. The broader
+[`docs/examples/active-authorization-v2.toml`](docs/examples/active-authorization-v2.toml)
+records the planned mature pipeline. A configured analyzer kind that is not yet
+implemented fails validation and is not skipped or reinterpreted.
+
+## Rule sources and built-in analysis
+
+External rule files are strict TOML and action-free. A rule has a unique ID and
+at least one supported matcher: a filename glob or text-content regex. Policy
+bindings in the main configuration map normalized findings to `audit`, `deny`,
+`delete`, or `quarantine`; detection rules cannot directly mutate files or
+choose an outcome.
+
+Built-in analysis requirements:
+
+- Match filename globs against the logical filename and content regexes against
+  captured immutable bytes.
+- Return every match in canonical order rather than stopping at the first.
+- Never include the matched value or raw content in a finding or report.
+- Treat invalid UTF-8 and over-limit content as failures by default. Explicit
+  analyzer configuration may classify either as inapplicable.
+- Count intentional inapplicability once as excluded coverage while still
+  evaluating filename rules.
+- Treat object read, length, or digest disagreement as incomplete required
+  coverage and exit `30`.
+
+## Immutable inspection and workspace
+
+Every run owns a private workspace below the configured root. Its internal
+layout may contain manifests, content-addressed objects, analyzer views,
+archive work, an action journal, invocation quarantine, and temporary state;
+that layout is not a public interface.
+
+Requirements:
+
+- Create every run workspace with owner-only access and without symlink
+  traversal.
+- Reject input/workspace overlap in either direction, including ancestry that
+  is searchable but not directory-readable.
+- Walk capture through descriptor-anchored operations.
+- Copy or stream each regular file once into a SHA-256-addressed object while
+  hashing it, and verify metadata before and after the read.
+- Reject symlinks, hardlinks, special files, cross-filesystem traversal,
+  unreadable or disappearing entries, new entries during capture, and unstable
+  metadata unless an explicit later policy defines safe behavior.
+- Give all analyzers the same captured manifest and objects. An analyzer must
+  never reopen live staging.
+- Generate artifact IDs on the host. Logical paths are root-relative segment
+  arrays for matching/reporting and are never reused as unchecked OS paths.
+- Keep live staging unchanged in evaluate mode. Workspace cleanup failure is an
+  operational error, not an allow or deny.
+
+## Domain and policy separation
+
+The implementation keeps these concepts separate:
+
+- A **finding** is a deterministic observation.
+- A **classification** is a probabilistic or semantic observation.
+- A **resolution** maps one observation to `audit`, `deny`, `delete`, or
+  `quarantine`.
+- An **action** is a centralized filesystem mutation.
+- An **outcome** is `allow`, `allow_modified`, `deny`, or `error`.
+
+Analyzers emit only observations and coverage. They cannot authorize content,
+select arbitrary host paths, choose filesystem actions, or mutate staging.
+Bindings must resolve deterministically; ambiguous or unbound observations fail
+closed. In evaluate-only operation, an `audit` resolution permits continuation,
+`deny` rejects the transaction, and a mutation directive also rejects because
+the requested remediation cannot be applied.
+
+## Coverage requirements
+
+Coverage is phase-aware and records eligible, assigned, completed, and excluded
+candidate counts for every analyzer.
+
+- `completed` and `excluded` are disjoint.
+- An explicitly inapplicable assigned artifact counts as excluded, not
+  completed.
+- `completed + excluded == assigned` is necessary but not sufficient for a
+  complete analyzer row; protocol, budget, tool, or execution failure keeps it
+  incomplete.
+- A phase is complete only when all required analyzer rows are complete.
+- Exits `0` and `20` require complete initial coverage. Exit `10` will also
+  require complete post-action verification.
+- Coverage failures must be typed and represented in the report rather than
+  existing only in logs.
+
+## Explicit daemon operation
+
+The daemon runs only named, configured jobs. Milestone 2 supports
+`policy_scan` jobs with explicit targets, a profile, and an internal schedule.
+Selecting one or more `--job` values limits execution to those jobs; otherwise
+all enabled jobs run.
+
+Each policy scan invokes the same evaluate-only engine used by one-shot
+authorization. It captures each configured target independently, records the
+decision through protected logging, never modifies targets, and treats capture
+or analysis uncertainty as an error. The daemon configuration states what the
+process does; simply starting File Guardian does not imply directory scanning.
+
+## Logging and operations
+
+- Human diagnostics and operational logs use stderr or configured protected
+  files, never authorization stdout.
+- Logging configuration is validated at startup and uses bounded file rotation
+  where file logging is enabled.
+- Reports and logs do not expose matched secrets or immutable object content.
+- Daemon errors identify the job and target without changing authorization
+  semantics.
+- Unit and integration tests are deterministic and offline.
+
+## Planned analyzer pipeline
+
+The next milestone compiles ordered stages with serial or bounded-parallel
+execution and canonical aggregation. Candidate assignments and safe
+projections of prior observations are frozen before a stage begins. Required
+analyzers fail closed; optional incomplete advisory coverage is allowed only
+when explicitly configured.
+
+### Internal Pi classifier
+
+The internal Pi-based LLM may read sensitive captured content because the
+selected model and transport are approved for it. It remains transaction-scoped
+and read-only. File Guardian will invoke an absolute executable without a shell
+or discovered user customizations, expose only bounded host-controlled artifact
+tools, require strict terminal structured output, validate all classifications
+against an administrator vocabulary, and run Pi in a required OS sandbox with
+no unsandboxed fallback.
+
+The initial Pi rollout is audit-only. Model output cannot suppress a
+deterministic finding, and any required timeout, process, tool, budget, schema,
+or coverage failure produces exit `30`.
+
+### Deterministic external analyzers
+
+Password, credential, and secret scanners follow Pi. Reviewed adapters will
+accept host-assigned immutable candidates and return bounded, versioned NDJSON
+normalized to deterministic findings. They run without a shell, without
+network, inside a required sandbox with resource ceilings and full
+process-group cleanup. Raw matched values and native output never enter the
+authorization report.
+
+## Planned actions and content expansion
+
+### Verified delete and invocation quarantine
+
+After analyzers are established, File Guardian will add centralized actions.
+Delete and invocation-scoped quarantine require target identity revalidation,
+journaling, deterministic target ordering, and a complete recapture and rerun
+of every required analyzer. Only that verified flow may produce exit `10`.
+Evaluate mode remains non-mutating. A surviving deny suppresses all mutation.
+
+### Recursive archives
+
+ZIP, TAR, tar+gzip, and single gzip members will become logical immutable
+artifacts inside the invocation workspace, with global depth, entry, expanded
+byte, compression-ratio, and time ceilings. Attacker-controlled paths will not
+be conventionally extracted. A finding on an archive member targets the outer
+physical staged archive for any later action.
+
+### Exact fingerprint indexes
+
+Exact SHA-256 fingerprints remain a separate analyzer and administration
+track. Indexes will support configured source roots, root-relative
+include/exclude globs, manual `build`, `sync`, `add`, and `inspect` operations,
+and optional per-index daemon schedules. Static indexes may be on-demand only.
+
+Incremental operation may reuse a file hash when validated size, modification
+time, identity, and generation metadata agree; directory modification times are
+hints and never proof that descendants are unchanged. Atomic SQLite
+generations, WAL, one writer, pinned concurrent readers, freshness policy, and
+retention provide safe daemon/one-shot database sharing. Exact whole-file
+hashes detect renamed identical copies, not excerpts or modified copies.
+
+## Implementation sequence
+
+1. Contract and golden examples.
+2. Private workspace, immutable inspection, typed domain, and all-match
+   built-in rules.
+3. Strict schema-v2 read-only `authorize`, JSON/stdout protocol, exits `0`,
+   `20`, and `30`, plus explicit evaluate-only daemon jobs.
+4. Ordered pipeline and internal Pi classifier, initially audit-only.
+5. Sandboxed deterministic password and secret scanner adapters.
+6. Centralized delete and invocation quarantine with full verification and
+   exit `10`.
+7. Bounded recursive archive inspection.
+8. Manual exact fingerprint indexing and authorization matching.
+9. Incremental SQLite index generations, concurrent readers, freshness, and
+   optional per-index daemon schedules.
+10. Narrow deterministic redaction, then separately versioned similarity
+    fingerprints.
+
+The normative implementation contract is
+[`docs/active-authorization-analyzer-pipeline.md`](docs/active-authorization-analyzer-pipeline.md).
+
+## Acceptance gates
+
+- Strict TOML, JSON, and report-invariant tests run offline.
+- Fixed input produces deterministic manifest and observation ordering.
+- Inspection never mutates input and analyzers never reopen staging.
+- Every capture, analyzer, policy, cleanup, and reporting uncertainty is typed
+  and cannot produce exit `0` or `20`.
+- Privacy tests reject absolute paths, secrets, snippets, prompts, transcripts,
+  credentials, environment values, and raw scanner output in reports.
+- Later fake Pi and delegate processes cover malformed output, crashes,
+  timeouts, pipe floods, budget exhaustion, and incomplete coverage.
+- Each behavior change updates tests and public documentation and passes
+  `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`.

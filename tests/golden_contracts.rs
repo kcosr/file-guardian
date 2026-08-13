@@ -1,6 +1,7 @@
 use file_guardian::domain::{
     InspectionIssue, IssueCode, NormalizedObservation, PhaseCoverageStatus, RunCoverage,
 };
+use file_guardian::report::AuthorizationReport;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -70,6 +71,59 @@ fn golden_coverage_round_trips_as_the_exact_canonical_json_shape() {
             expected
         );
     }
+}
+
+#[test]
+fn golden_reports_satisfy_the_full_machine_report_contract() {
+    for source in [
+        include_str!("../docs/examples/reports/allow.json"),
+        include_str!("../docs/examples/reports/deny.json"),
+        include_str!("../docs/examples/reports/error.json"),
+    ] {
+        let report: AuthorizationReport =
+            serde_json::from_str(source).expect("valid authorization report");
+        report.validate().expect("report invariants");
+        let line = report.to_json_line().expect("serializable report");
+        assert_eq!(line.last(), Some(&b'\n'));
+        assert_eq!(line.iter().filter(|byte| **byte == b'\n').count(), 1);
+        assert!(!line[..line.len() - 1].contains(&b'\n'));
+    }
+}
+
+#[test]
+fn final_manifest_identity_is_strict_for_decisions_and_partial_for_errors() {
+    let mut allow: Value =
+        serde_json::from_str(include_str!("../docs/examples/reports/allow.json")).unwrap();
+    allow["input"]["final_manifest_identity"] = Value::Null;
+    assert!(serde_json::from_value::<AuthorizationReport>(allow).is_err());
+
+    let mut error: Value =
+        serde_json::from_str(include_str!("../docs/examples/reports/error.json")).unwrap();
+    assert!(serde_json::from_value::<AuthorizationReport>(error.clone()).is_ok());
+    error["input"]["final_manifest_identity"] = Value::String(
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+    );
+    assert!(serde_json::from_value::<AuthorizationReport>(error).is_ok());
+}
+
+#[test]
+fn error_report_keeps_relative_artifacts_from_a_trustworthy_initial_capture() {
+    let mut error: Value =
+        serde_json::from_str(include_str!("../docs/examples/reports/error.json")).unwrap();
+    error["artifacts"] = serde_json::json!([{
+        "artifact_id": "a_initial",
+        "subject_id": "subject_initial",
+        "kind": "physical_file",
+        "relative_path": {
+            "segments": [{"encoding": "utf8", "value": "captured.txt"}]
+        },
+        "byte_len": 7,
+        "content_digest":
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }]);
+    error["statistics"]["physical_artifacts"] = serde_json::json!(1);
+    error["statistics"]["logical_artifacts"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<AuthorizationReport>(error).is_ok());
 }
 
 #[test]

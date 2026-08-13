@@ -3,5 +3,5 @@
 mod snapshot;
 mod workspace;
 
-pub use snapshot::{CaptureError, CaptureLimits, Snapshot, Snapshotter};
+pub use snapshot::{CaptureError, CaptureLimits, Snapshot, SnapshotInputKind, Snapshotter};
 pub use workspace::{InvocationWorkspace, ObjectStore, StoredObject, WorkspaceError};

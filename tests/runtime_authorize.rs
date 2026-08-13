@@ -1,0 +1,348 @@
+use std::fs;
+use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use file_guardian::report::{AuthorizationOutcome, AuthorizationReport};
+
+struct Fixture {
+    _temp: tempfile::TempDir,
+    config: PathBuf,
+    input: PathBuf,
+}
+
+impl Fixture {
+    fn new(directive: &str, input_name: &str) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let input = temp.path().join("input");
+        let rules = temp.path().join("rules.toml");
+        let config = temp.path().join("config.toml");
+        fs::create_dir(&workspace).unwrap();
+        fs::set_permissions(&workspace, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join(input_name), b"public test data").unwrap();
+        fs::write(
+            &rules,
+            r#"schema_version = "file-guardian-rules/1"
+
+[[rules]]
+id = "blocked"
+filename_glob = "*.blocked"
+"#,
+        )
+        .unwrap();
+        fs::write(&config, config_text(&workspace, &rules, directive, None)).unwrap();
+        Self {
+            _temp: temp,
+            config,
+            input,
+        }
+    }
+
+    fn authorize(&self, extra: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_file-guardian"));
+        command.arg("--config").arg(&self.config).arg("authorize");
+        command.args(extra).arg(&self.input).output().unwrap()
+    }
+
+    fn set_profile_mode(&self, mode: &str) {
+        let value = fs::read_to_string(&self.config).unwrap().replace(
+            "action_mode = \"evaluate\"",
+            &format!("action_mode = \"{mode}\""),
+        );
+        fs::write(&self.config, value).unwrap();
+    }
+
+    fn enable_console_logging(&self) {
+        let value = fs::read_to_string(&self.config)
+            .unwrap()
+            .replace("console = false", "console = true");
+        fs::write(&self.config, value).unwrap();
+    }
+}
+
+fn config_text(
+    workspace: &Path,
+    rules: &Path,
+    directive: &str,
+    daemon: Option<(&Path, bool)>,
+) -> String {
+    let daemon = daemon.map_or_else(String::new, |(target, run_on_start)| {
+        format!(
+            r#"
+[[daemon.jobs]]
+id = "scan"
+enabled = true
+kind = "policy_scan"
+profile = "publication"
+every_secs = 60
+run_on_start = {run_on_start}
+
+[daemon.jobs.target]
+kind = "literal"
+path = "{}"
+"#,
+            target.display()
+        )
+    });
+    format!(
+        r#"schema_version = "2"
+
+[authorization]
+default_profile = "publication"
+
+[authorization.workspace]
+root = "{}"
+
+[[authorization.profiles]]
+id = "publication"
+pipeline = "publication"
+action_mode = "evaluate"
+default_unbound_observation = "error"
+
+[[pipelines]]
+id = "publication"
+
+[[pipelines.stages]]
+id = "rules"
+analyzers = ["rules"]
+
+[[analyzers]]
+id = "rules"
+kind = "builtin_rules"
+rule_files = ["{}"]
+
+[[policy_bindings]]
+id = "blocked"
+profile = "publication"
+analyzer = "rules"
+rule = "*"
+directive = "{directive}"
+
+[logging]
+console = false
+{daemon}
+"#,
+        workspace.display(),
+        rules.display(),
+    )
+}
+
+fn report(output: &Output) -> AuthorizationReport {
+    assert_eq!(
+        output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+        1
+    );
+    assert_eq!(output.stdout.last(), Some(&b'\n'));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn authorize_allows_with_exact_json_stdout_and_preserves_input() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    let output = fixture.authorize(&["--request-id", "build-42"]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = report(&output);
+    assert_eq!(report.outcome, AuthorizationOutcome::Allow);
+    assert_eq!(report.request_id.unwrap().as_str(), "build-42");
+    assert_eq!(
+        fs::read(fixture.input.join("safe.txt")).unwrap(),
+        b"public test data"
+    );
+}
+
+#[test]
+fn authorize_denies_matching_input_with_exit_twenty() {
+    let fixture = Fixture::new("deny", "payload.blocked");
+    let output = fixture.authorize(&[]);
+    assert_eq!(output.status.code(), Some(20));
+    let report = report(&output);
+    assert_eq!(report.outcome, AuthorizationOutcome::Deny);
+    assert_eq!(report.observations.len(), 1);
+    assert!(fixture.input.join("payload.blocked").exists());
+}
+
+#[test]
+fn valid_authorize_syntax_reports_configuration_error_as_json() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_file-guardian"))
+        .arg("--config")
+        .arg(temp.path().join("missing.toml"))
+        .arg("authorize")
+        .arg("--request-id")
+        .arg("request-7")
+        .arg(temp.path())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(30));
+    let report = report(&output);
+    assert_eq!(report.outcome, AuthorizationOutcome::Error);
+    assert_eq!(report.request_id.unwrap().as_str(), "request-7");
+}
+
+#[test]
+fn apply_request_fails_closed_without_modification() {
+    let fixture = Fixture::new("delete", "payload.blocked");
+    let output = fixture.authorize(&["--action-mode", "apply"]);
+    assert_eq!(output.status.code(), Some(30));
+    assert_eq!(report(&output).outcome, AuthorizationOutcome::Error);
+    assert!(fixture.input.join("payload.blocked").exists());
+}
+
+#[test]
+fn explicit_evaluate_downgrades_an_apply_capable_profile() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    fixture.set_profile_mode("apply");
+    let output = fixture.authorize(&["--action-mode", "evaluate"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(report(&output).outcome, AuthorizationOutcome::Allow);
+
+    let absent_mode = fixture.authorize(&[]);
+    assert_eq!(absent_mode.status.code(), Some(30));
+    assert_eq!(report(&absent_mode).outcome, AuthorizationOutcome::Error);
+}
+
+#[test]
+fn literal_input_with_spaces_and_glob_characters_is_not_expanded() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    let literal = fixture._temp.path().join("literal [*] tree");
+    fs::rename(&fixture.input, &literal).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_file-guardian"))
+        .arg("--config")
+        .arg(&fixture.config)
+        .arg("authorize")
+        .arg(&literal)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(report(&output).outcome, AuthorizationOutcome::Allow);
+}
+
+#[test]
+fn double_dash_allows_a_literal_path_starting_with_a_hyphen() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    let literal = fixture._temp.path().join("-input");
+    fs::rename(&fixture.input, &literal).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_file-guardian"))
+        .current_dir(fixture._temp.path())
+        .arg("--config")
+        .arg(&fixture.config)
+        .arg("authorize")
+        .arg("--")
+        .arg("-input")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(report(&output).outcome, AuthorizationOutcome::Allow);
+}
+
+#[test]
+fn non_utf8_filename_is_preserved_in_the_machine_report() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    fs::write(
+        fixture._temp.path().join("rules.toml"),
+        r#"schema_version = "file-guardian-rules/1"
+
+[[rules]]
+id = "blocked"
+content_regex = "never-matches-this-input"
+"#,
+    )
+    .unwrap();
+    let name = std::ffi::OsString::from_vec(vec![b'n', 0xff, b'm']);
+    fs::write(fixture.input.join(&name), b"opaque name").unwrap();
+    let output = fixture.authorize(&[]);
+    assert_eq!(output.status.code(), Some(0));
+    let report = report(&output);
+    let artifact = report
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.relative_path.segments()[0].as_slice() == [b'n', 0xff, b'm'])
+        .expect("non-UTF8 filename must remain byte-exact");
+    let wire = serde_json::to_value(&artifact.relative_path).unwrap();
+    assert_eq!(wire["segments"][0]["encoding"], "base64url");
+}
+
+#[test]
+fn console_logging_never_contaminates_machine_stdout() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    fixture.enable_console_logging();
+    let output = fixture.authorize(&[]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(report(&output).outcome, AuthorizationOutcome::Allow);
+}
+
+#[test]
+fn malformed_rules_are_reported_as_json_error() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    fs::write(fixture._temp.path().join("rules.toml"), "not = [valid").unwrap();
+    let output = fixture.authorize(&[]);
+    assert_eq!(output.status.code(), Some(30));
+    assert_eq!(report(&output).outcome, AuthorizationOutcome::Error);
+}
+
+#[test]
+fn report_identities_cover_compiled_rules_and_effective_policy() {
+    let fixture = Fixture::new("audit", "safe.txt");
+    let first = report(&fixture.authorize(&[]));
+    let first_policy = first.policy.unwrap();
+
+    fs::write(
+        fixture._temp.path().join("rules.toml"),
+        r#"schema_version = "file-guardian-rules/1"
+
+[[rules]]
+id = "blocked"
+filename_glob = "*.different"
+"#,
+    )
+    .unwrap();
+    let second = report(&fixture.authorize(&[]));
+    let second_policy = second.policy.unwrap();
+    assert_ne!(
+        first_policy.pipeline_identity,
+        second_policy.pipeline_identity
+    );
+    assert_eq!(first_policy.identity, second_policy.identity);
+
+    let value = fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace("directive = \"audit\"", "directive = \"deny\"");
+    fs::write(&fixture.config, value).unwrap();
+    let third = report(&fixture.authorize(&[]));
+    let third_policy = third.policy.unwrap();
+    assert_ne!(second_policy.identity, third_policy.identity);
+    assert_eq!(
+        second_policy.pipeline_identity,
+        third_policy.pipeline_identity
+    );
+}
+
+#[test]
+fn unhealthy_run_on_start_daemon_writes_no_stdout_and_exits_thirty() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    let missing = fixture.input.join("missing");
+    fs::write(
+        &fixture.config,
+        config_text(
+            fixture._temp.path().join("workspace").as_path(),
+            fixture._temp.path().join("rules.toml").as_path(),
+            "deny",
+            Some((&missing, true)),
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_file-guardian"))
+        .arg("--config")
+        .arg(&fixture.config)
+        .arg("daemon")
+        .arg("--job")
+        .arg("scan")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(30));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
