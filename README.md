@@ -135,6 +135,11 @@ Schema v2 defines:
   `quarantine` directives;
 - explicit daemon jobs and logging settings.
 
+Pipeline identity covers ordered stages, execution and prior-observation
+settings, selected analyzer configurations, selectors, limits, and compiled
+rule material. Profile and policy bindings/directives are covered separately by
+policy identity.
+
 Each stage chooses `serial` or bounded `parallel` execution. An analyzer's
 `selection.include`, `selection.exclude`, and `selection.artifact_kinds`
 compile its assignment from the immutable manifest before execution. Matching

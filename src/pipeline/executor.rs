@@ -67,6 +67,13 @@ struct AnalyzerResult {
     coverage: AnalyzerCoverage,
 }
 
+#[derive(Clone, Debug)]
+struct PreparationFailure {
+    analyzer_id: Option<AnalyzerId>,
+    message: &'static str,
+    coverage: Vec<AnalyzerCoverage>,
+}
+
 pub struct PipelineExecutor;
 
 impl PipelineExecutor {
@@ -77,9 +84,7 @@ impl PipelineExecutor {
     ) -> PipelineResult {
         let prepared = match prepare(pipeline, &manifest) {
             Ok(prepared) => prepared,
-            Err((analyzer_id, message)) => {
-                return preparation_failure(pipeline, &manifest, analyzer_id, message)
-            }
+            Err(failure) => return preparation_failure(failure),
         };
 
         let mut aggregate = PipelineResult {
@@ -163,36 +168,66 @@ impl PipelineExecutor {
 fn prepare(
     pipeline: &CompiledPipeline,
     manifest: &ArtifactManifest,
-) -> Result<Vec<Vec<PreparedAnalyzer>>, (Option<AnalyzerId>, &'static str)> {
-    pipeline
-        .stages
-        .iter()
-        .map(|stage| {
-            stage
-                .analyzers
-                .iter()
-                .map(|analyzer| {
-                    let selection = analyzer
-                        .eligibility
-                        .assign(&analyzer.id, manifest)
-                        .map_err(|_| {
-                            (
-                                Some(analyzer.id.clone()),
-                                "analyzer candidate assignment could not be constructed",
-                            )
-                        })?;
-                    Ok(PreparedAnalyzer {
+) -> Result<Vec<Vec<PreparedAnalyzer>>, PreparationFailure> {
+    prepare_with(pipeline, |analyzer| {
+        analyzer
+            .eligibility
+            .assign(&analyzer.id, manifest)
+            .map(|selection| {
+                selection
+                    .assignments
+                    .into_iter()
+                    .map(|assignment| assignment.artifact_id)
+                    .collect()
+            })
+            .map_err(|_| ())
+    })
+}
+
+fn prepare_with(
+    pipeline: &CompiledPipeline,
+    mut assign: impl FnMut(&CompiledAnalyzer) -> Result<Vec<ArtifactId>, ()>,
+) -> Result<Vec<Vec<PreparedAnalyzer>>, PreparationFailure> {
+    let mut prepared = Vec::with_capacity(pipeline.stages.len());
+    let mut coverage = Vec::new();
+    let mut first_failure = None;
+
+    for stage in &pipeline.stages {
+        let mut prepared_stage = Vec::with_capacity(stage.analyzers.len());
+        for analyzer in &stage.analyzers {
+            match assign(analyzer) {
+                Ok(assignment) => {
+                    coverage.push(incomplete_coverage(
+                        analyzer.id.clone(),
+                        assignment.len() as u64,
+                    ));
+                    prepared_stage.push(PreparedAnalyzer {
                         analyzer: analyzer.clone(),
-                        assignment: selection
-                            .assignments
-                            .into_iter()
-                            .map(|assignment| assignment.artifact_id)
-                            .collect(),
-                    })
-                })
-                .collect()
+                        assignment,
+                    });
+                }
+                Err(()) => {
+                    first_failure.get_or_insert_with(|| analyzer.id.clone());
+                    // Assignment construction failed, so no eligible or assigned
+                    // count is known for this analyzer. Zero is the coverage
+                    // contract's representation for that unknown, not a claim
+                    // that the analyzer's selector matched the whole manifest.
+                    coverage.push(incomplete_coverage(analyzer.id.clone(), 0));
+                }
+            }
+        }
+        prepared.push(prepared_stage);
+    }
+
+    if let Some(analyzer_id) = first_failure {
+        Err(PreparationFailure {
+            analyzer_id: Some(analyzer_id),
+            message: "analyzer candidate assignment could not be constructed",
+            coverage,
         })
-        .collect()
+    } else {
+        Ok(prepared)
+    }
 }
 
 async fn execute_stage(
@@ -370,23 +405,16 @@ fn validate_analyzer_result(
     }
 }
 
-fn preparation_failure(
-    pipeline: &CompiledPipeline,
-    manifest: &ArtifactManifest,
-    analyzer_id: Option<AnalyzerId>,
-    message: &'static str,
-) -> PipelineResult {
-    let assigned = manifest.artifacts().len() as u64;
+fn preparation_failure(failure: PreparationFailure) -> PipelineResult {
     PipelineResult {
         execution: PipelineExecution::default(),
         observations: Vec::new(),
-        issues: vec![issue(IssueCode::InternalFailure, analyzer_id, message)],
-        coverage: pipeline
-            .stages
-            .iter()
-            .flat_map(|stage| &stage.analyzers)
-            .map(|analyzer| incomplete_coverage(analyzer.id.clone(), assigned))
-            .collect(),
+        issues: vec![issue(
+            IssueCode::InternalFailure,
+            failure.analyzer_id,
+            failure.message,
+        )],
+        coverage: failure.coverage,
         complete: false,
     }
 }
@@ -483,6 +511,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Barrier;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -524,11 +553,26 @@ mod tests {
         id: &str,
         run: impl Fn(TestAnalyzerInput) -> TestAnalyzerOutput + Send + Sync + 'static,
     ) -> CompiledAnalyzer {
+        analyzer_with_selector(id, &["**"], run)
+    }
+
+    fn analyzer_with_selector(
+        id: &str,
+        include: &[&str],
+        run: impl Fn(TestAnalyzerInput) -> TestAnalyzerOutput + Send + Sync + 'static,
+    ) -> CompiledAnalyzer {
         CompiledAnalyzer::new(
             AnalyzerId::new(id).unwrap(),
             true,
-            EligibilitySelector::compile(&["**".to_string()], &[], [ArtifactKind::PhysicalFile])
-                .unwrap(),
+            EligibilitySelector::compile(
+                &include
+                    .iter()
+                    .map(|pattern| (*pattern).to_string())
+                    .collect::<Vec<_>>(),
+                &[],
+                [ArtifactKind::PhysicalFile],
+            )
+            .unwrap(),
             AnalyzerImplementation::Test(TestAnalyzer { run: Arc::new(run) }),
         )
     }
@@ -640,14 +684,23 @@ mod tests {
         let fixture = Fixture::new();
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
+        let first_batch_started = Arc::new(Barrier::new(2));
         let mut analyzers = Vec::new();
-        for (id, delay_ms, observation) in [("one", 40, "z"), ("two", 5, "a"), ("three", 5, "m")] {
+        for (index, (id, observation)) in [("one", "z"), ("two", "a"), ("three", "m")]
+            .into_iter()
+            .enumerate()
+        {
             let active = Arc::clone(&active);
             let peak = Arc::clone(&peak);
+            let first_batch_started = Arc::clone(&first_batch_started);
             analyzers.push(analyzer(id, move |input| {
                 let current = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(current, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(delay_ms));
+                if index < 2 {
+                    // Neither member of the first batch can finish until both
+                    // are running, deterministically proving actual overlap.
+                    first_batch_started.wait();
+                }
                 active.fetch_sub(1, Ordering::SeqCst);
                 success(vec![finding(
                     observation,
@@ -681,6 +734,58 @@ mod tests {
                 .map(|item| observation_id(item).as_str())
                 .collect::<Vec<_>>(),
             vec!["obs_a", "obs_m", "obs_z"]
+        );
+    }
+
+    #[test]
+    fn preparation_failure_reports_exact_successful_assignments_and_zero_for_unknown() {
+        let fixture = Fixture::new();
+        let pipeline = CompiledPipeline::new(vec![stage(
+            "prepare",
+            StageExecution::Serial,
+            vec![
+                analyzer_with_selector("selected", &["artifact.txt"], |_| success(Vec::new())),
+                analyzer_with_selector("unselected", &["*.rs"], |_| success(Vec::new())),
+                analyzer_with_selector("failed", &["artifact.txt"], |_| success(Vec::new())),
+            ],
+            PriorObservationMode::None,
+            limits(),
+        )])
+        .unwrap();
+
+        let failure = prepare_with(&pipeline, |analyzer| {
+            if analyzer.id.as_str() == "failed" {
+                return Err(());
+            }
+            analyzer
+                .eligibility
+                .assign(&analyzer.id, &fixture.manifest)
+                .map(|selection| {
+                    selection
+                        .assignments
+                        .into_iter()
+                        .map(|assignment| assignment.artifact_id)
+                        .collect()
+                })
+                .map_err(|_| ())
+        })
+        .unwrap_err();
+        let result = preparation_failure(failure);
+
+        assert_eq!(
+            result
+                .coverage
+                .iter()
+                .map(|row| (row.analyzer_id.as_str(), row.eligible, row.assigned))
+                .collect::<Vec<_>>(),
+            vec![("selected", 1, 1), ("unselected", 0, 0), ("failed", 0, 0)]
+        );
+        assert_eq!(
+            result.issues[0]
+                .analyzer_id
+                .as_ref()
+                .map(AnalyzerId::as_str),
+            Some("failed")
         );
     }
 

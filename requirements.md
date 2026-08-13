@@ -130,6 +130,11 @@ The main configuration defines:
 - explicit `policy_scan` daemon jobs and schedules;
 - protected stderr/file logging.
 
+Pipeline identity covers ordered stages, execution and prior-observation
+settings, selected analyzer configurations, selectors, limits, and compiled
+rule material. Profile and policy bindings/directives are covered separately by
+policy identity.
+
 Configuration path precedence is `--config`, then `FILE_GUARDIAN_CONFIG`, then
 `/etc/file-guardian/config.toml`. Environment variables do not override fields
 inside the selected configuration or otherwise change policy, paths, analyzer

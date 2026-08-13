@@ -15,8 +15,13 @@ use crate::domain::{
 };
 use crate::pipeline::{CompiledPipeline, PipelineExecution, PipelineExecutor};
 use crate::policy::{self, EvaluationDecision, PolicyBinding, PolicyResolution};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+type CaptureOperation = dyn Fn(&InvocationWorkspace, CaptureLimits, &Path) -> Result<Snapshot, CaptureError>
+    + Send
+    + Sync
+    + 'static;
 
 /// Fully compiled inputs for one authorization invocation.
 ///
@@ -100,6 +105,22 @@ async fn authorize_with_revalidation_hook<F>(
 where
     F: FnOnce(),
 {
+    authorize_with_capture_operation(
+        request,
+        before_revalidation,
+        Arc::new(|workspace, limits, input| Snapshotter::new(workspace, limits).capture(input)),
+    )
+    .await
+}
+
+async fn authorize_with_capture_operation<F>(
+    request: AuthorizationRequest,
+    before_revalidation: F,
+    capture: Arc<CaptureOperation>,
+) -> AuthorizationResult
+where
+    F: FnOnce(),
+{
     if request.validate().is_err() {
         return error_without_workspace(issue(
             IssueCode::ConfigurationFailure,
@@ -120,11 +141,17 @@ where
     };
 
     let workspace = Arc::new(workspace);
-    let mut result =
-        execute_in_workspace(&request, Arc::clone(&workspace), before_revalidation).await;
+    let mut result = execute_in_workspace(
+        &request,
+        Arc::clone(&workspace),
+        before_revalidation,
+        capture,
+    )
+    .await;
     match Arc::try_unwrap(workspace) {
-        Ok(workspace) => {
-            if workspace.remove().is_err() {
+        Ok(workspace) => match tokio::task::spawn_blocking(move || workspace.remove()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
                 result.outcome = ServiceOutcome::Error;
                 result.issues.push(issue(
                     IssueCode::WorkspaceFailure,
@@ -132,7 +159,15 @@ where
                     "invocation workspace could not be removed",
                 ));
             }
-        }
+            Err(_) => {
+                result.outcome = ServiceOutcome::Error;
+                result.issues.push(issue(
+                    IssueCode::InternalFailure,
+                    None,
+                    "workspace cleanup task did not complete",
+                ));
+            }
+        },
         Err(_) => {
             result.outcome = ServiceOutcome::Error;
             result.issues.push(issue(
@@ -149,15 +184,21 @@ async fn execute_in_workspace<F>(
     request: &AuthorizationRequest,
     workspace: Arc<InvocationWorkspace>,
     before_revalidation: F,
+    capture: Arc<CaptureOperation>,
 ) -> AuthorizationResult
 where
     F: FnOnce(),
 {
-    let initial = match Snapshotter::new(workspace.as_ref(), request.capture_limits)
-        .capture(&request.input)
+    let initial = match capture_snapshot(
+        Arc::clone(&workspace),
+        request.capture_limits,
+        request.input.clone(),
+        Arc::clone(&capture),
+    )
+    .await
     {
         Ok(snapshot) => snapshot,
-        Err(error) => {
+        Err(CaptureTaskError::Capture(error)) => {
             return error_result(ErrorParts {
                 input_kind: None,
                 initial_manifest: None,
@@ -165,6 +206,26 @@ where
                 observations: Vec::new(),
                 resolutions: Vec::new(),
                 issues: vec![capture_issue(&error, InspectionPhase::Initial)],
+                coverage_rows: Vec::new(),
+                initial_status: PhaseCoverageStatus::Incomplete,
+                pipeline: PipelineExecution {
+                    stages_completed: 0,
+                    analyzers_completed: 0,
+                },
+            });
+        }
+        Err(CaptureTaskError::Join) => {
+            return error_result(ErrorParts {
+                input_kind: None,
+                initial_manifest: None,
+                final_manifest: None,
+                observations: Vec::new(),
+                resolutions: Vec::new(),
+                issues: vec![issue(
+                    IssueCode::InternalFailure,
+                    None,
+                    "initial capture task did not complete",
+                )],
                 coverage_rows: Vec::new(),
                 initial_status: PhaseCoverageStatus::Incomplete,
                 pipeline: PipelineExecution {
@@ -222,12 +283,35 @@ where
     };
 
     before_revalidation();
-    let final_snapshot = match Snapshotter::new(workspace.as_ref(), request.capture_limits)
-        .capture(&request.input)
+    let final_snapshot = match capture_snapshot(
+        Arc::clone(&workspace),
+        request.capture_limits,
+        request.input.clone(),
+        capture,
+    )
+    .await
     {
         Ok(snapshot) => snapshot,
-        Err(error) => {
+        Err(CaptureTaskError::Capture(error)) => {
             issues.push(capture_issue(&error, InspectionPhase::Initial));
+            return error_result(ErrorParts {
+                input_kind: Some(initial.input_kind),
+                initial_manifest: Some(initial.manifest),
+                final_manifest: None,
+                observations,
+                resolutions: evaluation.resolutions,
+                issues,
+                coverage_rows,
+                initial_status: PhaseCoverageStatus::Complete,
+                pipeline,
+            });
+        }
+        Err(CaptureTaskError::Join) => {
+            issues.push(issue(
+                IssueCode::InternalFailure,
+                None,
+                "final capture task did not complete",
+            ));
             return error_result(ErrorParts {
                 input_kind: Some(initial.input_kind),
                 initial_manifest: Some(initial.manifest),
@@ -276,6 +360,23 @@ where
             EvaluationDecision::Deny => ServiceOutcome::Deny,
         },
     )
+}
+
+enum CaptureTaskError {
+    Capture(CaptureError),
+    Join,
+}
+
+async fn capture_snapshot(
+    workspace: Arc<InvocationWorkspace>,
+    limits: CaptureLimits,
+    input: PathBuf,
+    capture: Arc<CaptureOperation>,
+) -> Result<Snapshot, CaptureTaskError> {
+    tokio::task::spawn_blocking(move || capture(workspace.as_ref(), limits, &input))
+        .await
+        .map_err(|_| CaptureTaskError::Join)?
+        .map_err(CaptureTaskError::Capture)
 }
 
 fn successful_result(
@@ -432,6 +533,9 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     struct Fixture {
@@ -544,6 +648,58 @@ content_regex = "SECRET"
         assert_eq!(result.initial_manifest, result.final_manifest);
         assert!(!fixture.workspace_root.join("run_allow").exists());
         assert!(fixture.root.path().exists());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_captures_do_not_stall_the_async_runtime() {
+        let fixture = Fixture::new();
+        fs::write(fixture.input.join("safe.txt"), "safe").unwrap();
+        let request = fixture.request("nonblocking-captures", "builtin", builtin());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(0_usize), Condvar::new()));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::sync_channel(2);
+
+        let watchdog_gate = Arc::clone(&gate);
+        let watchdog = std::thread::spawn(move || {
+            let mut runtime_progressed = true;
+            for capture_index in 0..2 {
+                if progress_rx.recv_timeout(Duration::from_secs(2)) != Ok(capture_index) {
+                    runtime_progressed = false;
+                }
+                let (released, condition) = watchdog_gate.as_ref();
+                *released.lock().unwrap() = capture_index + 1;
+                condition.notify_all();
+            }
+            runtime_progressed
+        });
+
+        let capture_calls = Arc::clone(&calls);
+        let capture_gate = Arc::clone(&gate);
+        let capture: Arc<CaptureOperation> = Arc::new(move |workspace, limits, input| {
+            let capture_index = capture_calls.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(capture_index).unwrap();
+            let (released, condition) = capture_gate.as_ref();
+            let released = released.lock().unwrap();
+            drop(
+                condition
+                    .wait_while(released, |released| *released <= capture_index)
+                    .unwrap(),
+            );
+            Snapshotter::new(workspace, limits).capture(input)
+        });
+
+        let authorization = tokio::spawn(authorize_with_capture_operation(request, || {}, capture));
+        for capture_index in 0..2 {
+            assert_eq!(entered_rx.recv().await, Some(capture_index));
+            tokio::task::yield_now().await;
+            progress_tx.send(capture_index).unwrap();
+        }
+
+        let result = authorization.await.unwrap();
+        assert!(watchdog.join().unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(result.outcome, ServiceOutcome::Allow);
     }
 
     #[tokio::test]

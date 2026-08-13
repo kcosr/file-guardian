@@ -335,17 +335,6 @@ impl Config {
                 profile.id
             ));
         }
-        for analyzer_id in pipeline.stages.iter().flat_map(|stage| &stage.analyzers) {
-            let analyzer = self
-                .analyzer(analyzer_id)
-                .expect("validated analyzer reference");
-            if !matches!(analyzer.kind, AnalyzerKind::BuiltinRules { .. }) {
-                return invalid(format!(
-                    "profile '{}' selects analyzer '{}' whose kind is not available in this authorization phase",
-                    profile.id, analyzer.id
-                ));
-            }
-        }
         Ok(AuthorizationSelection {
             profile,
             pipeline,
@@ -1345,7 +1334,7 @@ path = "/srv/uploads"
     }
 
     #[test]
-    fn phase_three_rejects_unimplemented_analyzer_kinds() {
+    fn authorize_selection_accepts_valid_external_analyzers_for_fail_closed_execution() {
         let mut config = parse(MINIMAL).unwrap();
         config.analyzers[0].kind = AnalyzerKind::ExternalTool {
             adapter: PathBuf::from("/usr/libexec/file-guardian/scanner"),
@@ -1353,7 +1342,7 @@ path = "/srv/uploads"
             protocol: "file-guardian-delegate/1".to_string(),
             sandbox: "required".to_string(),
         };
-        assert!(config.validate_for_authorize(None).is_err());
+        assert!(config.validate_for_authorize(None).is_ok());
     }
 
     #[test]

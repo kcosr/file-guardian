@@ -4,6 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use file_guardian::domain::{CoverageStatus, IssueCode, PhaseCoverageStatus};
 use file_guardian::report::{AuthorizationOutcome, AuthorizationReport};
 
 struct Fixture {
@@ -60,6 +61,46 @@ filename_glob = "*.blocked"
             .unwrap()
             .replace("console = false", "console = true");
         fs::write(&self.config, value).unwrap();
+    }
+
+    fn select_unsupported_external_analyzer(&self) -> PathBuf {
+        let adapter = self._temp.path().join("delegate-scanner");
+        let marker = self._temp.path().join("delegate-was-invoked");
+        fs::write(&adapter, format!("#!/bin/sh\n: > '{}'\n", marker.display())).unwrap();
+        fs::set_permissions(&adapter, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let rules = self._temp.path().join("rules.toml");
+        let builtin_and_binding = format!(
+            r#"[[analyzers]]
+id = "rules"
+kind = "builtin_rules"
+rule_files = ["{}"]
+
+[[policy_bindings]]
+id = "blocked"
+profile = "publication"
+analyzer = "rules"
+rule = "*"
+directive = "deny""#,
+            rules.display()
+        );
+        let external = format!(
+            r#"[[analyzers]]
+id = "rules"
+kind = "external_tool"
+adapter = "{}"
+protocol = "file-guardian-delegate/1"
+sandbox = "required""#,
+            adapter.display()
+        );
+        let current = fs::read_to_string(&self.config).unwrap();
+        let updated = current.replace(&builtin_and_binding, &external);
+        assert_ne!(
+            updated, current,
+            "test fixture analyzer block must be replaced"
+        );
+        fs::write(&self.config, updated).unwrap();
+        marker
     }
 }
 
@@ -162,6 +203,36 @@ fn authorize_denies_matching_input_with_exit_twenty() {
     assert_eq!(report.outcome, AuthorizationOutcome::Deny);
     assert_eq!(report.observations.len(), 1);
     assert!(fixture.input.join("payload.blocked").exists());
+}
+
+#[test]
+fn selected_unimplemented_external_analyzer_fails_closed_with_runtime_coverage() {
+    let fixture = Fixture::new("deny", "safe.txt");
+    let invocation_marker = fixture.select_unsupported_external_analyzer();
+
+    let output = fixture.authorize(&[]);
+
+    assert_eq!(output.status.code(), Some(30));
+    let report = report(&output);
+    assert_eq!(report.outcome, AuthorizationOutcome::Error);
+    assert!(report.policy.is_some());
+    assert!(report.input.is_some());
+    assert_eq!(
+        report.coverage.initial.status,
+        PhaseCoverageStatus::Incomplete
+    );
+    assert_eq!(report.coverage.initial.analyzers.len(), 1);
+    let coverage = &report.coverage.initial.analyzers[0];
+    assert_eq!(coverage.analyzer_id.as_str(), "rules");
+    assert_eq!(coverage.status, CoverageStatus::Incomplete);
+    assert_eq!(coverage.eligible, 1);
+    assert_eq!(coverage.assigned, 1);
+    assert_eq!(coverage.completed, 0);
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.code == IssueCode::RequiredAnalyzerProcessFailure));
+    assert!(!invocation_marker.exists());
 }
 
 #[test]

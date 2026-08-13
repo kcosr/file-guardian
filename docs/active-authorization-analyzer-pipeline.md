@@ -87,7 +87,7 @@ Report schema `1` contains these top-level fields:
 - `schema_version`, `run_id`, optional `request_id`, `outcome`, `exit_code`,
   and `modified`.
 - Phase-aware `coverage.initial` and `coverage.verification`.
-- The compiled profile and pipeline identities in `policy`.
+- The compiled policy and pipeline identities in `policy`.
 - Initial and final immutable manifest identities in `input`.
 - `pipeline_runs`, normalized `observations`, policy `resolutions`, centralized
   `actions`, typed `issues`, and bounded `statistics`.
@@ -429,11 +429,10 @@ external-tool definitions parse and validate, but selecting either unsupported
 runner fails execution closed with exit `30`; fields are never reinterpreted or
 aliased.
 
-Pipeline identity covers stage order/execution, analyzer definitions and
-selectors, required status, built-in rule identity, Pi executable/model/thinking
-and instruction/schema/tool identities, deterministic adapter/ruleset/protocol
-and sandbox identities, prior-observation rules, policy bindings, and relevant
-limits.
+Pipeline identity covers ordered stages, execution and prior-observation
+settings, selected analyzer configurations, selectors, limits, and compiled
+rule material. Profile and policy bindings/directives are covered separately by
+policy identity.
 
 ## Implementation sequence
 
