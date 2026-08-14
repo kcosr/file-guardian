@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use globset::Glob;
 use serde::{Deserialize, Serialize};
 
+use crate::analyzers::pi::proxy::EXTENSION_MAX_RESPONSE_BYTES;
 use crate::logging::LoggingSettings;
 use crate::policy::PolicyDirective;
 
@@ -1215,10 +1216,15 @@ impl AnalyzerLimits {
                 "Pi analyzer '{id}' max_output_bytes must be at least {required_response} to contain a base64 response for max_read_bytes_per_call"
             ));
         }
-        const EXTENSION_MAX_PROXY_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
-        if maximum_output > EXTENSION_MAX_PROXY_RESPONSE_BYTES {
+        let extension_maximum = u64::try_from(EXTENSION_MAX_RESPONSE_BYTES).map_err(|_| {
+            ConfigError::Invalid(
+                "trusted extension response limit exceeds the configuration integer range"
+                    .to_string(),
+            )
+        })?;
+        if maximum_output > extension_maximum {
             return invalid(format!(
-                "Pi analyzer '{id}' max_output_bytes must not exceed the trusted extension limit of {EXTENSION_MAX_PROXY_RESPONSE_BYTES}"
+                "Pi analyzer '{id}' max_output_bytes must not exceed the trusted extension limit of {extension_maximum}"
             ));
         }
         Ok(())
@@ -1964,6 +1970,22 @@ path = "/srv/uploads"
         limits.max_read_bytes_per_call = Some(u64::MAX);
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("too large to bound a base64 response"));
+
+        let mut config = pi_example();
+        let limits = &mut config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .limits;
+        limits.max_output_bytes = Some(
+            u64::try_from(EXTENSION_MAX_RESPONSE_BYTES)
+                .unwrap()
+                .checked_add(1)
+                .unwrap(),
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("must not exceed the trusted extension limit"));
     }
 
     #[test]

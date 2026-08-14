@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 const EXTENSION: &str = include_str!("../src/analyzers/pi/assets/file_guardian_extension.js");
 const RUST_PROTOCOL: &str = include_str!("../src/analyzers/pi/protocol.rs");
+const RUST_PROXY: &str = include_str!("../src/analyzers/pi/proxy.rs");
 
 const EXPECTED_TOOLS: [&str; 7] = [
     "artifact_metadata",
@@ -55,6 +56,13 @@ fn extension_and_host_use_distinct_matching_wire_and_terminal_versions() {
     // Instruction bytes are authenticated bootstrap data, never an LLM tool.
     assert!(EXTENSION.contains("proxyRequest(\"instruction\")"));
     assert!(RUST_PROTOCOL.contains("Instruction {}"));
+}
+
+#[test]
+fn extension_and_host_share_the_same_response_ceiling() {
+    assert!(EXTENSION.contains("const MAX_PROXY_RESPONSE_BYTES = 2 * 1024 * 1024;"));
+    assert!(RUST_PROXY.contains("const EXTENSION_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;"));
+    assert!(RUST_PROXY.contains("self.max_response_bytes > EXTENSION_MAX_RESPONSE_BYTES"));
 }
 
 #[test]

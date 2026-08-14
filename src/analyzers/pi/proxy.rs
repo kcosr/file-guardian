@@ -24,7 +24,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, watch};
 
 const SOCKET_NAME: &str = "proxy.sock";
-const EXTENSION_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const EXTENSION_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PiProxyLimits {
