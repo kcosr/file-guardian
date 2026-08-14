@@ -12,12 +12,16 @@ const runnerSource = new URL("../src/analyzers/pi/assets/tool_sidecar_runner.js"
 
 function unavailable(result) {
 	return (
-		result.error?.code === "ENOENT" ||
-		/operation not permitted|no permissions to create new namespace|user namespaces? (?:are )?not (?:available|supported)/i.test(
+		result.error !== undefined ||
+		/operation not permitted|permission denied|no permissions to create new namespace|user namespaces? (?:are )?not (?:available|supported)/i.test(
 			result.stderr ?? "",
 		)
 	);
 }
+
+assert.equal(unavailable({ error: { code: "ETIMEDOUT" }, stderr: "" }), true);
+assert.equal(unavailable({ stderr: "bwrap: setting up uid map: Permission denied" }), true);
+assert.equal(unavailable({ status: 1, stderr: "unexpected Bubblewrap failure" }), false);
 
 const probe = spawnSync(
 	BWRAP,

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, open, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -13,13 +13,30 @@ const sentinelPath = join(temporary, "parent-only-fd");
 await mkdir(input, { mode: 0o700 });
 await mkdir(work, { mode: 0o700 });
 await writeFile(join(input, "artifact.txt"), "one\ntwo\nthree\n", { mode: 0o400 });
-const inheritedSentinel = await open(sentinelPath, "w+");
+await writeFile(sentinelPath, "parent-only\n", { mode: 0o600 });
 
 const runner = new URL("../src/analyzers/pi/assets/tool_sidecar_runner.js", import.meta.url);
-const child = spawn(process.execPath, [runner.pathname, "--test-roots", input, work, "/usr"], {
-	env: {},
-	stdio: ["pipe", "pipe", "pipe"],
-});
+// Bash deliberately opens fd 9 without O_CLOEXEC and then replaces itself
+// with Node. This mirrors the production Pi process, where File Guardian
+// clears CLOEXEC on the proxy-directory descriptor before exec. The runner's
+// own child_process.spawn calls must still exclude fd 9 from tool descendants.
+const child = spawn(
+	"/bin/bash",
+	[
+		"--noprofile",
+		"--norc",
+		"-c",
+		'exec 9<"$1"; exec "$2" "$3" --test-roots "$4" "$5" "$6"',
+		"file-guardian-fd-wrapper",
+		sentinelPath,
+		process.execPath,
+		runner.pathname,
+		input,
+		work,
+		"/usr",
+	],
+	{ env: {}, stdio: ["pipe", "pipe", "pipe"] },
+);
 const lines = createInterface({ input: child.stdout, crlfDelay: Infinity, terminal: false });
 const iterator = lines[Symbol.asyncIterator]();
 let requestId = 0;
@@ -54,7 +71,7 @@ try {
 	assert.equal(reuse.status, "ok");
 	assert.match(reuse.result.text, /^persistent\n\[exit 0\]$/);
 	const descriptor = await request("bash", {
-		command: `test \"$(readlink /proc/self/fd/${inheritedSentinel.fd} 2>/dev/null || true)\" != \"${sentinelPath}\"`,
+		command: `test \"$(readlink /proc/self/fd/9 2>/dev/null || true)\" != \"${sentinelPath}\"`,
 	});
 	assert.equal(descriptor.status, "ok");
 	assert.match(descriptor.result.text, /\[exit 0\]$/);
@@ -69,6 +86,5 @@ try {
 	console.log("Pi tool sidecar harness passed");
 } finally {
 	child.kill("SIGKILL");
-	await inheritedSentinel.close();
 	await rm(temporary, { recursive: true, force: true });
 }
