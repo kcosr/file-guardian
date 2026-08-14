@@ -42,8 +42,8 @@
     {
       "phase": "initial",
       "status": "incomplete",
-      "stages_completed": 2,
-      "analyzers_completed": 3
+      "stages_completed": 0,
+      "analyzers_completed": 0
     }
   ],
   "observations": [],

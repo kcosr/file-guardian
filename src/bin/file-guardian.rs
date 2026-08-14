@@ -16,7 +16,8 @@ use file_guardian::domain::{IssueCode, RunId};
 use file_guardian::logging::LoggingSettings;
 use file_guardian::report::{AuthorizationOutcome, AuthorizationReport, ReportIdentifier};
 use file_guardian::runtime::{
-    compile_invocation, report_from_result, secure_run_id, startup_error_report, ReportContext,
+    compile_invocation, completed_run_internal_failure_report, report_from_result, secure_run_id,
+    startup_error_report, ReportContext,
 };
 use file_guardian::service::AuthorizationService;
 use tokio::signal;
@@ -116,16 +117,19 @@ async fn authorize_with_config(
     })?
     .map_err(|error| (run_id.clone(), error.to_string()))?;
     let result = AuthorizationService::authorize(compiled.request).await;
-    report_from_result(
-        ReportContext {
-            run_id: run_id.clone(),
-            request_id: request_id(args),
-            policy: Some(compiled.policy),
-            duration_ms: elapsed_millis(started),
-        },
-        result,
-    )
-    .map_err(|error| (run_id, error.to_string()))
+    let context = ReportContext {
+        run_id: run_id.clone(),
+        request_id: request_id(args),
+        policy: Some(compiled.policy),
+        duration_ms: elapsed_millis(started),
+    };
+    match report_from_result(context.clone(), result.clone()) {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            tracing::error!("completed authorization report could not be constructed: {error}");
+            Ok(completed_run_internal_failure_report(context, result))
+        }
+    }
 }
 
 fn emit_report(report: &AuthorizationReport) -> ExitCode {
@@ -170,6 +174,10 @@ async fn run_daemon_command(config_path: Option<&Path>, args: DaemonArgs) -> Exi
             return ExitCode::from(30);
         }
     };
+    if let Err(error) = preflight_daemon_jobs(&config, &jobs).await {
+        tracing::error!("daemon job preflight failed: {error}");
+        return ExitCode::from(30);
+    }
     let config = Arc::new(config);
     let (failed_tx, mut failed_rx) = mpsc::channel::<String>(jobs.len());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -214,6 +222,29 @@ async fn run_daemon_command(config_path: Option<&Path>, args: DaemonArgs) -> Exi
         }
     }
     status
+}
+
+async fn preflight_daemon_jobs(config: &Config, jobs: &[DaemonJobConfig]) -> Result<(), String> {
+    let config = config.clone();
+    let jobs = jobs.to_vec();
+    tokio::task::spawn_blocking(move || {
+        for job in jobs {
+            let DaemonJobKind::PolicyScan { profile, .. } = &job.kind;
+            let run_id = secure_run_id()
+                .map_err(|_| format!("job '{}' secure run identity failed", job.id))?;
+            compile_invocation(
+                &config,
+                Some(profile),
+                Some(ConfigActionMode::Evaluate),
+                run_id,
+                PathBuf::from("/daemon-preflight"),
+            )
+            .map_err(|error| format!("job '{}' could not be compiled: {error}", job.id))?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| "daemon preflight task failed".to_string())?
 }
 
 #[cfg(unix)]
@@ -436,5 +467,31 @@ mod tests {
         wait_for_unix_shutdown(future::pending(), future::ready(Some(())))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_preflights_jobs_even_when_run_on_start_is_false() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config: Config = toml::from_str(include_str!("../../config/config.toml")).unwrap();
+        let file_guardian::config::AnalyzerKind::BuiltinRules { rule_files, .. } =
+            &mut config.analyzers[0].kind
+        else {
+            panic!("checked-in config must use built-in rules")
+        };
+        *rule_files = vec![temporary.path().join("missing-rules.toml")];
+        let job = DaemonJobConfig {
+            id: "preflight".to_string(),
+            enabled: true,
+            kind: DaemonJobKind::PolicyScan {
+                profile: "publication".to_string(),
+                target: DaemonTarget::Literal {
+                    path: PathBuf::from("/srv/uploads"),
+                },
+                every_secs: 300,
+                run_on_start: false,
+            },
+        };
+        let error = preflight_daemon_jobs(&config, &[job]).await.unwrap_err();
+        assert!(error.contains("could not be compiled"));
     }
 }

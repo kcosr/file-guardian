@@ -18,6 +18,7 @@ use crate::policy::PolicyDirective;
 
 pub const CONFIG_SCHEMA_VERSION: &str = "2";
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/file-guardian/config.toml";
+pub(crate) const SYNTHESIZED_POLICY_BINDING_PREFIX: &str = "default:";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -109,6 +110,28 @@ impl Config {
             "resolved configuration file path",
             &resolved_path,
         )?;
+        for (name, path) in config
+            .analyzers
+            .iter()
+            .flat_map(AnalyzerConfig::administrator_paths)
+        {
+            let resolved = canonicalize_if_exists(path)?;
+            validate_disjoint(
+                "resolved authorization.workspace.root",
+                &resolved_workspace,
+                name,
+                &resolved,
+            )?;
+        }
+        if let Some(directory) = &config.logging.directory {
+            let resolved = canonicalize_if_exists(directory)?;
+            validate_disjoint(
+                "resolved authorization.workspace.root",
+                &resolved_workspace,
+                "resolved logging.directory",
+                &resolved,
+            )?;
+        }
         Ok(config)
     }
 
@@ -135,6 +158,7 @@ impl Config {
         )?;
         let limits = &self.authorization.workspace.capture;
         if limits.max_files == 0
+            || limits.max_entries == 0
             || limits.max_file_bytes == 0
             || limits.max_total_bytes == 0
             || limits.max_depth == 0
@@ -411,8 +435,12 @@ impl Config {
         self.validate()?;
         let wanted = selected.iter().collect::<BTreeSet<_>>();
         for id in &wanted {
-            if !self.daemon.jobs.iter().any(|job| &job.id == *id) {
-                return invalid(format!("unknown daemon job '{id}'"));
+            match self.daemon.jobs.iter().find(|job| &job.id == *id) {
+                None => return invalid(format!("unknown daemon job '{id}'")),
+                Some(job) if !job.enabled => {
+                    return invalid(format!("explicitly selected daemon job '{id}' is disabled"));
+                }
+                Some(_) => {}
             }
         }
         let jobs = self
@@ -460,6 +488,8 @@ pub struct WorkspaceConfig {
 pub struct CaptureConfig {
     #[serde(default = "default_max_files")]
     pub max_files: u64,
+    #[serde(default = "default_max_entries")]
+    pub max_entries: u64,
     #[serde(default = "default_max_file_bytes")]
     pub max_file_bytes: u64,
     #[serde(default = "default_max_total_bytes")]
@@ -472,6 +502,7 @@ impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
             max_files: default_max_files(),
+            max_entries: default_max_entries(),
             max_file_bytes: default_max_file_bytes(),
             max_total_bytes: default_max_total_bytes(),
             max_depth: default_max_depth(),
@@ -481,6 +512,9 @@ impl Default for CaptureConfig {
 
 fn default_max_files() -> u64 {
     100_000
+}
+fn default_max_entries() -> u64 {
+    200_000
 }
 fn default_max_file_bytes() -> u64 {
     1024 * 1024 * 1024
@@ -1222,6 +1256,12 @@ impl PolicyBindingConfig {
         analyzers: &BTreeMap<&str, usize>,
     ) -> Result<(), ConfigError> {
         validate_id("policy_bindings.id", &self.id)?;
+        if self.id.starts_with(SYNTHESIZED_POLICY_BINDING_PREFIX) {
+            return invalid(format!(
+                "policy binding '{}' uses the reserved '{}' identifier namespace",
+                self.id, SYNTHESIZED_POLICY_BINDING_PREFIX
+            ));
+        }
         if !profiles.contains_key(self.profile.as_str()) {
             return invalid(format!(
                 "policy binding '{}' references unknown profile '{}'",
@@ -1447,6 +1487,17 @@ fn validate_relative(field: &str, path: &Path) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn canonicalize_if_exists(path: &Path) -> Result<PathBuf, ConfigError> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(source) => Err(ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 fn validate_binding_ambiguity(bindings: &[PolicyBindingConfig]) -> Result<(), ConfigError> {
     let mut exact = BTreeSet::new();
     let mut wildcard = BTreeSet::new();
@@ -1659,6 +1710,90 @@ path = "/srv/uploads"
     }
 
     #[test]
+    fn explicitly_selected_disabled_daemon_job_is_an_error() {
+        let extra = r#"
+
+[[daemon.jobs]]
+id = "uploads"
+kind = "policy_scan"
+enabled = false
+profile = "publication"
+every_secs = 300
+
+[daemon.jobs.target]
+kind = "literal"
+path = "/srv/uploads"
+"#;
+        let config = parse(&format!("{MINIMAL}{extra}")).unwrap();
+        let error = config
+            .validate_for_daemon(&["uploads".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("explicitly selected daemon job 'uploads' is disabled"));
+    }
+
+    #[test]
+    fn synthesized_policy_binding_namespace_is_reserved() {
+        let invalid = MINIMAL.replace("id = \"blocked\"", "id = \"default:collision\"");
+        let error = parse(&invalid).unwrap().validate().unwrap_err().to_string();
+        assert!(error.contains("reserved 'default:' identifier namespace"));
+    }
+
+    #[test]
+    fn capture_entry_limit_is_positive_and_defaults_independently() {
+        let config = parse(MINIMAL).unwrap();
+        assert_eq!(config.authorization.workspace.capture.max_entries, 200_000);
+        let invalid = MINIMAL.replace(
+            "root = \"/var/lib/file-guardian/runs\"",
+            "root = \"/var/lib/file-guardian/runs\"\n\n[authorization.workspace.capture]\nmax_entries = 0",
+        );
+        assert!(parse(&invalid).unwrap().validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_logging_and_analyzer_paths_must_not_enter_workspace() {
+        use std::os::unix::fs::symlink;
+
+        for admin_kind in ["rule", "logging"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let workspace = temporary.path().join("runs");
+            let outside = temporary.path().join("outside");
+            fs::create_dir(&workspace).unwrap();
+            fs::create_dir(&outside).unwrap();
+            let config_path = temporary.path().join("config.toml");
+            let source = if admin_kind == "rule" {
+                let actual = workspace.join("rules.toml");
+                fs::write(&actual, b"").unwrap();
+                let linked = outside.join("rules.toml");
+                symlink(&actual, &linked).unwrap();
+                MINIMAL
+                    .replace("/var/lib/file-guardian/runs", workspace.to_str().unwrap())
+                    .replace(
+                        "/etc/file-guardian/rules.d/publication.toml",
+                        linked.to_str().unwrap(),
+                    )
+            } else {
+                let actual = workspace.join("logs");
+                fs::create_dir(&actual).unwrap();
+                let linked = outside.join("logs");
+                symlink(&actual, &linked).unwrap();
+                format!(
+                    "{}\n[logging]\ndirectory = {:?}\n",
+                    MINIMAL.replace("/var/lib/file-guardian/runs", workspace.to_str().unwrap()),
+                    linked.to_str().unwrap()
+                )
+            };
+            fs::write(&config_path, source).unwrap();
+
+            let error = Config::load_from_sources(Some(&config_path)).unwrap_err();
+            assert!(
+                matches!(error, ConfigError::Invalid(message) if message.contains("resolved authorization.workspace.root"))
+            );
+        }
+    }
+
+    #[test]
     fn evaluate_can_downgrade_but_never_upgrade_authority() {
         let mut config = parse(MINIMAL).unwrap();
         config.authorization.profiles[0].action_mode = ActionMode::Apply;
@@ -1715,6 +1850,13 @@ path = "/srv/uploads"
             "analyzers = [\"rules\"]\nprior_observations = \"all_summary\"",
         );
         assert!(parse(&invalid).is_err());
+    }
+
+    #[test]
+    fn capture_traversal_entry_limit_must_be_positive() {
+        let mut config = parse(MINIMAL).unwrap();
+        config.authorization.workspace.capture.max_entries = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::time::Duration;
 use crate::analyzers::pi::protocol::{ClassificationVocabulary, TerminalValidationLimits};
 use crate::analyzers::pi::proxy::{ExpectedPiRuntime, PiProxyLimits};
 use crate::analyzers::pi::runner::PiRunLimits;
-use crate::analyzers::pi::sandbox::PiRuntimeSpec;
+use crate::analyzers::pi::sandbox::{PiRuntimeSpec, PI_RUNTIME_CONTEXT_MODE};
 use crate::analyzers::pi::{PiClassifierAnalyzer, PiClassifierSpec};
 use crate::analyzers::{
     BuiltinAnalyzerLimits, BuiltinContentApplicability, BuiltinRulesAnalyzer,
@@ -25,7 +25,7 @@ use crate::authorization::SnapshotInputKind;
 use crate::config::{
     ActionMode as ConfigActionMode, AnalyzerKind, ApplicabilityPolicy, ArtifactKindConfig,
     ClassifierScope, Config, PriorObservations, StageExecution as ConfigStageExecution,
-    UnboundObservation,
+    UnboundObservation, SYNTHESIZED_POLICY_BINDING_PREFIX,
 };
 use crate::domain::{
     AnalyzerId, ArtifactKind, ArtifactManifest, ClassificationCode, ConfiguredConfidence,
@@ -265,6 +265,7 @@ pub fn compile_invocation(
             input,
             capture_limits: crate::authorization::CaptureLimits {
                 max_files: capture.max_files,
+                max_entries: capture.max_entries,
                 max_file_bytes: capture.max_file_bytes,
                 max_total_bytes: capture.max_total_bytes,
                 max_depth: capture.max_depth,
@@ -406,7 +407,7 @@ fn compile_pi_analyzer(
             provider: pi.provider.clone(),
             model: pi.model.clone(),
             thinking: pi.thinking.clone(),
-            mode: "print".to_string(),
+            mode: PI_RUNTIME_CONTEXT_MODE.to_string(),
         },
         terminal_limits: TerminalValidationLimits::new(
             checked_usize("max_findings", max_findings)?,
@@ -579,9 +580,13 @@ fn compile_policy_bindings(
         {
             continue;
         }
+        let synthesized_identity =
+            crate::domain::Digest::sha256([analyzer.as_bytes(), &[0], rule.as_bytes()].concat());
         bindings.push(PolicyBinding {
-            id: BindingId::new(format!("default:{analyzer}:{rule}"))
-                .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
+            id: BindingId::new(format!(
+                "{SYNTHESIZED_POLICY_BINDING_PREFIX}{synthesized_identity}"
+            ))
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
             selector: ObservationSelector::Finding {
                 analyzer_id: Some(
                     AnalyzerId::new(analyzer.clone())
@@ -688,6 +693,57 @@ pub fn report_from_result(
         actions: Vec::new(),
         issues: result.issues,
         statistics,
+    })
+}
+
+/// Convert a completed service result whose normal report could not be
+/// constructed into a typed internal-failure report. The first attempt keeps
+/// all safe service state; the second drops only internally inconsistent
+/// observation data and impossible input context.
+pub fn completed_run_internal_failure_report(
+    context: ReportContext,
+    result: AuthorizationResult,
+) -> AuthorizationReport {
+    let mut rich = result.clone();
+    rich.outcome = ServiceOutcome::Error;
+    rich.issues.push(InspectionIssue {
+        phase: InspectionPhase::Initial,
+        code: IssueCode::InternalFailure,
+        analyzer_id: None,
+        subject_id: None,
+        artifact_id: None,
+        message: SanitizedMessage::new("authorization report could not be constructed")
+            .expect("static diagnostic is sanitized"),
+    });
+    if let Ok(report) = report_from_result(context.clone(), rich) {
+        return report;
+    }
+
+    let mut sanitized = result;
+    sanitized.outcome = ServiceOutcome::Error;
+    if sanitized.input_kind.is_none() || sanitized.initial_manifest.is_none() {
+        sanitized.input_kind = None;
+        sanitized.initial_manifest = None;
+        sanitized.final_manifest = None;
+    }
+    sanitized.observations.clear();
+    sanitized.resolutions.clear();
+    sanitized.issues = vec![InspectionIssue {
+        phase: InspectionPhase::Initial,
+        code: IssueCode::InternalFailure,
+        analyzer_id: None,
+        subject_id: None,
+        artifact_id: None,
+        message: SanitizedMessage::new("authorization report could not be constructed")
+            .expect("static diagnostic is sanitized"),
+    }];
+    report_from_result(context.clone(), sanitized).unwrap_or_else(|_| {
+        startup_error_report(
+            context.run_id,
+            context.request_id,
+            IssueCode::InternalFailure,
+            "authorization report could not be constructed",
+        )
     })
 }
 
@@ -849,6 +905,32 @@ directive = "deny"
         }
     }
 
+    #[test]
+    fn synthesized_bindings_use_reserved_bounded_digest_ids() {
+        let mut config = config_with_rule_binding("blocked");
+        config.policy_bindings.clear();
+        let long_rule = "r".repeat(128);
+        let bindings = compile_policy_bindings(
+            &config,
+            "publication",
+            UnboundObservation::Audit,
+            &[
+                ("rules".to_string(), "blocked".to_string()),
+                ("rules".to_string(), long_rule),
+            ],
+        )
+        .unwrap();
+        assert_eq!(bindings.len(), 2);
+        let ids = bindings
+            .iter()
+            .map(|binding| binding.id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 2);
+        assert!(ids
+            .iter()
+            .all(|id| { id.starts_with(SYNTHESIZED_POLICY_BINDING_PREFIX) && id.len() <= 128 }));
+    }
+
     #[tokio::test]
     async fn complete_service_result_maps_to_allow_report() {
         let temp = tempfile::tempdir().unwrap();
@@ -886,25 +968,34 @@ directive = "deny"
             policy_bindings: Vec::new(),
         })
         .await;
-        let report = report_from_result(
-            ReportContext {
-                run_id,
-                request_id: None,
-                policy: Some(PolicySummary {
-                    profile_id: ReportIdentifier::new("publication").unwrap(),
-                    identity: Digest::sha256(b"profile"),
-                    pipeline_id: ReportIdentifier::new("pipeline").unwrap(),
-                    pipeline_identity: Digest::sha256(b"pipeline"),
-                    effective_action_mode: EffectiveActionMode::Evaluate,
-                }),
-                duration_ms: 7,
-            },
-            result,
-        )
-        .unwrap();
+        let context = ReportContext {
+            run_id,
+            request_id: None,
+            policy: Some(PolicySummary {
+                profile_id: ReportIdentifier::new("publication").unwrap(),
+                identity: Digest::sha256(b"profile"),
+                pipeline_id: ReportIdentifier::new("pipeline").unwrap(),
+                pipeline_identity: Digest::sha256(b"pipeline"),
+                effective_action_mode: EffectiveActionMode::Evaluate,
+            }),
+            duration_ms: 7,
+        };
+        let report = report_from_result(context.clone(), result.clone()).unwrap();
         assert_eq!(report.outcome, AuthorizationOutcome::Allow);
         assert_eq!(report.exit_code, 0);
         assert_eq!(report.artifacts.len(), 1);
         assert_eq!(report.statistics.duration_ms, 7);
+
+        let mut malformed = result;
+        malformed.input_kind = None;
+        assert!(report_from_result(context.clone(), malformed.clone()).is_err());
+        let fallback = completed_run_internal_failure_report(context, malformed);
+        assert_eq!(fallback.outcome, AuthorizationOutcome::Error);
+        assert_eq!(fallback.exit_code, 30);
+        assert!(fallback.policy.is_some());
+        assert!(fallback.issues.iter().any(|issue| {
+            issue.code == IssueCode::InternalFailure
+                && issue.message.as_str() == "authorization report could not be constructed"
+        }));
     }
 }

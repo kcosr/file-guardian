@@ -24,6 +24,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{oneshot, watch};
 
 const SOCKET_NAME: &str = "proxy.sock";
+const EXTENSION_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PiProxyLimits {
@@ -53,6 +54,7 @@ impl PiProxyLimits {
             || self.max_search_bytes_per_call == 0
             || self.max_search_calls == 0
             || self.frame_read_timeout.is_zero()
+            || self.max_response_bytes > EXTENSION_MAX_RESPONSE_BYTES
             || encoded_response_upper_bound(self.max_read_bytes_per_call)
                 .is_none_or(|size| size > self.max_response_bytes as u64)
         {
@@ -196,17 +198,6 @@ impl PiProxy {
 
     pub fn progress(&self) -> watch::Receiver<ProxyProgress> {
         self.progress.clone()
-    }
-
-    /// Stops the server and removes the only socket and its private directory.
-    pub async fn shutdown(mut self) -> Result<(), PiProxyError> {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        (&mut self.task)
-            .await
-            .map_err(|_| PiProxyError::ServerStopped)?;
-        self.cleanup_endpoint()
     }
 
     /// Finalizes a completed child run. A run which exits without a terminal
@@ -465,22 +456,10 @@ impl Server {
             }
             ProxyOperation::ManifestList {} => {
                 self.require_ready()?;
-                let entries = self
-                    .assignments
-                    .iter()
-                    .map(|(artifact_id, candidate_id)| {
-                        let artifact = self.artifact(artifact_id)?;
-                        Ok(ManifestEntry {
-                            candidate_id,
-                            artifact_id,
-                            logical_path: logical_path(artifact),
-                            kind: artifact.kind,
-                            byte_len: artifact.byte_len,
-                            content_digest: artifact.content_digest,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, PiProxyError>>()?;
-                Ok(OperationResult::Continue(to_value(entries)?))
+                Ok(OperationResult::Continue(manifest_list_value(
+                    &self.input,
+                    &self.assignments,
+                )?))
             }
             ProxyOperation::ArtifactMetadata { artifact_id } => {
                 self.require_ready()?;
@@ -690,28 +669,74 @@ fn logical_path(artifact: &Artifact) -> &LogicalPath {
 }
 
 fn validate_input(input: &PiProxyInput) -> Result<(), PiProxyError> {
-    let instruction_response = ProxyResponse::Ok {
-        protocol: PROTOCOL_VERSION.to_owned(),
-        request_id: u64::MAX,
-        result: json!({"instruction": input.instruction.as_ref()}),
-    };
     if input.instruction.is_empty()
-        || serde_json::to_vec(&instruction_response)
-            .map_err(|_| PiProxyError::InvalidInstruction)?
-            .len()
-            .checked_add(1)
-            .is_none_or(|size| size > input.limits.max_response_bytes)
+        || !response_fits(
+            json!({"instruction": input.instruction.as_ref()}),
+            input.limits.max_response_bytes,
+        )?
     {
         return Err(PiProxyError::InvalidInstruction);
     }
-    if input
+    let assignments = input
         .assignments
         .iter()
-        .any(|assignment| input.manifest.artifact(&assignment.artifact_id).is_none())
+        .map(|assignment| {
+            (
+                assignment.artifact_id.clone(),
+                assignment.candidate_id.clone(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if assignments.len() != input.assignments.len()
+        || input
+            .assignments
+            .iter()
+            .any(|assignment| input.manifest.artifact(&assignment.artifact_id).is_none())
     {
         return Err(PiProxyError::InvalidAssignment);
     }
+    let manifest_list = manifest_list_value(input, &assignments)?;
+    if !response_fits(manifest_list, input.limits.max_response_bytes)? {
+        return Err(PiProxyError::ManifestResponseTooLarge);
+    }
     Ok(())
+}
+
+fn manifest_list_value(
+    input: &PiProxyInput,
+    assignments: &BTreeMap<ArtifactId, CandidateId>,
+) -> Result<Value, PiProxyError> {
+    let entries = assignments
+        .iter()
+        .map(|(artifact_id, candidate_id)| {
+            let artifact = input
+                .manifest
+                .artifact(artifact_id)
+                .ok_or(PiProxyError::InvalidAssignment)?;
+            Ok(ManifestEntry {
+                candidate_id,
+                artifact_id,
+                logical_path: logical_path(artifact),
+                kind: artifact.kind,
+                byte_len: artifact.byte_len,
+                content_digest: artifact.content_digest,
+            })
+        })
+        .collect::<Result<Vec<_>, PiProxyError>>()?;
+    to_value(entries)
+}
+
+fn response_fits(result: Value, max_response_bytes: usize) -> Result<bool, PiProxyError> {
+    let response = ProxyResponse::Ok {
+        protocol: PROTOCOL_VERSION.to_owned(),
+        request_id: u64::MAX,
+        result,
+    };
+    Ok(serde_json::to_vec(&response)
+        .map_err(|_| PiProxyError::Internal)?
+        .len()
+        .checked_add(1)
+        .is_some_and(|size| size <= max_response_bytes))
 }
 
 async fn read_request(
@@ -893,6 +918,8 @@ pub enum PiProxyError {
     InvalidInstruction,
     #[error("Pi proxy assignment does not match the immutable manifest")]
     InvalidAssignment,
+    #[error("Pi proxy assignment metadata exceeds the configured response limit")]
+    ManifestResponseTooLarge,
     #[error("could not obtain a private Pi proxy capability")]
     Entropy(#[source] std::io::Error),
     #[error("could not create the private Pi proxy endpoint")]
@@ -987,10 +1014,14 @@ mod tests {
     }
 
     fn fixture(bytes: &[u8]) -> Fixture {
-        fixture_with_workspace_padding(bytes, 0)
+        fixture_with_paths(bytes, 0, "artifact.bin")
     }
 
     fn fixture_with_workspace_padding(bytes: &[u8], padding: usize) -> Fixture {
+        fixture_with_paths(bytes, padding, "artifact.bin")
+    }
+
+    fn fixture_with_paths(bytes: &[u8], padding: usize, logical_name: &str) -> Fixture {
         let temporary = TempDir::new().unwrap();
         let mut root = temporary.path().to_path_buf();
         if padding != 0 {
@@ -1008,7 +1039,7 @@ mod tests {
         let subject_id = SubjectId::from_suffix("proxy-test").unwrap();
         let artifact_id = ArtifactId::from_suffix("proxy-test").unwrap();
         let logical_path =
-            LogicalPath::new(vec![PathSegment::utf8("artifact.bin").unwrap()]).unwrap();
+            LogicalPath::new(vec![PathSegment::utf8(logical_name).unwrap()]).unwrap();
         let source_identity = SourceIdentity {
             device: 1,
             inode: 2,
@@ -1088,7 +1119,7 @@ mod tests {
                 provider: "internal".to_owned(),
                 model: "classifier".to_owned(),
                 thinking: "high".to_owned(),
-                mode: "text".to_owned(),
+                mode: super::super::sandbox::PI_RUNTIME_CONTEXT_MODE.to_owned(),
             },
             vocabulary: Arc::new(
                 ClassificationVocabulary::new([code], [ConfiguredConfidence::High], [reason])
@@ -1126,8 +1157,12 @@ mod tests {
     }
 
     async fn exchange(path: &Path, request: &ProxyRequest) -> ProxyResponse {
+        exchange_raw(path, &serde_json::to_vec(request).unwrap()).await
+    }
+
+    async fn exchange_raw(path: &Path, frame: &[u8]) -> ProxyResponse {
         let mut stream = UnixStream::connect(path).await.unwrap();
-        let mut encoded = serde_json::to_vec(request).unwrap();
+        let mut encoded = frame.to_vec();
         encoded.push(b'\n');
         stream.write_all(&encoded).await.unwrap();
         stream.shutdown().await.unwrap();
@@ -1157,7 +1192,7 @@ mod tests {
             provider: "internal".to_owned(),
             model: "classifier".to_owned(),
             thinking: "high".to_owned(),
-            mode: "text".to_owned(),
+            mode: super::super::sandbox::PI_RUNTIME_CONTEXT_MODE.to_owned(),
             model_in_catalog: true,
             active_tools: REQUIRED_TOOLS
                 .iter()
@@ -1348,7 +1383,120 @@ mod tests {
         assert!(actual_socket.exists());
         let debug = format!("{:?}", proxy.endpoint());
         assert!(!debug.contains("/proc/self/fd/"));
-        proxy.shutdown().await.unwrap();
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::MissingTerminalSubmission)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[test]
+    fn oversized_manifest_list_is_rejected_before_endpoint_creation() {
+        let sentinel = format!("private-name-{}", "x".repeat(6_000));
+        let fixture = fixture_with_paths(b"content", 0, &sentinel);
+        let error = match PiProxy::start(&fixture.workspace, input(&fixture)) {
+            Ok(_) => panic!("oversized manifest response must fail before launch"),
+            Err(error) => error,
+        };
+        assert!(matches!(&error, PiProxyError::ManifestResponseTooLarge));
+        let diagnostic = format!("{error:?}");
+        assert!(!diagnostic.contains("private-name"));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_json_frame_is_fatal() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let response = exchange_raw(&socket(&proxy), br#"{"protocol":]"#).await;
+        assert!(matches!(
+            response,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::InvalidRequest
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::MalformedFrame)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrong_token_and_manifest_are_each_fatal() {
+        for wrong_manifest in [false, true] {
+            let fixture = fixture(b"content");
+            let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+            let mut request = bound_request(&proxy, &fixture, 1, runtime_ready());
+            if wrong_manifest {
+                request.manifest_identity = Digest::sha256(b"foreign manifest");
+            } else {
+                request.run_token = "foreign-token".to_owned();
+            }
+            assert!(matches!(
+                exchange(&socket(&proxy), &request).await,
+                ProxyResponse::Error {
+                    error: WireError {
+                        code: ProxyErrorCode::Unauthorized
+                    },
+                    ..
+                }
+            ));
+            assert!(matches!(
+                proxy.finish().await,
+                Err(PiProxyError::Unauthorized)
+            ));
+            fixture.workspace.remove().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn skipped_request_id_is_fatal() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let request = bound_request(&proxy, &fixture, 2, runtime_ready());
+        assert!(matches!(
+            exchange(&socket(&proxy), &request).await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::ProtocolViolation
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::ProtocolViolation)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_handshake_mismatch_is_fatal() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let mut operation = runtime_ready();
+        let ProxyOperation::RuntimeReady { pi_version, .. } = &mut operation else {
+            unreachable!();
+        };
+        *pi_version = "0.82.0".to_owned();
+        let request = bound_request(&proxy, &fixture, 1, operation);
+        assert!(matches!(
+            exchange(&socket(&proxy), &request).await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::ProtocolViolation
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::RuntimeMismatch)
+        ));
         fixture.workspace.remove().unwrap();
     }
 
@@ -1456,7 +1604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_interrupts_a_partial_frame_and_removes_the_endpoint() {
+    async fn finish_interrupts_a_partial_frame_and_removes_the_endpoint() {
         let fixture = fixture(b"data");
         let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
         let socket = socket(&proxy);
@@ -1464,10 +1612,13 @@ mod tests {
         let mut client = UnixStream::connect(&socket).await.unwrap();
         client.write_all(b"{").await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(1), proxy.shutdown())
+        let result = tokio::time::timeout(Duration::from_secs(1), proxy.finish())
             .await
-            .expect("shutdown must interrupt the active frame")
-            .unwrap();
+            .expect("finish must interrupt the active frame");
+        assert!(matches!(
+            result,
+            Err(PiProxyError::MissingTerminalSubmission)
+        ));
         assert!(!endpoint.exists());
         fixture.workspace.remove().unwrap();
     }
@@ -1519,7 +1670,10 @@ mod tests {
         let debug = format!("{:?}", proxy.endpoint());
         assert!(!debug.contains(&token));
         assert!(debug.contains("[REDACTED]"));
-        proxy.shutdown().await.unwrap();
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::MissingTerminalSubmission)
+        ));
         fixture.workspace.remove().unwrap();
     }
 }

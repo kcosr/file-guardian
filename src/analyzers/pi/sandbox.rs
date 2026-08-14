@@ -15,6 +15,12 @@ use tokio::time::timeout;
 
 pub(crate) const SANDBOX_PROXY_SOCKET: &str = "/run/file-guardian/proxy.sock";
 pub(crate) const PI_TOOLS: &str = "manifest_list,artifact_metadata,artifact_read,artifact_read_range,artifact_search,prior_observations,submit_classification";
+/// Pi's `--mode` controls serialized stdout, independently of the extension
+/// context mode selected by `--print`.
+pub(crate) const PI_CLI_OUTPUT_MODE: &str = "text";
+/// Pi 0.83 maps `--print --mode text` to `ctx.mode == "print"`. The proxy
+/// runtime-ready handshake must validate this value, not the CLI output mode.
+pub(crate) const PI_RUNTIME_CONTEXT_MODE: &str = "print";
 
 #[derive(Clone, Debug)]
 pub(crate) struct PiRuntimeSpec {
@@ -207,6 +213,7 @@ pub(crate) fn compile_sandbox_command(
     runtime: &PreparedPiRuntime,
     invocation: &SandboxInvocation<'_>,
 ) -> Result<SandboxCommand, PiSandboxError> {
+    debug_assert_eq!(PI_RUNTIME_CONTEXT_MODE, "print");
     runtime.revalidate()?;
     validate_proxy_dir(invocation.proxy_endpoint_dir)?;
     let mut environment = vec![
@@ -259,6 +266,7 @@ pub(crate) fn compile_sandbox_command(
         "--disable-userns",
         "--assert-userns-disabled",
         "--die-with-parent",
+        "--new-session",
         "--hostname",
         "file-guardian-pi",
         "--cap-drop",
@@ -332,7 +340,7 @@ pub(crate) fn compile_sandbox_command(
     arguments.extend(os_args(&[
         "--print",
         "--mode",
-        "text",
+        PI_CLI_OUTPUT_MODE,
         "--no-session",
         "--no-builtin-tools",
         "--tools",
@@ -721,18 +729,27 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            let secure_parent = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+            let secure_parent = secure_test_parent();
             let root = tempfile::Builder::new()
                 .prefix(".pi-sandbox-test-")
                 .tempdir_in(secure_parent)
                 .unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let runtime = root.path().join("runtime");
-            for directory in ["bin", "lib/pi/dist", "etc/ssl/certs", "config", "proxy"] {
-                fs::create_dir_all(root.path().join(directory)).unwrap();
-            }
-            fs::create_dir_all(&runtime).unwrap();
-            for directory in ["bin", "lib/pi/dist", "etc/ssl/certs"] {
-                fs::create_dir_all(runtime.join(directory)).unwrap();
+            for directory in [
+                runtime.clone(),
+                runtime.join("bin"),
+                runtime.join("lib"),
+                runtime.join("lib/pi"),
+                runtime.join("lib/pi/dist"),
+                runtime.join("etc"),
+                runtime.join("etc/ssl"),
+                runtime.join("etc/ssl/certs"),
+                root.path().join("config"),
+                root.path().join("proxy"),
+            ] {
+                fs::create_dir_all(&directory).unwrap();
+                fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
             }
             let files = [
                 ("bin/node", b"static-node".as_slice(), true),
@@ -805,6 +822,21 @@ mod tests {
         fn prepare(&self) -> PreparedPiRuntime {
             PreparedPiRuntime::prepare(self.spec.clone()).unwrap()
         }
+    }
+
+    fn secure_test_parent() -> PathBuf {
+        let current = std::env::current_dir().unwrap();
+        current
+            .ancestors()
+            .find(|path| {
+                path.ancestors().all(|ancestor| {
+                    fs::metadata(ancestor).is_ok_and(|metadata| {
+                        metadata.is_dir() && metadata.permissions().mode() & 0o022 == 0
+                    })
+                })
+            })
+            .expect("test host must expose a secure ancestor directory")
+            .to_path_buf()
     }
 
     #[test]
@@ -894,6 +926,7 @@ mod tests {
             "--disable-userns",
             "--assert-userns-disabled",
             "--die-with-parent",
+            "--new-session",
             "--cap-drop",
             "--tmpfs",
             "--proc",
@@ -902,7 +935,7 @@ mod tests {
             "/runtime/lib/pi/dist/cli.js",
             "--print",
             "--mode",
-            "text",
+            PI_CLI_OUTPUT_MODE,
             "--no-session",
             "--no-builtin-tools",
             PI_TOOLS,
@@ -920,6 +953,10 @@ mod tests {
             );
         }
         assert!(!args.iter().any(|value| value == "--system-prompt"));
+        assert!(args
+            .windows(2)
+            .any(|values| values == ["--mode", PI_CLI_OUTPUT_MODE]));
+        assert_eq!(PI_RUNTIME_CONTEXT_MODE, "print");
         assert!(!args
             .windows(3)
             .any(|values| values[0] == "--ro-bind" && values[1] == "/"));
@@ -941,6 +978,51 @@ mod tests {
                 "missing mount {target}"
             );
         }
+        let actual_mounts = args
+            .windows(3)
+            .filter(|values| values[0] == "--ro-bind")
+            .map(|values| (values[1].clone(), values[2].clone()))
+            .collect::<BTreeSet<_>>();
+        let expected_mounts = [
+            (fixture.spec.runtime_root.clone(), PathBuf::from("/runtime")),
+            (
+                fixture.spec.trusted_extension.clone(),
+                PathBuf::from("/policy/file-guardian-extension.js"),
+            ),
+            (
+                fixture.spec.isolated_agent_dir.clone(),
+                PathBuf::from("/config"),
+            ),
+            (
+                fixture.spec.runtime_root.join("etc/resolv.conf"),
+                PathBuf::from("/etc/resolv.conf"),
+            ),
+            (
+                fixture.spec.runtime_root.join("etc/hosts"),
+                PathBuf::from("/etc/hosts"),
+            ),
+            (
+                fixture.spec.runtime_root.join("etc/nsswitch.conf"),
+                PathBuf::from("/etc/nsswitch.conf"),
+            ),
+            (
+                fixture
+                    .spec
+                    .runtime_root
+                    .join("etc/ssl/certs/ca-certificates.crt"),
+                PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+            ),
+            (fixture.proxy.clone(), PathBuf::from("/run/file-guardian")),
+        ]
+        .into_iter()
+        .map(|(source, target)| {
+            (
+                source.to_string_lossy().into_owned(),
+                target.to_string_lossy().into_owned(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+        assert_eq!(actual_mounts, expected_mounts);
         let names = command
             .environment
             .iter()

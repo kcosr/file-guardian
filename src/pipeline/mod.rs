@@ -141,6 +141,15 @@ impl CompiledPipeline {
         }
         let mut stage_ids = BTreeSet::new();
         for stage in &stages {
+            if stage.analyzers.is_empty() {
+                return Err(PipelineError::EmptyStage(stage.id.clone()));
+            }
+            if matches!(
+                stage.execution,
+                StageExecution::Parallel { max_concurrency: 0 }
+            ) {
+                return Err(PipelineError::ZeroConcurrency(stage.id.clone()));
+            }
             if !stage_ids.insert(stage.id.clone()) {
                 return Err(PipelineError::DuplicateStage(stage.id.clone()));
             }
@@ -178,4 +187,56 @@ pub enum PipelineError {
     DuplicateAnalyzer(AnalyzerId),
     #[error("optional analyzer {0} is not supported by this coverage contract")]
     OptionalAnalyzerUnsupported(AnalyzerId),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bypassed_stage(execution: StageExecution) -> CompiledStage {
+        CompiledStage {
+            id: StageId::new("bypassed").unwrap(),
+            execution,
+            analyzers: Vec::new(),
+            prior_observations: PriorObservationMode::None,
+            prior_limits: ProjectionLimits::new(1, 1).unwrap(),
+        }
+    }
+
+    #[test]
+    fn pipeline_revalidates_public_stage_fields() {
+        let empty = bypassed_stage(StageExecution::Serial);
+        assert!(matches!(
+            CompiledPipeline::new(vec![empty.clone()]),
+            Err(PipelineError::EmptyStage(_))
+        ));
+        assert!(matches!(
+            (CompiledPipeline {
+                stages: vec![empty]
+            })
+            .validate(),
+            Err(PipelineError::EmptyStage(_))
+        ));
+
+        let mut zero_concurrency = bypassed_stage(StageExecution::Parallel { max_concurrency: 0 });
+        // The concurrency invariant must be checked independently from stage
+        // emptiness, even when callers bypass `CompiledStage::new`.
+        zero_concurrency.analyzers.push(CompiledAnalyzer::new(
+            AnalyzerId::new("unsupported").unwrap(),
+            true,
+            EligibilitySelector::compile(
+                &["**".to_string()],
+                &[],
+                [crate::domain::ArtifactKind::PhysicalFile],
+            )
+            .unwrap(),
+            AnalyzerImplementation::Unsupported {
+                kind: UnsupportedAnalyzerKind::External,
+            },
+        ));
+        assert!(matches!(
+            CompiledPipeline::new(vec![zero_concurrency]),
+            Err(PipelineError::ZeroConcurrency(_))
+        ));
+    }
 }

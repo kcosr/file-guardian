@@ -89,8 +89,17 @@ Report schema `1` contains these top-level fields:
 - Phase-aware `coverage.initial` and `coverage.verification`.
 - The compiled policy and pipeline identities in `policy`.
 - Initial and final immutable manifest identities in `input`.
-- `pipeline_runs`, normalized `observations`, policy `resolutions`, centralized
-  `actions`, typed `issues`, and bounded `statistics`.
+- Mandatory `artifacts`, followed by `pipeline_runs`, normalized
+  `observations`, policy `resolutions`, centralized `actions`, typed `issues`,
+  and bounded `statistics`.
+
+`artifacts` is always an array. Each record contains a host-generated
+`artifact_id`, physical `subject_id`, `kind`, segment-encoded relative logical
+path, byte length, and content digest. It never contains an absolute path,
+workspace object path, or content. After a trustworthy initial capture it lists
+the safely reportable captured artifacts even when later analysis fails; an
+error before trustworthy capture uses an empty array. Logical archive-member
+records use the same surface once archive materialization is implemented.
 
 Schema `1` deliberately remains an aggregate authorization report. Its
 `pipeline_runs` entries summarize phase status and completed stage/analyzer
@@ -150,6 +159,12 @@ hashing. Metadata is checked before and after reading. Symlinks, hardlinks,
 special files, cross-filesystem traversal, unreadable entries, disappearing
 files, new entries during capture, and unstable metadata are governed by
 explicit policy and otherwise become typed coverage failures.
+
+Capture bounds traversal work separately from accepted content:
+`authorization.workspace.capture.max_entries` counts every directory entry
+encountered, including directories and entries later rejected, while
+`max_files` counts captured regular files. The mature example uses `200000`
+entries and `100000` files.
 
 All analyzers read the same captured objects. They never reopen live staging.
 Artifact IDs are host-generated; logical paths are root-relative segment arrays
@@ -277,12 +292,16 @@ classifier response. The runner therefore uses an explicit reviewed extension
 and a terminating structured-output tool:
 
 ```text
-pi --print --no-session --no-builtin-tools --no-extensions
+pi --print --mode text --no-session --no-builtin-tools --no-extensions
    --no-skills --no-prompt-templates --no-themes --no-context-files
    --no-approve --provider <provider> --model <model> --thinking <level>
    --extension <trusted-file-guardian-extension>
-   --tools <exact-file-guardian-tool-list> <fixed-start-message>
+   --tools <exact-file-guardian-tool-list>
 ```
+
+The fixed classification task is written to Pi's stdin and stdin is then
+closed. It is not a command-line argument. The trusted system instruction is
+obtained separately through the authenticated bootstrap proxy operation.
 
 The executable, model, thinking level, administrator-owned instruction,
 structured-output schema, vocabulary, tool grant, selectors, and budgets are
@@ -608,5 +627,6 @@ positive model, benchmark corpus, and report-only rollout before enforcement.
   disagreement.
 - Privacy tests reject absolute paths, matched secrets, prompts, transcripts,
   raw scanner output, credentials, and unsafe environment values in reports.
-- Each feature phase updates documentation and changelog and passes formatting,
-  lint, test, and release-build gates.
+- Each feature phase updates documentation and passes formatting, lint, test,
+  and release-build gates. Changelog attribution is added after a PR exists so
+  the required PR link is available.

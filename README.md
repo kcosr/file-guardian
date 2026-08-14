@@ -20,6 +20,8 @@ caller-owned staging tree.
 
 - One-shot authorization of exactly one literal regular file or directory.
 - Descriptor-anchored capture into a private, invocation-scoped workspace.
+- Independent traversal-entry and captured-file ceilings, so directory-heavy
+  or rejected-entry trees cannot bypass capture work limits.
 - Immutable SHA-256-addressed objects shared by all analysis in the run.
 - Built-in filename glob and text-content regex matching.
 - Compiled multi-stage pipelines with serial or bounded-parallel stage
@@ -111,6 +113,13 @@ are never mixed into stdout.
 CLI syntax and help errors conventionally exit `2`. A publisher must fail
 closed on malformed, missing, truncated, or exit-inconsistent JSON and must
 publish only exits `0` and, once supported, `10`.
+
+Report schema `1` always includes top-level `artifacts`. Each record contains a
+host-generated artifact and subject ID, kind, segment-encoded relative logical
+path, byte length, and content digest. The array never exposes absolute staging
+or workspace paths, object-store paths, or file content. It is empty before a
+trustworthy capture and may retain safely known captured records on a later
+error.
 
 ### Safe caller pattern
 

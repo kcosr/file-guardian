@@ -11,6 +11,7 @@ default_profile = "publication"
 root = "/var/lib/file-guardian/runs"
 
 [authorization.workspace.capture]
+max_entries = 200000
 max_files = 100000
 max_file_bytes = 1073741824
 max_total_bytes = 10737418240

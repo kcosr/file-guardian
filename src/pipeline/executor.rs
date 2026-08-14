@@ -107,6 +107,30 @@ impl PipelineExecutor {
             Ok(prepared) => prepared,
             Err(failure) => return preparation_failure(failure),
         };
+        if !manifest.artifacts().is_empty()
+            && prepared
+                .iter()
+                .flatten()
+                .filter(|prepared| prepared.analyzer.required)
+                .all(|prepared| prepared.assignment.is_empty())
+        {
+            let coverage = prepared
+                .iter()
+                .flatten()
+                .map(|prepared| incomplete_coverage(prepared.analyzer.id.clone(), 0))
+                .collect();
+            return PipelineResult {
+                execution: PipelineExecution::default(),
+                observations: Vec::new(),
+                issues: vec![issue(
+                    IssueCode::IncompleteCoverage,
+                    None,
+                    "no required analyzer was assigned any captured artifact",
+                )],
+                coverage,
+                complete: false,
+            };
+        }
 
         let mut aggregate = PipelineResult {
             execution: PipelineExecution::default(),
@@ -996,5 +1020,88 @@ mod tests {
             result.issues[0].code,
             IssueCode::RequiredAnalyzerBudgetExceeded
         );
+    }
+
+    #[tokio::test]
+    async fn nonempty_manifest_with_no_required_assignment_fails_closed() {
+        let fixture = Fixture::new();
+        let pipeline = CompiledPipeline::new(vec![stage(
+            "unmatched",
+            StageExecution::Serial,
+            vec![
+                analyzer_with_selector("first", &["*.rs"], |_| success(Vec::new())),
+                analyzer_with_selector("second", &["vendor/**"], |_| success(Vec::new())),
+            ],
+            PriorObservationMode::None,
+            limits(),
+        )])
+        .unwrap();
+
+        let result = PipelineExecutor::execute(
+            &pipeline,
+            Arc::clone(&fixture.manifest),
+            Arc::clone(&fixture.workspace),
+        )
+        .await;
+
+        assert!(!result.complete);
+        assert_eq!(result.issues[0].code, IssueCode::IncompleteCoverage);
+        assert_eq!(result.coverage.len(), 2);
+        assert!(result
+            .coverage
+            .iter()
+            .all(|row| row.eligible == 0 && row.assigned == 0 && row.completed == 0));
+    }
+
+    #[tokio::test]
+    async fn one_zero_eligibility_analyzer_is_valid_when_another_covers_the_manifest() {
+        let fixture = Fixture::new();
+        let pipeline = CompiledPipeline::new(vec![stage(
+            "mixed",
+            StageExecution::Serial,
+            vec![
+                analyzer_with_selector("unmatched", &["*.rs"], |_| success(Vec::new())),
+                analyzer("matched", |_| success(Vec::new())),
+            ],
+            PriorObservationMode::None,
+            limits(),
+        )])
+        .unwrap();
+
+        let result = PipelineExecutor::execute(
+            &pipeline,
+            Arc::clone(&fixture.manifest),
+            Arc::clone(&fixture.workspace),
+        )
+        .await;
+
+        assert!(result.complete);
+        assert_eq!(result.coverage.len(), 2);
+        assert_eq!(result.coverage[0].assigned, 0);
+        assert_eq!(result.coverage[1].assigned, 1);
+    }
+
+    #[tokio::test]
+    async fn empty_manifest_with_zero_assignments_remains_valid() {
+        let fixture = Fixture::new();
+        let empty_manifest = Arc::new(ArtifactManifest::new(Vec::new(), Vec::new()).unwrap());
+        let pipeline = CompiledPipeline::new(vec![stage(
+            "empty",
+            StageExecution::Serial,
+            vec![analyzer("required", |_| success(Vec::new()))],
+            PriorObservationMode::None,
+            limits(),
+        )])
+        .unwrap();
+
+        let result =
+            PipelineExecutor::execute(&pipeline, empty_manifest, Arc::clone(&fixture.workspace))
+                .await;
+
+        assert!(result.complete);
+        assert_eq!(result.execution.stages_completed, 1);
+        assert_eq!(result.execution.analyzers_completed, 1);
+        assert_eq!(result.coverage[0].assigned, 0);
+        assert_eq!(result.coverage[0].completed, 0);
     }
 }

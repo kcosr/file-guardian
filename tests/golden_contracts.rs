@@ -54,6 +54,15 @@ fn golden_reports_match_typed_domain_contracts_and_exit_invariants() {
             .as_str(),
         "publication-llm"
     );
+
+    let error: Value =
+        serde_json::from_str(include_str!("../docs/examples/reports/error.json")).unwrap();
+    assert_eq!(error["pipeline_runs"][0]["stages_completed"], 0);
+    assert_eq!(error["pipeline_runs"][0]["analyzers_completed"], 0);
+    assert_eq!(
+        error["coverage"]["initial"]["analyzers"][0]["status"],
+        "incomplete"
+    );
 }
 
 #[test]

@@ -49,6 +49,7 @@ const MAX_ANCESTOR_DIRECTORIES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureLimits {
+    pub max_entries: u64,
     pub max_files: u64,
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
@@ -58,6 +59,7 @@ pub struct CaptureLimits {
 impl Default for CaptureLimits {
     fn default() -> Self {
         Self {
+            max_entries: 200_000,
             max_files: 100_000,
             max_file_bytes: 1024 * 1024 * 1024,
             max_total_bytes: 10 * 1024 * 1024 * 1024,
@@ -107,6 +109,7 @@ impl<'a> Snapshotter<'a> {
             workspace: self.workspace,
             limits: self.limits,
             root_device: initial_key.device,
+            entries: 0,
             files: 0,
             bytes: 0,
             subjects: Vec::new(),
@@ -226,6 +229,7 @@ struct CaptureState<'a> {
     workspace: &'a InvocationWorkspace,
     limits: CaptureLimits,
     root_device: u64,
+    entries: u64,
     files: u64,
     bytes: u64,
     subjects: Vec<PhysicalSubject>,
@@ -251,7 +255,22 @@ impl CaptureState<'_> {
         if before_key.device != self.root_device {
             return Err(CaptureError::FilesystemCrossingRejected);
         }
-        let entries = enumerate(directory)?;
+        let remaining_entries = self.limits.max_entries.checked_sub(self.entries).ok_or(
+            CaptureError::TraversalEntryLimitExceeded {
+                limit: self.limits.max_entries,
+            },
+        )?;
+        let entries = enumerate(directory, remaining_entries, self.limits.max_entries)?;
+        self.entries = self
+            .entries
+            .checked_add(u64::try_from(entries.len()).map_err(|_| {
+                CaptureError::TraversalEntryLimitExceeded {
+                    limit: self.limits.max_entries,
+                }
+            })?)
+            .ok_or(CaptureError::TraversalEntryLimitExceeded {
+                limit: self.limits.max_entries,
+            })?;
         for entry in &entries {
             let mut path = parent.to_vec();
             path.push(entry.segment.clone());
@@ -290,7 +309,18 @@ impl CaptureState<'_> {
             }
         }
 
-        let after_entries = enumerate(directory)?;
+        // Re-enumeration remains independently bounded. If the directory grew
+        // beyond the traversal budget after the initial enumeration, report
+        // the mutation as instability rather than treating the changed tree as
+        // the caller's original oversized input.
+        let after_entries =
+            match enumerate(directory, self.limits.max_entries, self.limits.max_entries) {
+                Ok(entries) => entries,
+                Err(CaptureError::TraversalEntryLimitExceeded { .. }) => {
+                    return Err(CaptureError::DirectoryUnstable);
+                }
+                Err(error) => return Err(error),
+            };
         let after_dir = fs::fstat(directory).map_err(|_| CaptureError::EnumerationFailure)?;
         if entries != after_entries || ensure_stable(&before_dir, &after_dir).is_err() {
             return Err(CaptureError::DirectoryUnstable);
@@ -404,7 +434,11 @@ struct Entry {
     stat: StatKey,
 }
 
-fn enumerate(directory: &OwnedFd) -> Result<Vec<Entry>, CaptureError> {
+fn enumerate(
+    directory: &OwnedFd,
+    permitted_entries: u64,
+    configured_limit: u64,
+) -> Result<Vec<Entry>, CaptureError> {
     let mut entries = Vec::new();
     let mut stream = Dir::read_from(directory).map_err(|_| CaptureError::EnumerationFailure)?;
     for result in &mut stream {
@@ -412,6 +446,11 @@ fn enumerate(directory: &OwnedFd) -> Result<Vec<Entry>, CaptureError> {
         let name = entry.file_name();
         if name.to_bytes() == b"." || name.to_bytes() == b".." {
             continue;
+        }
+        if u64::try_from(entries.len()).map_or(true, |count| count >= permitted_entries) {
+            return Err(CaptureError::TraversalEntryLimitExceeded {
+                limit: configured_limit,
+            });
         }
         let segment = PathSegment::try_from(OsStr::from_bytes(name.to_bytes()))
             .map_err(|_| CaptureError::InvalidInputName)?;
@@ -592,6 +631,8 @@ pub enum CaptureError {
     UnsupportedFileType,
     #[error("crossing onto another filesystem is not allowed")]
     FilesystemCrossingRejected,
+    #[error("directory traversal entry count exceeds {limit}")]
+    TraversalEntryLimitExceeded { limit: u64 },
     #[error("file count exceeds {limit}")]
     FileCountLimitExceeded { limit: u64 },
     #[error("file size exceeds {limit} bytes")]
@@ -895,6 +936,24 @@ mod tests {
                 ..CaptureLimits::default()
             }),
             Err(CaptureError::DepthLimitExceeded { limit: 0 })
+        ));
+    }
+
+    #[test]
+    fn bounds_wide_directory_enumeration_including_empty_directories() {
+        let fixture = Fixture::new("entry-count");
+        stdfs::create_dir(fixture.input()).unwrap();
+        for name in ["a", "b", "c", "d", "e"] {
+            stdfs::create_dir(fixture.input().join(name)).unwrap();
+        }
+
+        assert!(matches!(
+            fixture.capture(CaptureLimits {
+                max_entries: 4,
+                max_files: 0,
+                ..CaptureLimits::default()
+            }),
+            Err(CaptureError::TraversalEntryLimitExceeded { limit: 4 })
         ));
     }
 

@@ -11,6 +11,7 @@ struct Fixture {
     _temp: tempfile::TempDir,
     config: PathBuf,
     input: PathBuf,
+    workspace: PathBuf,
 }
 
 impl Fixture {
@@ -31,6 +32,10 @@ impl Fixture {
 [[rules]]
 id = "blocked"
 filename_glob = "*.blocked"
+
+[[rules]]
+id = "matched-secret"
+content_regex = "FG_PRIVATE_MATCHED_SECRET_[A-Z]+"
 "#,
         )
         .unwrap();
@@ -39,6 +44,7 @@ filename_glob = "*.blocked"
             _temp: temp,
             config,
             input,
+            workspace,
         }
     }
 
@@ -173,39 +179,69 @@ fn report(output: &Output) -> AuthorizationReport {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
+fn assert_machine_stdout_is_private(output: &Output, fixture: &Fixture, input_bytes: &[u8]) {
+    for private_path in [&fixture.input, &fixture.workspace] {
+        assert!(
+            !contains_bytes(&output.stdout, private_path.as_os_str().as_encoded_bytes()),
+            "machine stdout exposed absolute path {}",
+            private_path.display()
+        );
+    }
+    assert!(
+        !contains_bytes(&output.stdout, input_bytes),
+        "machine stdout exposed staged file bytes"
+    );
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
 #[test]
 fn authorize_allows_with_exact_json_stdout_and_preserves_input() {
-    let fixture = Fixture::new("deny", "safe.txt");
+    let fixture = Fixture::new("audit", "safe.txt");
+    let matched_secret = b"FG_PRIVATE_MATCHED_SECRET_ALLOW";
+    fs::write(fixture.input.join("safe.txt"), matched_secret).unwrap();
     let output = fixture.authorize(&["--request-id", "build-42"]);
     assert_eq!(output.status.code(), Some(0));
+    assert_machine_stdout_is_private(&output, &fixture, matched_secret);
     let report = report(&output);
     assert_eq!(report.outcome, AuthorizationOutcome::Allow);
     assert_eq!(report.request_id.unwrap().as_str(), "build-42");
     assert_eq!(
         fs::read(fixture.input.join("safe.txt")).unwrap(),
-        b"public test data"
+        matched_secret
     );
 }
 
 #[test]
 fn authorize_denies_matching_input_with_exit_twenty() {
-    let fixture = Fixture::new("deny", "payload.blocked");
+    let fixture = Fixture::new("deny", "payload.txt");
+    let matched_secret = b"FG_PRIVATE_MATCHED_SECRET_ALPHA";
+    fs::write(fixture.input.join("payload.txt"), matched_secret).unwrap();
     let output = fixture.authorize(&[]);
     assert_eq!(output.status.code(), Some(20));
+    assert_machine_stdout_is_private(&output, &fixture, matched_secret);
     let report = report(&output);
     assert_eq!(report.outcome, AuthorizationOutcome::Deny);
     assert_eq!(report.observations.len(), 1);
-    assert!(fixture.input.join("payload.blocked").exists());
+    assert!(fixture.input.join("payload.txt").exists());
 }
 
 #[test]
 fn rule_bound_unimplemented_external_analyzer_fails_closed_with_runtime_coverage() {
     let fixture = Fixture::new("deny", "safe.txt");
+    let sensitive_input = b"FG_PRIVATE_ERROR_SECRET_BRAVO";
+    fs::write(fixture.input.join("safe.txt"), sensitive_input).unwrap();
     let invocation_marker = fixture.select_unsupported_external_analyzer();
 
     let output = fixture.authorize(&[]);
 
     assert_eq!(output.status.code(), Some(30));
+    assert_machine_stdout_is_private(&output, &fixture, sensitive_input);
     let report = report(&output);
     assert_eq!(report.outcome, AuthorizationOutcome::Error);
     assert!(report.policy.is_some());
@@ -229,7 +265,7 @@ fn rule_bound_unimplemented_external_analyzer_fails_closed_with_runtime_coverage
 }
 
 #[test]
-fn analyzer_selector_excludes_artifacts_before_assignment() {
+fn nonempty_manifest_with_no_required_assignment_fails_closed() {
     let fixture = Fixture::new("deny", "payload.blocked");
     let value = fs::read_to_string(&fixture.config).unwrap().replace(
         &format!(
@@ -249,12 +285,20 @@ artifact_kinds = ["physical_file"]"#,
     fs::write(&fixture.config, value).unwrap();
 
     let output = fixture.authorize(&[]);
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.status.code(), Some(30));
     let report = report(&output);
-    assert_eq!(report.outcome, AuthorizationOutcome::Allow);
+    assert_eq!(report.outcome, AuthorizationOutcome::Error);
     assert!(report.observations.is_empty());
     assert_eq!(report.coverage.initial.analyzers[0].eligible, 0);
     assert_eq!(report.coverage.initial.analyzers[0].assigned, 0);
+    assert_eq!(
+        report.coverage.initial.status,
+        PhaseCoverageStatus::Incomplete
+    );
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.code == IssueCode::IncompleteCoverage));
 }
 
 #[test]

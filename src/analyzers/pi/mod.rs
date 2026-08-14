@@ -8,6 +8,8 @@ pub(crate) mod sandbox;
 use self::protocol::{ClassificationVocabulary, TerminalValidationLimits};
 use self::proxy::{ExpectedPiRuntime, PiProxy, PiProxyInput, PiProxyLimits};
 use self::runner::{PiInvocationSpec, PiRunError, PiRunLimits, PiRunSignals, PiRunner};
+#[cfg(test)]
+use self::sandbox::PI_RUNTIME_CONTEXT_MODE;
 use self::sandbox::{PiRuntimeSpec, PreparedPiRuntime};
 use crate::authorization::InvocationWorkspace;
 use crate::domain::{
@@ -23,6 +25,64 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
 
 const FIXED_TASK: &[u8] = b"Classify the assigned immutable artifacts under the trusted system instruction. Submit exactly one terminal classification.\n";
+
+struct ProxySignalBridge {
+    signals: Option<PiRunSignals>,
+    runner_done: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProxySignalBridge {
+    fn start(mut progress: watch::Receiver<proxy::ProxyProgress>) -> Self {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (activity_tx, activity_rx) = watch::channel(0_u64);
+        let (runner_done_tx, mut runner_done_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut ready_tx = Some(ready_tx);
+            loop {
+                let state = *progress.borrow_and_update();
+                activity_tx.send_replace(state.authenticated_requests);
+                if state.runtime_ready {
+                    if let Some(sender) = ready_tx.take() {
+                        let _ = sender.send(());
+                    }
+                }
+                tokio::select! {
+                    _ = &mut runner_done_rx => break,
+                    changed = progress.changed() => {
+                        if changed.is_err() {
+                            if state.terminal_submitted {
+                                let _ = runner_done_rx.await;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            signals: Some(PiRunSignals {
+                runtime_ready: ready_rx,
+                activity: activity_rx,
+            }),
+            runner_done: Some(runner_done_tx),
+            task,
+        }
+    }
+
+    fn take_signals(&mut self) -> PiRunSignals {
+        self.signals
+            .take()
+            .expect("proxy signals are consumed once")
+    }
+
+    async fn stop(mut self) {
+        if let Some(runner_done) = self.runner_done.take() {
+            let _ = runner_done.send(());
+        }
+        let _ = self.task.await;
+    }
+}
 
 #[derive(Clone)]
 pub struct PiClassifierAnalyzer {
@@ -144,24 +204,7 @@ impl PiClassifierAnalyzer {
 
         let endpoint_dir = proxy.endpoint().endpoint_dir().to_path_buf();
         let token = proxy.endpoint().run_token().to_owned();
-        let mut progress = proxy.progress();
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (activity_tx, activity_rx) = watch::channel(0_u64);
-        let bridge = tokio::spawn(async move {
-            let mut ready_tx = Some(ready_tx);
-            loop {
-                let state = *progress.borrow_and_update();
-                activity_tx.send_replace(state.authenticated_requests);
-                if state.runtime_ready {
-                    if let Some(sender) = ready_tx.take() {
-                        let _ = sender.send(());
-                    }
-                }
-                if progress.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
+        let mut bridge = ProxySignalBridge::start(proxy.progress());
         let manifest_identity = manifest.identity.to_string();
         let invocation = PiInvocationSpec {
             provider: &self.expected_runtime.provider,
@@ -175,10 +218,7 @@ impl PiClassifierAnalyzer {
             credential_environment: &self.credential_environment,
             fixed_task: FIXED_TASK,
             limits: self.run_limits.clone(),
-            signals: PiRunSignals {
-                runtime_ready: ready_rx,
-                activity: activity_rx,
-            },
+            signals: bridge.take_signals(),
         };
         let run = match &self.runner {
             PiRunnerBackend::Sandbox(runner) => runner.run(invocation).await.map(|_| ()),
@@ -194,17 +234,43 @@ impl PiClassifierAnalyzer {
                 .await
             }
         };
-        bridge.abort();
-        let _ = bridge.await;
-        if let Err(error) = run {
-            let cleanup = proxy.shutdown().await;
-            return cleanup
-                .map_err(PiClassifierError::Proxy)
-                .and(Err(PiClassifierError::Runner(error)));
+        bridge.stop().await;
+        let proxy_result = proxy.finish().await;
+        match (run, proxy_result) {
+            (Ok(()), Ok(outcome)) => Ok(outcome.submission.into_observations()),
+            (Ok(()), Err(error)) => Err(PiClassifierError::Proxy(error)),
+            (Err(runner), Ok(_)) => Err(PiClassifierError::Runner(runner)),
+            (Err(_runner), Err(proxy)) if proxy_failure_is_primary(&proxy) => {
+                Err(PiClassifierError::Proxy(proxy))
+            }
+            (Err(runner), Err(_cleanup_or_missing_terminal)) => {
+                Err(PiClassifierError::Runner(runner))
+            }
         }
-        let outcome = proxy.finish().await.map_err(PiClassifierError::Proxy)?;
-        Ok(outcome.submission.into_observations())
     }
+}
+
+fn proxy_failure_is_primary(error: &proxy::PiProxyError) -> bool {
+    use proxy::PiProxyError;
+    matches!(
+        error,
+        PiProxyError::Accept(_)
+            | PiProxyError::ReadEndpoint(_)
+            | PiProxyError::WriteEndpoint(_)
+            | PiProxyError::FrameTooLarge
+            | PiProxyError::MalformedFrame
+            | PiProxyError::FrameReadTimeout
+            | PiProxyError::Unauthorized
+            | PiProxyError::ProtocolViolation
+            | PiProxyError::ConcurrentRequest
+            | PiProxyError::RuntimeMismatch
+            | PiProxyError::InvalidRequest
+            | PiProxyError::InvalidTerminalSubmission
+            | PiProxyError::BudgetExceeded
+            | PiProxyError::ResponseTooLarge
+            | PiProxyError::ObjectRead
+            | PiProxyError::Internal
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -298,7 +364,7 @@ mod tests {
                 provider: "internal".to_string(),
                 model: "classifier".to_string(),
                 thinking: "high".to_string(),
-                mode: "print".to_string(),
+                mode: PI_RUNTIME_CONTEXT_MODE.to_string(),
             },
             terminal_limits: TerminalValidationLimits::new(10, 10, 10).unwrap(),
             proxy_limits: PiProxyLimits {
@@ -391,6 +457,135 @@ mod tests {
             "model_in_catalog": true,
             "active_tools": protocol::REQUIRED_TOOLS,
         })
+    }
+
+    async fn run_analyzer(
+        fixture: &Fixture,
+        analyzer: &PiClassifierAnalyzer,
+    ) -> Result<Vec<NormalizedObservation>, PiClassifierError> {
+        let analyzer_id = AnalyzerId::new("pi-review").unwrap();
+        let assignments =
+            EligibilitySelector::compile(&["**".to_string()], &[], [ArtifactKind::PhysicalFile])
+                .unwrap()
+                .assign(&analyzer_id, &fixture.manifest)
+                .unwrap()
+                .assignments;
+        let prior = Arc::new(
+            PriorObservationProjection::build(
+                PriorObservationMode::AllNormalized,
+                &[],
+                ProjectionLimits::new(100, 64 * 1024).unwrap(),
+            )
+            .unwrap(),
+        );
+        analyzer
+            .analyze(
+                Arc::clone(&fixture.manifest),
+                assignments,
+                Arc::clone(&fixture.workspace),
+                prior,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn terminal_progress_close_does_not_fail_runner_activity_channel() {
+        let (progress_tx, progress_rx) = watch::channel(proxy::ProxyProgress::default());
+        let mut bridge = ProxySignalBridge::start(progress_rx);
+        let mut signals = bridge.take_signals();
+        progress_tx.send_replace(proxy::ProxyProgress {
+            authenticated_requests: 6,
+            runtime_ready: true,
+            terminal_submitted: true,
+        });
+        drop(progress_tx);
+
+        signals.runtime_ready.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *signals.activity.borrow() != 6 {
+                signals.activity.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        signals.activity.borrow_and_update();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), signals.activity.changed())
+                .await
+                .is_err(),
+            "the analyzer must keep activity open until the runner exits"
+        );
+        bridge.stop().await;
+        assert!(signals.activity.changed().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fatal_proxy_progress_close_still_closes_runner_activity_channel() {
+        let (progress_tx, progress_rx) = watch::channel(proxy::ProxyProgress::default());
+        let mut bridge = ProxySignalBridge::start(progress_rx);
+        let mut signals = bridge.take_signals();
+        progress_tx.send_replace(proxy::ProxyProgress {
+            authenticated_requests: 1,
+            runtime_ready: true,
+            terminal_submitted: false,
+        });
+        drop(progress_tx);
+
+        signals.runtime_ready.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while *signals.activity.borrow() != 1 {
+                signals.activity.changed().await.unwrap();
+            }
+            signals.activity.borrow_and_update();
+            assert!(signals.activity.changed().await.is_err());
+        })
+        .await
+        .expect("fatal proxy closure must promptly stop runner activity");
+        bridge.stop().await;
+    }
+
+    #[tokio::test]
+    async fn runner_failure_remains_primary_when_proxy_has_no_terminal() {
+        let fixture = Fixture::new();
+        let analyzer = analyzer(&fixture, |invocation| {
+            Box::pin(async move {
+                let _ = exchange(
+                    &invocation.socket_path,
+                    bound(&invocation, 1, runtime_ready()),
+                )
+                .await;
+                Err(PiRunError::NonZeroExit)
+            })
+        });
+
+        assert!(matches!(
+            run_analyzer(&fixture, &analyzer).await,
+            Err(PiClassifierError::Runner(PiRunError::NonZeroExit))
+        ));
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_failure_remains_primary_when_runner_also_fails() {
+        let fixture = Fixture::new();
+        let analyzer = analyzer(&fixture, |invocation| {
+            Box::pin(async move {
+                let _ = exchange(
+                    &invocation.socket_path,
+                    bound(&invocation, 1, runtime_ready()),
+                )
+                .await;
+                let mut unauthorized = bound(&invocation, 2, json!({"type":"manifest_list"}));
+                unauthorized["run_token"] = json!("wrong-token");
+                let response = exchange(&invocation.socket_path, unauthorized).await;
+                assert_eq!(response["status"], "error");
+                Err(PiRunError::RuntimeHandshake)
+            })
+        });
+
+        assert!(matches!(
+            run_analyzer(&fixture, &analyzer).await,
+            Err(PiClassifierError::Proxy(proxy::PiProxyError::Unauthorized))
+        ));
     }
 
     #[tokio::test]

@@ -105,9 +105,17 @@ Required behavior:
 
 The report carries run and optional request identities, outcome, exit, modified
 state, phase-aware coverage, compiled policy and pipeline identities, immutable
-manifest identities, analyzer runs, normalized observations, resolutions,
-centralized actions, typed issues, and bounded statistics. Golden examples live
-under [`docs/examples/reports`](docs/examples/reports).
+manifest identities, mandatory artifact records, analyzer runs, normalized
+observations, resolutions, centralized actions, typed issues, and bounded
+statistics. Golden examples live under
+[`docs/examples/reports`](docs/examples/reports).
+
+Top-level `artifacts` is always an array. Each record contains only a
+host-generated artifact ID, physical subject ID, kind, segment-encoded relative
+logical path, byte length, and content digest. It never contains an absolute or
+workspace object path or file bytes. A report retains safely known records from
+a trustworthy initial capture even if later analysis fails; an error before
+trustworthy capture uses an empty array.
 
 Report schema `1` remains aggregate: `pipeline_runs` records phase status and
 completed stage/analyzer counts, while per-analyzer coverage and normalized
@@ -184,6 +192,9 @@ Requirements:
 - Reject input/workspace overlap in either direction, including ancestry that
   is searchable but not directory-readable.
 - Walk capture through descriptor-anchored operations.
+- Count every encountered directory entry against
+  `authorization.workspace.capture.max_entries`, independently from regular
+  files accepted against `max_files`.
 - Copy or stream each regular file once into a SHA-256-addressed object while
   hashing it, and verify metadata before and after the read.
 - Reject symlinks, hardlinks, special files, cross-filesystem traversal,

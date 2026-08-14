@@ -482,6 +482,7 @@ fn capture_issue(error: &CaptureError, phase: InspectionPhase) -> InspectionIssu
             "filesystem crossing rejected",
         ),
         CaptureError::FileCountLimitExceeded { .. }
+        | CaptureError::TraversalEntryLimitExceeded { .. }
         | CaptureError::FileSizeLimitExceeded { .. }
         | CaptureError::TotalSizeLimitExceeded { .. }
         | CaptureError::DepthLimitExceeded { .. } => {
@@ -648,6 +649,43 @@ content_regex = "SECRET"
         assert_eq!(result.initial_manifest, result.final_manifest);
         assert!(!fixture.workspace_root.join("run_allow").exists());
         assert!(fixture.root.path().exists());
+    }
+
+    #[tokio::test]
+    async fn empty_input_with_zero_assignments_remains_valid() {
+        let fixture = Fixture::new();
+        let result =
+            AuthorizationService::authorize(fixture.request("empty-input", "builtin", builtin()))
+                .await;
+
+        assert_eq!(result.outcome, ServiceOutcome::Allow);
+        assert!(result.issues.is_empty());
+        assert!(result
+            .initial_manifest
+            .as_ref()
+            .unwrap()
+            .artifacts()
+            .is_empty());
+        assert_eq!(result.coverage.initial.analyzers[0].assigned, 0);
+        assert_eq!(result.coverage.initial.analyzers[0].completed, 0);
+    }
+
+    #[tokio::test]
+    async fn nonempty_input_with_no_required_assignment_fails_closed() {
+        let fixture = Fixture::new();
+        fs::write(fixture.input.join("captured.txt"), "safe").unwrap();
+        let mut request = fixture.request("unassigned-input", "builtin", builtin());
+        request.pipeline.stages[0].analyzers[0].eligibility =
+            EligibilitySelector::compile(&["*.rs".to_string()], &[], [ArtifactKind::PhysicalFile])
+                .unwrap();
+
+        let result = AuthorizationService::authorize(request).await;
+
+        assert_eq!(result.outcome, ServiceOutcome::Error);
+        assert_eq!(result.issues[0].code, IssueCode::IncompleteCoverage);
+        assert!(result.final_manifest.is_none());
+        assert_eq!(result.coverage.initial.analyzers[0].assigned, 0);
+        assert_eq!(result.coverage.initial.analyzers[0].completed, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
