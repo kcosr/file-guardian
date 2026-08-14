@@ -394,8 +394,13 @@ impl Config {
                 directory,
             )?;
         }
-        LoggingSettings::from_config(&self.logging)
+        let logging = LoggingSettings::from_config(&self.logging)
             .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        if self.daemon.jobs.iter().any(|job| job.enabled) && !logging.admits_info_events() {
+            return invalid(
+                "enabled daemon jobs require logging.level = 'info', 'debug', or 'trace' so decision events cannot be filtered",
+            );
+        }
         Ok(())
     }
 
@@ -1751,6 +1756,29 @@ directive = "deny"
     fn policy_rule_selectors_accept_the_domain_rule_id_vocabulary() {
         let source = MINIMAL.replace("rule = \"*\"", "rule = \"secrets/private-key\"");
         parse(&source).unwrap().validate().unwrap();
+    }
+
+    #[test]
+    fn enabled_daemon_jobs_require_a_level_that_records_decisions() {
+        let mut config = parse(MINIMAL).unwrap();
+        config.daemon.jobs.push(DaemonJobConfig {
+            id: "scheduled".to_string(),
+            enabled: true,
+            kind: DaemonJobKind::PolicyScan {
+                profile: "publication".to_string(),
+                target: DaemonTarget::Literal {
+                    path: PathBuf::from("/srv/uploads"),
+                },
+                every_secs: 300,
+                run_on_start: false,
+            },
+        });
+        config.logging.level = "warn".to_string();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("decision events cannot be filtered"));
+
+        config.logging.level = "info".to_string();
+        config.validate().unwrap();
     }
 
     #[test]

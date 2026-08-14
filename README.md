@@ -317,7 +317,9 @@ target and enable at least one job before starting the systemd service.
 Each daemon decision is emitted both as a complete schema-valid report on
 stderr and as a structured event through the configured protected logger.
 Scheduled intervals use delay semantics, so a slow scan does not cause a burst
-of catch-up executions.
+of catch-up executions. An enabled daemon job requires `logging.level` to be
+`info`, `debug`, or `trace`; startup fails closed if the configured filter would
+drop decision events.
 
 Example systemd unit:
 

@@ -86,6 +86,10 @@ impl LoggingSettings {
         })
     }
 
+    pub fn admits_info_events(&self) -> bool {
+        matches!(self.level, Level::TRACE | Level::DEBUG | Level::INFO)
+    }
+
     pub fn init_tracing(&self) -> Result<LoggingGuards, LoggingError> {
         let builder: SubscriberBuilder = tracing_subscriber::fmt()
             .with_max_level(self.level)

@@ -265,6 +265,10 @@ next scan rather than creating a burst of catch-up work. The
 daemon configuration states what the process does; simply starting File
 Guardian does not imply directory scanning.
 
+Any configuration with an enabled daemon job must select an `info`, `debug`, or
+`trace` logging level. Startup fails closed when the logging filter would omit
+daemon decision events.
+
 ## Logging and operations
 
 - Human diagnostics and operational logs use stderr or configured protected
