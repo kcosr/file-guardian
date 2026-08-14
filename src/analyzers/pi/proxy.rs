@@ -2033,6 +2033,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trailing_separator_is_rejected_as_a_noncanonical_wire_path() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        let request = bound_request(
+            &proxy,
+            &fixture,
+            2,
+            native_begin("read-1", NativeTool::Read, "artifact.txt/"),
+        );
+        assert!(matches!(
+            exchange(&socket, &request).await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::Unauthorized
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::Unauthorized)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
     async fn native_tool_end_must_match_the_outstanding_begin_exactly() {
         let fixture = fixture(b"content");
         let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();

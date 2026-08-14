@@ -12,6 +12,7 @@ const RUST_RUNNER: &str = include_str!("../src/analyzers/pi/runner.rs");
 const RUST_SANDBOX: &str = include_str!("../src/analyzers/pi/sandbox.rs");
 const NODE_HARNESS: &str = include_str!("pi_extension_harness.mjs");
 const SIDECAR_HARNESS: &str = include_str!("pi_tool_sidecar_harness.mjs");
+const BWRAP_SIDECAR_HARNESS: &str = include_str!("pi_tool_sidecar_bwrap_harness.mjs");
 
 const EXPECTED_TOOLS: [&str; 8] = [
     "bash",
@@ -275,6 +276,10 @@ fn executable_node_harness_passes_when_node_is_available() {
     for (script, label) in [
         ("tests/pi_extension_harness.mjs", "Pi extension"),
         ("tests/pi_tool_sidecar_harness.mjs", "Pi tool sidecar"),
+        (
+            "tests/pi_tool_sidecar_bwrap_harness.mjs",
+            "Pi Bubblewrap sidecar confinement",
+        ),
     ] {
         let output = match Command::new("node")
             .arg(script)
@@ -293,6 +298,9 @@ fn executable_node_harness_passes_when_node_is_available() {
         );
     }
     assert!(SIDECAR_HARNESS.contains("persistent"));
+    assert!(BWRAP_SIDECAR_HARNESS.contains("hostConnectionObserved"));
+    assert!(BWRAP_SIDECAR_HARNESS.contains("test ! -e /proc/self/environ"));
+    assert!(BWRAP_SIDECAR_HARNESS.contains("printf changed > /input/artifact.txt"));
 }
 
 #[test]

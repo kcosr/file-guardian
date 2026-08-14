@@ -745,6 +745,7 @@ mod tests {
             })
         );
         assert!(view.resolve_relative_path("../a.txt").is_none());
+        assert!(view.resolve_relative_path("a.txt/").is_none());
         assert_eq!(
             std::fs::metadata(&host_path).unwrap().permissions().mode() & 0o777,
             0o500

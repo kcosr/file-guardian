@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -9,9 +9,11 @@ const protocol = "file-guardian-tool-sidecar/1";
 const temporary = await mkdtemp(join(tmpdir(), "file-guardian-sidecar-"));
 const input = join(temporary, "input");
 const work = join(temporary, "work");
+const sentinelPath = join(temporary, "parent-only-fd");
 await mkdir(input, { mode: 0o700 });
 await mkdir(work, { mode: 0o700 });
 await writeFile(join(input, "artifact.txt"), "one\ntwo\nthree\n", { mode: 0o400 });
+const inheritedSentinel = await open(sentinelPath, "w+");
 
 const runner = new URL("../src/analyzers/pi/assets/tool_sidecar_runner.js", import.meta.url);
 const child = spawn(process.execPath, [runner.pathname, "--test-roots", input, work, "/usr"], {
@@ -51,6 +53,11 @@ try {
 	const reuse = await request("bash", { command: "cat state.txt" });
 	assert.equal(reuse.status, "ok");
 	assert.match(reuse.result.text, /^persistent\n\[exit 0\]$/);
+	const descriptor = await request("bash", {
+		command: `test \"$(readlink /proc/self/fd/${inheritedSentinel.fd} 2>/dev/null || true)\" != \"${sentinelPath}\"`,
+	});
+	assert.equal(descriptor.status, "ok");
+	assert.match(descriptor.result.text, /\[exit 0\]$/);
 
 	const invalid = await request("read", { path: "../outside", offset: 1, limit: 1 });
 	assert.equal(invalid.status, "recoverable_error");
@@ -62,5 +69,6 @@ try {
 	console.log("Pi tool sidecar harness passed");
 } finally {
 	child.kill("SIGKILL");
+	await inheritedSentinel.close();
 	await rm(temporary, { recursive: true, force: true });
 }

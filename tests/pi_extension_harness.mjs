@@ -110,6 +110,8 @@ assert.equal(hooks.consumeManifestPage(terminalPage), terminalPage);
 assert.equal(hooks.getNextManifestCursor(), 3);
 
 assert.equal(hooks.normalizedInputPath("nested/./file.txt"), "nested/file.txt");
+assert.equal(hooks.normalizedInputPath("nested///"), "nested");
+assert.equal(hooks.normalizedInputPath("./"), ".");
 for (const invalid of ["../secret", "/etc/passwd", "~/secret", "@/secret"]) {
 	assert.throws(() => hooks.normalizedInputPath(invalid), /relative to the immutable input/);
 }

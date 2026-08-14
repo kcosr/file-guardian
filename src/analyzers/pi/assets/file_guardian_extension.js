@@ -376,7 +376,11 @@ function normalizedInputPath(rawPath, defaultPath = null) {
 	if (normalized === ".." || normalized.startsWith("../") || normalized.startsWith("/")) {
 		throw new RecoverableNativeToolError("Path must be relative to the immutable input.");
 	}
-	return normalized;
+	// node:path preserves a trailing separator (for example, "src/" remains
+	// "src/"). The host proxy accepts one canonical spelling only, while the
+	// sidecar's realpath-derived result is separator-free. Normalize both ends
+	// to that same spelling before the proxy accounts the call.
+	return normalized === "." ? normalized : normalized.replace(/\/+$/, "");
 }
 
 function sidecarArguments() {
@@ -512,6 +516,8 @@ async function startToolSidecar() {
 	if (toolSidecar) return toolSidecar;
 	const child = spawn(bubblewrapExecutable, sidecarArguments(), {
 		env: {},
+		// Keep this exact three-descriptor map. Node/libuv closes every other
+		// descriptor in the child, including Pi's inherited proxy-directory fd.
 		stdio: ["pipe", "pipe", "pipe"],
 	});
 	let stderrBytes = 0;

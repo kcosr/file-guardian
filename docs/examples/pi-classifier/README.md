@@ -25,8 +25,10 @@ node --check src/analyzers/pi/assets/file_guardian_extension.js
 node --check src/analyzers/pi/assets/tool_sidecar_runner.js
 node --check tests/pi_extension_harness.mjs
 node --check tests/pi_tool_sidecar_harness.mjs
+node --check tests/pi_tool_sidecar_bwrap_harness.mjs
 node tests/pi_extension_harness.mjs
 node tests/pi_tool_sidecar_harness.mjs
+node tests/pi_tool_sidecar_bwrap_harness.mjs
 ```
 
 The Rust `pi_extension_contract` test invokes the same harness when `node` is
