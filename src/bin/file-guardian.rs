@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-#[cfg(unix)]
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -71,9 +70,14 @@ async fn run_authorize_command(config_path: Option<&Path>, args: AuthorizeArgs) 
             ));
         }
     };
-    match authorize_with_config(&config, &args, run_id).await {
-        Ok(report) => emit_report(&report),
-        Err((run_id, message)) => {
+    match wait_for_authorization_or_shutdown(
+        authorize_with_config(&config, &args, run_id.clone()),
+        wait_for_shutdown_signal(),
+    )
+    .await
+    {
+        AuthorizationWait::Completed(Ok(report)) => emit_report(&report),
+        AuthorizationWait::Completed(Err((run_id, message))) => {
             eprintln!("authorization could not start: {message}");
             emit_report(&startup_error_report(
                 run_id,
@@ -82,6 +86,43 @@ async fn run_authorize_command(config_path: Option<&Path>, args: AuthorizeArgs) 
                 "authorization request could not be compiled",
             ))
         }
+        AuthorizationWait::Shutdown(Ok(())) => {
+            tracing::warn!("authorization interrupted by shutdown signal");
+            emit_report(&startup_error_report(
+                run_id,
+                request_id(&args),
+                IssueCode::InternalFailure,
+                "authorization was interrupted before completion",
+            ))
+        }
+        AuthorizationWait::Shutdown(Err(error)) => {
+            tracing::error!("failed to listen for authorization shutdown signal: {error}");
+            emit_report(&startup_error_report(
+                run_id,
+                request_id(&args),
+                IssueCode::InternalFailure,
+                "authorization shutdown handling failed",
+            ))
+        }
+    }
+}
+
+enum AuthorizationWait<T> {
+    Completed(T),
+    Shutdown(io::Result<()>),
+}
+
+async fn wait_for_authorization_or_shutdown<Authorization, Shutdown, T>(
+    authorization: Authorization,
+    shutdown: Shutdown,
+) -> AuthorizationWait<T>
+where
+    Authorization: Future<Output = T>,
+    Shutdown: Future<Output = io::Result<()>>,
+{
+    tokio::select! {
+        result = authorization => AuthorizationWait::Completed(result),
+        result = shutdown => AuthorizationWait::Shutdown(result),
     }
 }
 
@@ -294,7 +335,7 @@ async fn run_daemon_loop(
         let _ = failed.send(job.id).await;
         return;
     }
-    let mut interval = tokio::time::interval(Duration::from_secs(*every_secs));
+    let mut interval = daemon_interval(Duration::from_secs(*every_secs));
     interval.tick().await;
     loop {
         tokio::select! {
@@ -315,6 +356,12 @@ async fn run_daemon_loop(
             return;
         }
     }
+}
+
+fn daemon_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 async fn run_daemon_scan(
@@ -360,6 +407,12 @@ async fn run_daemon_scan(
         };
         match report.to_json_line() {
             Ok(line) => {
+                let report_json = String::from_utf8_lossy(&line);
+                tracing::info!(
+                    job_id,
+                    authorization_report = %report_json.trim_end(),
+                    "daemon authorization decision"
+                );
                 if let Err(error) = io::stderr().lock().write_all(&line) {
                     tracing::error!(job_id, "daemon report could not be written: {error}");
                     return false;
@@ -418,10 +471,18 @@ fn elapsed_millis(started: Instant) -> u64 {
 mod tests {
     use super::*;
     use file_guardian::report::ReportIdentifier;
-    #[cfg(unix)]
     use std::future;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct FailingWriter;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
 
     impl Write for FailingWriter {
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
@@ -467,6 +528,28 @@ mod tests {
         wait_for_unix_shutdown(future::pending(), future::ready(Some(())))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_and_drops_inflight_authorization() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&dropped));
+        let authorization = async move {
+            let _guard = guard;
+            future::pending::<()>().await;
+        };
+        let result = wait_for_authorization_or_shutdown(authorization, future::ready(Ok(()))).await;
+        assert!(matches!(result, AuthorizationWait::Shutdown(Ok(()))));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn daemon_schedule_delays_instead_of_bursting_missed_ticks() {
+        let interval = daemon_interval(Duration::from_secs(30));
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Delay
+        );
     }
 
     #[tokio::test]

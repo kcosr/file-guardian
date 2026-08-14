@@ -60,6 +60,13 @@ help errors use conventional CLI exit `2`. After a valid `authorize` shape is
 recognized, operational failures attempt to emit an error report and exit
 `30`.
 
+SIGINT and SIGTERM cancel the in-flight authorization future, which cascades
+through structured analyzer cancellation, child supervision, and invocation
+workspace cleanup before a schema-valid error report is attempted. SIGKILL,
+kernel OOM termination, power loss, or a process crash cannot execute cleanup;
+deployment startup must handle stale owner-only run directories under the
+configured retention policy.
+
 ## Exit contract
 
 | Exit | Outcome | Meaning |
@@ -417,16 +424,17 @@ Recursive archive inspection is deferred: an archive is currently only an
 ordinary physical file and generally follows the binary rule above.
 
 An administrator prepares and protects the Pi runtime bundle, reviewed
-extension, instruction, and isolated agent configuration. The bundle manifest
-pins the exact Pi version and every runtime file hash. File Guardian executes
-the normalized runtime-relative Node launcher with the normalized Pi CLI
-entrypoint directly, so it does not depend on a host `/usr/bin/env node`
+extension, instruction, and isolated agent-state path/security contract. The
+bundle manifest pins the exact Pi version and every runtime file hash. File
+Guardian executes the normalized runtime-relative Node launcher with the
+normalized Pi CLI entrypoint directly, so it does not depend on a host `/usr/bin/env node`
 shebang. The manifest covers a self-contained Node runtime, dynamic loader and
 shared libraries, Pi package/dependencies, and CA/resolver material required by
 the approved model transport. File Guardian
-pins the configured material in pipeline identity, clears ambient
+pins the immutable configured material in pipeline identity, excludes mutable
+agent-state contents that Pi may update, clears ambient
 customization, verifies the Pi/runtime handshake and exact tool grant, and
-supervises the complete process group. Startup, idle and wall-clock deadlines;
+supervises the Bubblewrap leader and its process group. Startup, idle and wall-clock deadlines;
 process, memory and descriptor ceilings; concurrent bounded output draining;
 and terminate-then-kill cleanup prevent a failed child from outliving the
 authorization.
@@ -436,11 +444,13 @@ explicitly shares only the host network namespace, disables nested user
 namespaces, drops all capabilities, and builds a temporary root. It mounts only
 the verified bundle at `/runtime`, reviewed extension at
 `/policy/file-guardian-extension.js`, isolated Pi agent state at `/config`, and
-the private socket directory at `/run/file-guardian`; `/work`, `/home`, and
-`/tmp` are temporary. `/config` is the sole writable persistent mount because
+the private socket directory at `/run/file-guardian`; `/home` and `/tmp` are
+temporary, and the process working directory is the read-only `/input` view.
+`/config` is the sole writable persistent mount because
 Pi creates credential/settings lock files and may persist OAuth refreshes. It
 is a dedicated private copy, never the user's ambient Pi home, and no
-model-callable tool can address it. Verified bundle-local resolver, hosts,
+model-callable tool can address it. Its entire tree must be current-UID owned
+and owner-only; those properties are revalidated before each launch. Verified bundle-local resolver, hosts,
 name-service, and CA files are mounted at their conventional `/etc` locations.
 The host instruction is supplied through the authenticated proxy, not as an
 argument or host-file mount.
@@ -495,8 +505,8 @@ finding.
 | --- | --- |
 | Artifact prompt injection asks for a tool, path, or policy change | Content remains untrusted evidence; the fixed grant and host policy cannot change. A valid audit classification may complete, otherwise exit `30`. |
 | Model returns unknown fields, codes, IDs, counts, manifest identity, or claims coverage it did not receive | Reject the terminal submission, mark Pi coverage incomplete, and exit `30`. Do not echo the rejected payload. |
-| Pi stalls, floods output, crashes, forks, or ignores termination | Apply budgets, terminate the complete process group, drain bounded output, reap it, and exit `30`. |
-| Runtime, extension, instruction, or isolated configuration disagrees with its compiled identity | Refuse execution before trusting model output and exit `30`. |
+| Pi stalls, floods output, crashes, forks, or ignores termination | Apply budgets, send TERM then KILL to the Bubblewrap leader group, drain bounded output, reap the leader, and exit `30`; Bubblewrap's PID namespace and `--die-with-parent` tear down the interior when its leader exits. |
+| Immutable runtime, extension, or instruction disagrees with its compiled identity, or mutable agent state violates its ownership/permission contract | Refuse execution before trusting model output and exit `30`. |
 | Concurrent runs attempt to reuse a token, socket, request ID, or candidate ID | Per-run authentication and namespace isolation reject the request without exposing either run's content. |
 | Pi reads sensitive immutable content successfully | The approved internal model transport may receive it. Reports, stdout, errors, and routine logs retain only normalized safe codes and counts, never the content, prompt, transcript, tool payload, or transport credential. |
 

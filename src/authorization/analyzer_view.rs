@@ -90,6 +90,7 @@ impl Drop for AnalyzerViewReservation {
 /// One private, assignment-scoped filesystem presentation for an analyzer.
 pub struct AnalyzerView {
     host_path: PathBuf,
+    directory: OwnedFd,
     entries: Vec<AnalyzerViewEntry>,
     files_by_path: BTreeMap<String, usize>,
     directories: BTreeMap<String, DirectoryUsage>,
@@ -140,8 +141,7 @@ impl AnalyzerView {
 
 impl Drop for AnalyzerView {
     fn drop(&mut self) {
-        make_tree_owner_writable(&self.host_path);
-        match std::fs::remove_dir_all(&self.host_path) {
+        match super::workspace::remove_verified_tree(&self.host_path, &self.directory) {
             Ok(()) => {
                 self.reservation.take();
             }
@@ -194,6 +194,7 @@ impl<'a> AnalyzerViewBuilder<'a> {
         let (host_path, root) = self.workspace.create_analyzer_view_directory(name)?;
         let view = AnalyzerView {
             host_path,
+            directory: root,
             entries: plan.presentations,
             files_by_path: plan.files_by_path,
             directories: plan.directory_usage,
@@ -209,7 +210,7 @@ impl<'a> AnalyzerViewBuilder<'a> {
                 .collect::<Vec<_>>();
             directories.sort_by_key(|path| path.matches('/').count());
             for directory in directories {
-                create_planned_directory(&root, &directory)?;
+                create_planned_directory(&view.directory, &directory)?;
             }
             for entry in &view.entries {
                 let artifact = self
@@ -217,7 +218,7 @@ impl<'a> AnalyzerViewBuilder<'a> {
                     .artifact(&entry.artifact_id)
                     .ok_or(AnalyzerViewError::UnknownArtifact)?;
                 let components = entry.view_path.split('/').collect::<Vec<_>>();
-                let parent = open_directory(&root, &components[..components.len() - 1])?;
+                let parent = open_directory(&view.directory, &components[..components.len() - 1])?;
                 copy_verified(
                     self.workspace,
                     artifact.object_id.clone(),
@@ -227,15 +228,13 @@ impl<'a> AnalyzerViewBuilder<'a> {
                     artifact.content_digest,
                 )?;
             }
-            seal_directories(&root, view.directories.keys())
+            seal_directories(&view.directory, view.directories.keys())
         })();
 
         if let Err(error) = result {
-            drop(root);
             drop(view);
             return Err(error);
         }
-        drop(root);
         Ok(view)
     }
 

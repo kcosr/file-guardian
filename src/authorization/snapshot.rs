@@ -591,7 +591,10 @@ fn timestamp(seconds: i64, nanoseconds: u64) -> Result<FileTimestamp, CaptureErr
 
 fn map_store_error(error: WorkspaceError) -> CaptureError {
     match error {
-        WorkspaceError::ObjectTooLarge { limit } => CaptureError::FileSizeLimitExceeded { limit },
+        // The pre-read stat already rejected a file larger than the configured
+        // limit. Reaching the store ceiling therefore means the open file grew
+        // during capture and is an instability, not a caller size violation.
+        WorkspaceError::ObjectTooLarge { .. } => CaptureError::FileUnstable,
         WorkspaceError::ReadSource(_) => CaptureError::FileUnreadable,
         other => CaptureError::Workspace(other),
     }
@@ -936,6 +939,14 @@ mod tests {
                 ..CaptureLimits::default()
             }),
             Err(CaptureError::DepthLimitExceeded { limit: 0 })
+        ));
+    }
+
+    #[test]
+    fn growth_past_the_store_ceiling_is_file_instability() {
+        assert!(matches!(
+            map_store_error(WorkspaceError::ObjectTooLarge { limit: 4 }),
+            CaptureError::FileUnstable
         ));
     }
 

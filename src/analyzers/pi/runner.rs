@@ -187,7 +187,7 @@ async fn run_command(
     {
         command.process_group(0);
         let child_limits = limits.clone();
-        // SAFETY: the pre-exec closure only invokes setrlimit syscalls.
+        // SAFETY: the pre-exec closure only invokes setrlimit and umask syscalls.
         unsafe {
             command
                 .as_std_mut()
@@ -301,7 +301,7 @@ async fn run_command(
 
     let startup_remaining = limits.startup_timeout.saturating_sub(started.elapsed());
     let ready = tokio::select! {
-        result = &mut signals.runtime_ready => result.is_ok(),
+        result = &mut signals.runtime_ready => result.map(|()| true).map_err(|_| PiRunError::RuntimeHandshake),
         result = child.wait() => {
             let error = match result { Ok(status) if !status.success() => PiRunError::NonZeroExit, _ => PiRunError::RuntimeHandshake };
             kill_group(raw_pid, rustix::process::Signal::KILL);
@@ -317,7 +317,20 @@ async fn run_command(
             let error = overflow.map_or(PiRunError::Supervision, PiRunError::OutputLimit);
             return finish_tasks(stdout_task, stderr_task, Err(error)).await;
         }
-        _ = sleep(startup_remaining) => false,
+        _ = sleep(startup_remaining) => Ok(false),
+    };
+    let ready = match ready {
+        Ok(ready) => ready,
+        Err(error) => {
+            terminate_and_reap(
+                &mut child,
+                raw_pid,
+                limits.termination_grace,
+                &mut group_guard,
+            )
+            .await;
+            return finish_tasks(stdout_task, stderr_task, Err(error)).await;
+        }
     };
     if !ready {
         terminate_and_reap(
@@ -508,6 +521,7 @@ fn install_child_limits(limits: &PiRunLimits) -> std::io::Result<()> {
             },
         )?;
     }
+    rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
     Ok(())
 }
 
@@ -713,6 +727,24 @@ mod tests {
             )
             .await,
             Err(PiRunError::Timeout(PiTimeoutKind::Idle))
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_runtime_ready_channel_is_a_handshake_failure() {
+        let (_dir, path) = script("trap '' TERM; while :; do :; done");
+        let (run_signals, ready, _activity) = signals();
+        drop(ready);
+        assert_eq!(
+            run_command(
+                fake_command(&path),
+                b"classify\n".to_vec(),
+                limits(),
+                run_signals,
+                never_cancel(),
+            )
+            .await,
+            Err(PiRunError::RuntimeHandshake)
         );
     }
 

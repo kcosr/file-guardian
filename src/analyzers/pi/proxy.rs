@@ -241,6 +241,7 @@ impl Drop for PiProxy {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+        let _ = self.cleanup_endpoint();
     }
 }
 
@@ -417,7 +418,7 @@ impl Server {
 
     fn authenticate(&self, request: &ProxyRequest) -> Result<(), PiProxyError> {
         if request.protocol != PROTOCOL_VERSION
-            || request.run_token.as_bytes() != self.token.as_bytes()
+            || !constant_time_token_eq(&request.run_token, &self.token)
             || request.run_id != self.input.run_id
             || request.analyzer_id != self.input.analyzer_id
             || request.manifest_identity != self.input.manifest.identity
@@ -659,6 +660,16 @@ fn valid_tool_call_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
+fn constant_time_token_eq(candidate: &str, expected: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let expected = expected.as_bytes();
+    let mut difference = candidate.len() ^ expected.len();
+    for (index, expected_byte) in expected.iter().enumerate() {
+        difference |= usize::from(candidate.get(index).copied().unwrap_or(0) ^ expected_byte);
+    }
+    difference == 0
+}
+
 fn validate_input(input: &PiProxyInput) -> Result<(), PiProxyError> {
     if input.instruction.is_empty()
         || !response_fits(
@@ -667,6 +678,11 @@ fn validate_input(input: &PiProxyInput) -> Result<(), PiProxyError> {
         )?
     {
         return Err(PiProxyError::InvalidInstruction);
+    }
+    let prior_observations = serde_json::from_slice(input.prior_observations.canonical_json())
+        .map_err(|_| PiProxyError::Internal)?;
+    if !response_fits(prior_observations, input.limits.max_response_bytes)? {
+        return Err(PiProxyError::PriorObservationResponseTooLarge);
     }
     let assignments = input
         .assignments
@@ -946,6 +962,8 @@ pub enum PiProxyError {
     InvalidAssignment,
     #[error("one Pi manifest entry cannot fit in a bounded page response")]
     ManifestEntryResponseTooLarge,
+    #[error("Pi prior observations cannot fit in one bounded response")]
+    PriorObservationResponseTooLarge,
     #[error("could not obtain a private Pi proxy capability")]
     Entropy(#[source] std::io::Error),
     #[error("could not create the private Pi proxy endpoint")]
@@ -1024,9 +1042,10 @@ mod tests {
     use super::*;
     use crate::authorization::{AnalyzerViewBuilder, AnalyzerViewLimits};
     use crate::domain::{
-        Artifact, ArtifactKind, ClassificationCode, ConfiguredConfidence, Digest, LogicalPath,
-        PathSegment, PhysicalSubject, Provenance, ReasonCode, SourceFileType, SourceIdentity,
-        SubjectId,
+        Artifact, ArtifactKind, ClassificationCode, ConfiguredConfidence, Digest, Finding,
+        FindingCategory, LogicalPath, NormalizedObservation, ObservationId, PathSegment,
+        PhysicalSubject, Provenance, ReasonCode, RuleId, SafeEvidence, Severity, SourceFileType,
+        SourceIdentity, SubjectId,
     };
     use crate::pipeline::{PriorObservationMode, ProjectionLimits};
     use std::fs;
@@ -1255,6 +1274,42 @@ mod tests {
             phase: InspectionPhase::Initial,
             limits: limits(),
         }
+    }
+
+    #[test]
+    fn oversized_prior_projection_is_rejected_before_endpoint_creation() {
+        let fixture = fixture(b"safe");
+        let observations = (0..32)
+            .map(|index| {
+                NormalizedObservation::Finding(Finding {
+                    id: ObservationId::from_suffix(format!("prior-{index:02}")).unwrap(),
+                    analyzer_id: AnalyzerId::new("prior-analyzer").unwrap(),
+                    rule_id: RuleId::new("prior.rule").unwrap(),
+                    artifact_id: ArtifactId::from_suffix(format!("prior-{index:02}")).unwrap(),
+                    category: FindingCategory::PolicyViolation,
+                    severity: Severity::Medium,
+                    location: None,
+                    evidence: SafeEvidence {
+                        reason_codes: vec![ReasonCode::new("prior-finding").unwrap()],
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut proxy_input = input(&fixture);
+        proxy_input.prior_observations = Arc::new(
+            PriorObservationProjection::build(
+                PriorObservationMode::FindingsSummary,
+                &observations,
+                ProjectionLimits::new(64, 64 * 1024).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            PiProxy::start(&fixture.workspace, proxy_input),
+            Err(PiProxyError::PriorObservationResponseTooLarge)
+        ));
+        assert!(fixture.workspace.analyzer_views_are_empty());
     }
 
     fn paged_input(fixture: &PagedFixture) -> PiProxyInput {
@@ -2411,6 +2466,29 @@ mod tests {
             configured.validate(),
             Err(PiProxyError::InvalidLimits)
         ));
+    }
+
+    #[test]
+    fn token_comparison_accepts_only_the_complete_capability() {
+        let token = "a".repeat(64);
+        assert!(constant_time_token_eq(&token, &token));
+        assert!(!constant_time_token_eq(
+            &format!("{}b", &token[..63]),
+            &token
+        ));
+        assert!(!constant_time_token_eq(&token[..63], &token));
+        assert!(!constant_time_token_eq(&format!("{token}a"), &token));
+    }
+
+    #[tokio::test]
+    async fn dropping_proxy_revokes_and_removes_endpoint_immediately() {
+        let fixture = fixture(b"data");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let endpoint = proxy.endpoint().endpoint_dir().to_path_buf();
+        assert!(endpoint.exists());
+        drop(proxy);
+        assert!(!endpoint.exists());
+        fixture.workspace.remove().unwrap();
     }
 
     #[test]

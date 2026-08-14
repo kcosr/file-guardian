@@ -106,6 +106,7 @@ function proxyRequest(type, fields = {}, signal) {
 
 	const requestId = nextRequestId++;
 	const request = {
+		...fields,
 		protocol: PROTOCOL,
 		run_token: runToken,
 		run_id: runId,
@@ -113,7 +114,6 @@ function proxyRequest(type, fields = {}, signal) {
 		request_id: requestId,
 		analyzer_id: analyzerId,
 		type,
-		...fields,
 	};
 
 	return new Promise((resolvePromise, reject) => {
@@ -786,8 +786,8 @@ export default function fileGuardianClassifierExtension(pi) {
 		description: "Read bounded normalized prior observations; file contents and matched values are never included.",
 		parameters: strictObject({}),
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal) {
-			return proxyToolResult(await proxyRequest("prior_observations", params, signal));
+		async execute(_toolCallId, _params, signal) {
+			return proxyToolResult(await proxyRequest("prior_observations", {}, signal));
 		},
 	});
 

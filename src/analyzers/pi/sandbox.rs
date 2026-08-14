@@ -100,7 +100,6 @@ impl PreparedPiRuntime {
                 stamp_tree(&spec.runtime_root)?,
                 stamp_file(&spec.instruction_file)?,
                 stamp_file(&spec.trusted_extension)?,
-                stamp_tree(&spec.isolated_agent_dir)?,
             ];
             let identity = runtime_identity(&spec, &stamps);
             Ok(Self {
@@ -413,7 +412,7 @@ fn validate_runtime_spec(spec: &PiRuntimeSpec) -> Result<(), PiSandboxError> {
     verify_secure_file(&spec.bubblewrap_executable, true)?;
     verify_secure_file(&spec.instruction_file, false)?;
     verify_secure_file(&spec.trusted_extension, false)?;
-    verify_secure_tree(&spec.isolated_agent_dir)?;
+    verify_private_agent_tree(&spec.isolated_agent_dir)?;
     verify_runtime_manifest(spec, &launcher, &entrypoint, manifest_relative)
 }
 
@@ -585,6 +584,28 @@ fn verify_secure_tree(root: &Path) -> Result<(), PiSandboxError> {
             } else {
                 return Err(PiSandboxError::InvalidRuntime);
             }
+        }
+    }
+    Ok(())
+}
+
+fn verify_private_agent_tree(root: &Path) -> Result<(), PiSandboxError> {
+    let current_uid = rustix::process::geteuid().as_raw();
+    let mut pending = vec![root.to_owned()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).map_err(invalid_io)?;
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != current_uid
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(PiSandboxError::InvalidRuntime);
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path).map_err(invalid_io)? {
+                pending.push(entry.map_err(invalid_io)?.path());
+            }
+        } else if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(PiSandboxError::InvalidRuntime);
         }
     }
     Ok(())
@@ -1221,29 +1242,34 @@ mod tests {
 
     #[test]
     fn prepared_assets_are_revalidated_and_change_identity() {
-        for choose in 0..4 {
+        for choose in 0..2 {
             let fixture = Fixture::new();
             let prepared = fixture.prepare();
             let old_identity = prepared.identity();
             let path = match choose {
                 0 => &fixture.spec.instruction_file,
                 1 => &fixture.spec.trusted_extension,
-                2 => &fixture.spec.runtime_root.join("lib/pi/dist/cli.js"),
-                _ => {
-                    let config = fixture.spec.isolated_agent_dir.join("settings.json");
-                    fs::write(&config, b"old").unwrap();
-                    // This entry was added after preparation, so failure itself proves tree mutation.
-                    assert_eq!(prepared.revalidate(), Err(PiSandboxError::InvalidRuntime));
-                    continue;
-                }
+                _ => unreachable!(),
             };
             fs::write(path, b"mutated asset bytes").unwrap();
             assert_eq!(prepared.revalidate(), Err(PiSandboxError::InvalidRuntime));
-            if choose != 2 {
-                let new = PreparedPiRuntime::prepare(fixture.spec.clone()).unwrap();
-                assert_ne!(new.identity(), old_identity);
-            }
+            let new = PreparedPiRuntime::prepare(fixture.spec.clone()).unwrap();
+            assert_ne!(new.identity(), old_identity);
         }
+    }
+
+    #[test]
+    fn private_agent_state_may_change_without_changing_runtime_identity() {
+        let fixture = Fixture::new();
+        let prepared = fixture.prepare();
+        let old_identity = prepared.identity();
+        let settings = fixture.spec.isolated_agent_dir.join("settings.json");
+        fs::write(&settings, b"{}").unwrap();
+        fs::set_permissions(&settings, fs::Permissions::from_mode(0o600)).unwrap();
+
+        prepared.revalidate().unwrap();
+        let refreshed = PreparedPiRuntime::prepare(fixture.spec.clone()).unwrap();
+        assert_eq!(refreshed.identity(), old_identity);
     }
 
     #[test]
@@ -1311,6 +1337,20 @@ mod tests {
         )
         .unwrap();
         assert!(PreparedPiRuntime::prepare(non_executable_helper.spec).is_err());
+
+        let public_agent_dir = Fixture::new();
+        fs::set_permissions(
+            &public_agent_dir.spec.isolated_agent_dir,
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(PreparedPiRuntime::prepare(public_agent_dir.spec).is_err());
+
+        let public_agent_file = Fixture::new();
+        let auth = public_agent_file.spec.isolated_agent_dir.join("auth.json");
+        fs::write(&auth, b"{}").unwrap();
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(PreparedPiRuntime::prepare(public_agent_file.spec).is_err());
     }
 
     #[tokio::test]

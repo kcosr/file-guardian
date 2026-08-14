@@ -300,6 +300,22 @@ fn trusted_extension_authenticates_runtime_and_replaces_the_prompt() {
 }
 
 #[test]
+fn caller_fields_cannot_override_authenticated_proxy_envelope() {
+    let fields = EXTENSION
+        .find("\t\t...fields,\n\t\tprotocol: PROTOCOL,")
+        .expect("caller fields must precede authenticated envelope fields");
+    let request_end = EXTENSION[fields..]
+        .find("\n\t};")
+        .expect("proxy request object must close");
+    assert!(
+        !EXTENSION[fields + "\t\t...fields,".len()..fields + request_end].contains("...fields")
+    );
+    assert!(EXTENSION.contains(
+        "async execute(_toolCallId, _params, signal) {\n\t\t\treturn proxyToolResult(await proxyRequest(\"prior_observations\", {}, signal));"
+    ));
+}
+
+#[test]
 fn every_tool_parameter_object_is_closed_and_bounded() {
     assert!(EXTENSION.contains("additionalProperties: false"));
     assert!(!EXTENSION.contains("Type.Any("));

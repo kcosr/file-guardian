@@ -114,20 +114,20 @@ impl Config {
             "resolved configuration file path",
             &resolved_path,
         )?;
-        for (name, path) in config
-            .analyzers
-            .iter()
-            .flat_map(AnalyzerConfig::administrator_paths)
-        {
-            let resolved = canonicalize_if_exists(path)?;
-            validate_disjoint(
-                "resolved authorization.workspace.root",
-                &resolved_workspace,
-                name,
-                &resolved,
-            )?;
+        let mut resolved_administrator_paths = Vec::new();
+        for (analyzer_index, analyzer) in config.analyzers.iter().enumerate() {
+            for (name, path) in analyzer.administrator_paths() {
+                let resolved = canonicalize_if_exists(path)?;
+                validate_disjoint(
+                    "resolved authorization.workspace.root",
+                    &resolved_workspace,
+                    name,
+                    &resolved,
+                )?;
+                resolved_administrator_paths.push((analyzer_index, name, resolved));
+            }
         }
-        if let Some(directory) = &config.logging.directory {
+        let resolved_logging = if let Some(directory) = &config.logging.directory {
             let resolved = canonicalize_if_exists(directory)?;
             validate_disjoint(
                 "resolved authorization.workspace.root",
@@ -135,6 +135,42 @@ impl Config {
                 "resolved logging.directory",
                 &resolved,
             )?;
+            Some(resolved)
+        } else {
+            None
+        };
+        for (analyzer_index, analyzer) in config.analyzers.iter().enumerate() {
+            let Some(isolated_agent_dir) = analyzer.isolated_agent_dir() else {
+                continue;
+            };
+            let isolated_agent_dir = canonicalize_if_exists(isolated_agent_dir)?;
+            validate_disjoint(
+                "resolved analyzers.pi.isolated_agent_dir",
+                &isolated_agent_dir,
+                "resolved configuration file path",
+                &resolved_path,
+            )?;
+            if let Some(logging) = &resolved_logging {
+                validate_disjoint(
+                    "resolved analyzers.pi.isolated_agent_dir",
+                    &isolated_agent_dir,
+                    "resolved logging.directory",
+                    logging,
+                )?;
+            }
+            for (other_index, other_name, other_path) in &resolved_administrator_paths {
+                if *other_index == analyzer_index
+                    && *other_name == "analyzers.pi.isolated_agent_dir"
+                {
+                    continue;
+                }
+                validate_disjoint(
+                    "resolved analyzers.pi.isolated_agent_dir",
+                    &isolated_agent_dir,
+                    other_name,
+                    other_path,
+                )?;
+            }
         }
         Ok(config)
     }
@@ -266,6 +302,43 @@ impl Config {
                 for (right_name, right) in administrator_paths.iter().skip(index + 1) {
                     validate_disjoint(left_name, left, right_name, right)?;
                 }
+            }
+        }
+        let administrator_paths = self
+            .analyzers
+            .iter()
+            .enumerate()
+            .flat_map(|(index, analyzer)| {
+                analyzer
+                    .administrator_paths()
+                    .into_iter()
+                    .map(move |(name, path)| (index, name, path))
+            })
+            .collect::<Vec<_>>();
+        for (analyzer_index, analyzer) in self.analyzers.iter().enumerate() {
+            let Some(isolated_agent_dir) = analyzer.isolated_agent_dir() else {
+                continue;
+            };
+            if let Some(logging) = &self.logging.directory {
+                validate_disjoint(
+                    "analyzers.pi.isolated_agent_dir",
+                    isolated_agent_dir,
+                    "logging.directory",
+                    logging,
+                )?;
+            }
+            for (other_index, other_name, other_path) in &administrator_paths {
+                if *other_index == analyzer_index
+                    && *other_name == "analyzers.pi.isolated_agent_dir"
+                {
+                    continue;
+                }
+                validate_disjoint(
+                    "analyzers.pi.isolated_agent_dir",
+                    isolated_agent_dir,
+                    other_name,
+                    other_path,
+                )?;
             }
         }
         for binding in &self.policy_bindings {
@@ -708,6 +781,7 @@ impl AnalyzerConfig {
                 for path in rule_files {
                     validate_absolute("analyzers.rule_files", path)?;
                 }
+                self.limits.validate_builtin(&self.id)?;
             }
             AnalyzerKind::PiClassifier { pi, vocabulary, .. } => {
                 pi.validate(&self.id)?;
@@ -760,6 +834,13 @@ impl AnalyzerConfig {
             AnalyzerKind::ExternalTool { adapter, .. } => {
                 vec![("analyzers.adapter", adapter.as_path())]
             }
+        }
+    }
+
+    fn isolated_agent_dir(&self) -> Option<&Path> {
+        match &self.kind {
+            AnalyzerKind::PiClassifier { pi, .. } => Some(pi.isolated_agent_dir.as_path()),
+            _ => None,
         }
     }
 }
@@ -1243,6 +1324,40 @@ impl AnalyzerLimits {
         }
         Ok(())
     }
+
+    fn validate_builtin(&self, id: &str) -> Result<(), ConfigError> {
+        let unsupported = [
+            ("startup_timeout_secs", self.startup_timeout_secs),
+            ("idle_timeout_secs", self.idle_timeout_secs),
+            ("wall_timeout_secs", self.wall_timeout_secs),
+            ("termination_grace_secs", self.termination_grace_secs),
+            ("memory_bytes", self.memory_bytes),
+            ("cpu_time_secs", self.cpu_time_secs),
+            ("max_open_files", self.max_open_files),
+            ("max_processes", self.max_processes),
+            ("max_stdout_bytes", self.max_stdout_bytes),
+            ("max_stderr_bytes", self.max_stderr_bytes),
+            ("max_output_bytes", self.max_output_bytes),
+            ("max_tool_calls", self.max_tool_calls),
+            ("max_bytes_read", self.max_bytes_read),
+            ("max_read_bytes_per_call", self.max_read_bytes_per_call),
+            ("max_search_bytes_per_call", self.max_search_bytes_per_call),
+            ("max_search_calls", self.max_search_calls),
+            ("max_search_results", self.max_search_results),
+            ("max_view_files", self.max_view_files),
+            ("max_view_entries", self.max_view_entries),
+            ("max_view_bytes", self.max_view_bytes),
+            ("max_view_depth", self.max_view_depth),
+        ]
+        .into_iter()
+        .find_map(|(name, value)| value.is_some().then_some(name));
+        if let Some(field) = unsupported {
+            return invalid(format!(
+                "built-in analyzer '{id}' cannot enforce limits.{field}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1290,7 +1405,7 @@ impl PolicyBindingConfig {
             ));
         }
         if let Some(value) = self.rule.as_deref().filter(|value| *value != "*") {
-            validate_id("policy_bindings.rule", value)?;
+            validate_rule_selector("policy_bindings.rule", value)?;
         }
         if let Some(value) = &self.classification {
             validate_id("policy_bindings.classification", value)?;
@@ -1464,6 +1579,15 @@ fn validate_id(field: &str, value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_rule_selector(field: &str, value: &str) -> Result<(), ConfigError> {
+    crate::domain::RuleId::new(value).map_err(|_| {
+        ConfigError::Invalid(format!(
+            "{field} must contain 1 to 128 safe rule identifier characters"
+        ))
+    })?;
+    Ok(())
+}
+
 fn validate_absolute(field: &str, path: &Path) -> Result<(), ConfigError> {
     if !path.is_absolute()
         || path.components().any(|component| {
@@ -1611,6 +1735,22 @@ directive = "deny"
         config.validate().unwrap();
         let selected = config.validate_for_authorize(None).unwrap();
         assert_eq!(selected.pipeline.id, "publication");
+    }
+
+    #[test]
+    fn builtin_rules_reject_limits_they_cannot_enforce() {
+        let source = MINIMAL.replace(
+            "rule_files = [\"/etc/file-guardian/rules.d/publication.toml\"]",
+            "rule_files = [\"/etc/file-guardian/rules.d/publication.toml\"]\n\n[analyzers.limits]\nwall_timeout_secs = 30",
+        );
+        let error = parse(&source).unwrap().validate().unwrap_err().to_string();
+        assert!(error.contains("cannot enforce limits.wall_timeout_secs"));
+    }
+
+    #[test]
+    fn policy_rule_selectors_accept_the_domain_rule_id_vocabulary() {
+        let source = MINIMAL.replace("rule = \"*\"", "rule = \"secrets/private-key\"");
+        parse(&source).unwrap().validate().unwrap();
     }
 
     #[test]
@@ -2123,5 +2263,17 @@ path = "/srv/uploads"
         };
         pi.trusted_extension = pi.runtime_root.join("extension.js");
         assert!(config.validate().is_err());
+
+        let mut config = pi_example();
+        let mut duplicate = config
+            .analyzers
+            .iter()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .clone();
+        duplicate.id = "second-publication-llm".to_string();
+        config.analyzers.push(duplicate);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("isolated_agent_dir"));
     }
 }

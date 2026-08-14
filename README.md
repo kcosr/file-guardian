@@ -104,6 +104,12 @@ compact JSON document followed by a newline. The caller must parse the document
 and verify that its `exit_code` equals the process status. Logs and diagnostics
 are never mixed into stdout.
 
+On SIGINT or SIGTERM, `authorize` cancels in-flight analysis, signals supervised
+Pi teardown, drops the private invocation workspace, and attempts a schema-valid
+error report with exit `30`. SIGKILL, kernel OOM termination, power loss, or a
+process crash cannot run cleanup; deployments should remove stale owner-only
+run directories before reuse according to their retention policy.
+
 | Exit | Report outcome | Caller meaning |
 | ---: | --- | --- |
 | `0` | `allow` | Required analysis completed; the tree is allowed and unchanged. |
@@ -203,12 +209,15 @@ agent directory. See the complete
 [schema-v2 example](docs/examples/active-authorization-v2.toml).
 
 Prepare those files outside the authorization workspace, owned and writable
-only by the administrator. Configure credentials as explicit mappings from the
-dedicated `FILE_GUARDIAN_PI_CREDENTIAL_*` parent namespace to narrowly accepted
-provider credential variables. Values are loaded only at execution, are not
-configuration or pipeline identity material, and must never appear in a report
-or diagnostic. Ambient Pi extensions, skills, prompts, themes, sessions, tools,
-shell access, and inherited environment customization are disabled.
+only by the administrator. The isolated agent directory is different: it must
+be owned by the File Guardian service UID and have no group/other permission
+bits on any directory or file. Configure credentials as explicit mappings from
+the dedicated `FILE_GUARDIAN_PI_CREDENTIAL_*` parent namespace to narrowly
+accepted provider credential variables. Values are loaded only at execution,
+are not configuration or pipeline identity material, and must never appear in
+a report or diagnostic. Ambient Pi extensions, skills, prompts, themes,
+sessions, tools, shell access, and inherited environment customization are
+disabled.
 
 The runtime manifest pins the exact Pi version and hashes of all bundle files.
 The configured launcher and Pi entrypoint are normalized paths within that
@@ -221,8 +230,11 @@ reviewed extension, isolated Pi agent state, and private proxy endpoint are the
 only persistent mounts. The isolated agent state is the sole writable
 persistent mount because Pi creates credential/settings lock files and may
 persist an OAuth refresh. It must be a dedicated copy containing no ambient
-user configuration. The instruction is delivered by the authenticated host
-proxy and live staging/object storage is never mounted.
+user configuration. Its path and security contract are compiled, but its
+mutable credential/settings contents are deliberately excluded from pipeline
+identity and immutable runtime stamps. Ownership and permissions are
+revalidated immediately before every launch. The instruction is delivered by
+the authenticated host proxy and live staging/object storage is never mounted.
 
 The sandbox does not mount the host `/lib`, `/usr`, or `/etc`. A missing or
 unmanifested runtime, loader, library, trust, or resolver asset therefore fails
@@ -301,6 +313,11 @@ not mutate its targets.
 
 The shipped example job is disabled intentionally. Set a deployment-specific
 target and enable at least one job before starting the systemd service.
+
+Each daemon decision is emitted both as a complete schema-valid report on
+stderr and as a structured event through the configured protected logger.
+Scheduled intervals use delay semantics, so a slow scan does not cause a burst
+of catch-up executions.
 
 Example systemd unit:
 

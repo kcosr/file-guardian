@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -116,6 +117,12 @@ impl InvocationWorkspace {
         Arc::clone(&self.objects)
     }
 
+    #[cfg(test)]
+    pub(crate) fn analyzer_views_are_empty(&self) -> bool {
+        std::fs::read_dir(self.run_path.join("analyzer-views"))
+            .is_ok_and(|mut entries| entries.next().is_none())
+    }
+
     /// Creates an invocation-scoped private directory for one analyzer endpoint.
     ///
     /// `name` is deliberately restricted to an opaque, host-generated suffix;
@@ -173,9 +180,7 @@ impl InvocationWorkspace {
 
     /// Deletes this invocation's private state. Secure erasure is not claimed.
     pub fn remove(mut self) -> Result<(), WorkspaceError> {
-        let path = self.run_path.clone();
-        super::analyzer_view::make_tree_owner_writable(&path);
-        std::fs::remove_dir_all(path).map_err(WorkspaceError::RemoveRun)?;
+        remove_verified_tree(&self.run_path, &self._run_dir).map_err(WorkspaceError::RemoveRun)?;
         self.cleanup_armed = false;
         Ok(())
     }
@@ -196,10 +201,32 @@ fn validate_analyzer_directory_name(name: &str) -> Result<(), WorkspaceError> {
 impl Drop for InvocationWorkspace {
     fn drop(&mut self) {
         if self.cleanup_armed {
-            super::analyzer_view::make_tree_owner_writable(&self.run_path);
-            let _ = std::fs::remove_dir_all(&self.run_path);
+            let _ = remove_verified_tree(&self.run_path, &self._run_dir);
         }
     }
+}
+
+pub(super) fn remove_verified_tree(path: &Path, directory: &OwnedFd) -> io::Result<()> {
+    let held = fs::fstat(directory).map_err(io::Error::from)?;
+    let resolved = std::fs::symlink_metadata(path)?;
+    #[allow(clippy::useless_conversion)]
+    let held_device = u64::try_from(held.st_dev)
+        .map_err(|_| io::Error::other("held directory identity is invalid"))?;
+    #[allow(clippy::useless_conversion)]
+    let held_inode = u64::try_from(held.st_ino)
+        .map_err(|_| io::Error::other("held directory identity is invalid"))?;
+    if !resolved.is_dir()
+        || resolved.file_type().is_symlink()
+        || resolved.dev() != held_device
+        || resolved.ino() != held_inode
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "workspace cleanup path no longer identifies the held directory",
+        ));
+    }
+    super::analyzer_view::make_tree_owner_writable(path);
+    std::fs::remove_dir_all(path)
 }
 
 /// An invocation-scoped directory containing exactly one analyzer IPC socket.
@@ -245,9 +272,8 @@ impl AnalyzerEndpointDirectory {
     }
 
     pub(crate) fn remove(self) -> Result<(), WorkspaceError> {
-        let path = self.path.clone();
-        drop(self);
-        std::fs::remove_dir(path).map_err(WorkspaceError::RemoveAnalyzerEndpoint)
+        remove_verified_tree(&self.path, &self.directory)
+            .map_err(WorkspaceError::RemoveAnalyzerEndpoint)
     }
 }
 
@@ -524,5 +550,27 @@ mod tests {
         drop(workspace);
 
         assert!(!run_path.exists());
+    }
+
+    #[test]
+    fn cleanup_refuses_a_replaced_run_path() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("workspaces");
+        stdfs::create_dir(&root).unwrap();
+        stdfs::set_permissions(&root, stdfs::Permissions::from_mode(0o700)).unwrap();
+        let run_id = RunId::from_suffix("replaced-cleanup").unwrap();
+        let run_path = root.join(run_id.as_str());
+        let moved_path = root.join("moved-original");
+        let workspace = InvocationWorkspace::create(&root, &run_id).unwrap();
+        stdfs::rename(&run_path, &moved_path).unwrap();
+        stdfs::create_dir(&run_path).unwrap();
+        stdfs::write(run_path.join("sentinel"), b"preserve").unwrap();
+
+        assert!(matches!(
+            workspace.remove(),
+            Err(WorkspaceError::RemoveRun(error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(stdfs::read(run_path.join("sentinel")).unwrap(), b"preserve");
     }
 }

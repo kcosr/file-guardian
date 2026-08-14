@@ -2,7 +2,7 @@ schema_version = "file-guardian-rules/1"
 
 [[rules]]
 id = "windows-executable"
-filename_glob = "*.exe"
+filename_glob = "*.[eE][xX][eE]"
 
 [[rules]]
 id = "hardcoded-password"

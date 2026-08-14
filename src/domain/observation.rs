@@ -91,7 +91,7 @@ pub enum Severity {
     Critical,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ValidatedLocation {
     ByteRange { start: u64, end_exclusive: u64 },
@@ -115,6 +115,38 @@ impl ValidatedLocation {
             return Err(ValidatedLocationError::OneBased);
         }
         Ok(Self::Line { line })
+    }
+
+    pub fn line_column(line: u64, column: u64) -> Result<Self, ValidatedLocationError> {
+        if line == 0 || column == 0 {
+            return Err(ValidatedLocationError::OneBased);
+        }
+        Ok(Self::LineColumn { line, column })
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidatedLocation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum WireLocation {
+            ByteRange { start: u64, end_exclusive: u64 },
+            Line { line: u64 },
+            LineColumn { line: u64, column: u64 },
+        }
+
+        match WireLocation::deserialize(deserializer)? {
+            WireLocation::ByteRange {
+                start,
+                end_exclusive,
+            } => Self::byte_range(start, end_exclusive),
+            WireLocation::Line { line } => Self::line(line),
+            WireLocation::LineColumn { line, column } => Self::line_column(line, column),
+        }
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -214,5 +246,25 @@ mod tests {
     fn semantic_identifiers_reject_prose_and_controls() {
         assert!(RuleId::new("publication/restricted").is_ok());
         assert!(RuleId::new("contains secret\nvalue").is_err());
+    }
+
+    #[test]
+    fn locations_revalidate_one_based_and_nonempty_invariants() {
+        assert!(serde_json::from_str::<ValidatedLocation>(
+            r#"{"kind":"byte_range","start":5,"end_exclusive":2}"#
+        )
+        .is_err());
+        assert!(serde_json::from_str::<ValidatedLocation>(r#"{"kind":"line","line":0}"#).is_err());
+        assert!(serde_json::from_str::<ValidatedLocation>(
+            r#"{"kind":"line_column","line":1,"column":0}"#
+        )
+        .is_err());
+        assert_eq!(
+            serde_json::from_str::<ValidatedLocation>(
+                r#"{"kind":"line_column","line":2,"column":3}"#
+            )
+            .unwrap(),
+            ValidatedLocation::line_column(2, 3).unwrap()
+        );
     }
 }

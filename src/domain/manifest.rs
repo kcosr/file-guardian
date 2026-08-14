@@ -150,18 +150,18 @@ fn validate(subjects: &[PhysicalSubject], artifacts: &[Artifact]) -> Result<(), 
         let subject = by_subject
             .get(&artifact.subject_id)
             .ok_or_else(|| ManifestError::UnknownSubject(artifact.subject_id.clone()))?;
-        if artifact.kind == ArtifactKind::PhysicalFile {
-            if artifact.object_id != subject.object_id
-                || artifact.byte_len != subject.byte_len
-                || artifact.content_digest != subject.source_identity.content_digest
-            {
-                return Err(ManifestError::PhysicalArtifactMismatch(artifact.id.clone()));
-            }
-            match &artifact.provenance {
-                Provenance::Physical { logical_path } if logical_path == &subject.relative_path => {
-                }
-                _ => return Err(ManifestError::PhysicalArtifactMismatch(artifact.id.clone())),
-            }
+        if artifact.kind != ArtifactKind::PhysicalFile {
+            return Err(ManifestError::UnsupportedArtifactKind(artifact.id.clone()));
+        }
+        if artifact.object_id != subject.object_id
+            || artifact.byte_len != subject.byte_len
+            || artifact.content_digest != subject.source_identity.content_digest
+        {
+            return Err(ManifestError::PhysicalArtifactMismatch(artifact.id.clone()));
+        }
+        match &artifact.provenance {
+            Provenance::Physical { logical_path } if logical_path == &subject.relative_path => {}
+            _ => return Err(ManifestError::PhysicalArtifactMismatch(artifact.id.clone())),
         }
     }
     Ok(())
@@ -181,6 +181,8 @@ pub enum ManifestError {
     SubjectSize(SubjectId),
     #[error("physical artifact {0} does not match its source subject")]
     PhysicalArtifactMismatch(ArtifactId),
+    #[error("artifact {0} uses a kind whose manifest invariants are not implemented")]
+    UnsupportedArtifactKind(ArtifactId),
     #[error("could not serialize manifest identity: {0}")]
     IdentitySerialization(serde_json::Error),
 }
@@ -266,6 +268,16 @@ mod tests {
         assert!(matches!(
             ArtifactManifest::new(vec![subject], vec![artifact]),
             Err(ManifestError::PhysicalArtifactMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn archive_artifacts_are_rejected_until_their_identity_contract_exists() {
+        let (subject, mut artifact) = pair("a", "archive.zip", b"zip");
+        artifact.kind = ArtifactKind::ArchiveMember;
+        assert!(matches!(
+            ArtifactManifest::new(vec![subject], vec![artifact]),
+            Err(ManifestError::UnsupportedArtifactKind(_))
         ));
     }
 

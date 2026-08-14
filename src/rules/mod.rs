@@ -198,9 +198,9 @@ pub fn load_rule_file(path: &Path) -> Result<Vec<CompiledRule>, RulesError> {
 fn validate_rule_id(id: &str) -> Result<(), String> {
     if id.is_empty()
         || id.len() > 128
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+        || !id.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
+        })
     {
         return Err(format!(
             "rule id '{id}' must contain 1 to 128 safe identifier characters"
@@ -252,6 +252,22 @@ content_regex = "(?i)password\\s*="
             Some("PASSWORD =")
         );
         assert_eq!(rules[0].source.path(), file.path());
+    }
+
+    #[test]
+    fn rule_ids_accept_namespaced_slashes() {
+        let file = rule_file(
+            r#"
+schema_version = "file-guardian-rules/1"
+
+[[rules]]
+id = "secrets/private-key"
+filename_glob = "*.key"
+"#,
+        );
+
+        let rules = load_rule_file(file.path()).unwrap();
+        assert_eq!(rules[0].name, "secrets/private-key");
     }
 
     #[test]
@@ -338,5 +354,19 @@ id = "empty"
             load_rule_file(empty.path()),
             Err(RulesError::InvalidFile { .. })
         ));
+    }
+
+    #[test]
+    fn shipped_windows_executable_rule_covers_case_insensitive_extensions() {
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config/rules.d/publication.toml");
+        let rules = load_rule_file(&path).unwrap();
+        let executable = rules
+            .iter()
+            .find(|rule| rule.name == "windows-executable")
+            .unwrap();
+        for filename in ["payload.exe", "PAYLOAD.EXE", "Payload.ExE"] {
+            assert!(executable.matches_filename(filename));
+        }
     }
 }

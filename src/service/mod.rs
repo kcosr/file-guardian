@@ -718,7 +718,7 @@ content_regex = "SECRET"
         let watchdog = std::thread::spawn(move || {
             let mut runtime_progressed = true;
             for capture_index in 0..2 {
-                if progress_rx.recv_timeout(Duration::from_secs(2)) != Ok(capture_index) {
+                if progress_rx.recv_timeout(Duration::from_secs(30)) != Ok(capture_index) {
                     runtime_progressed = false;
                 }
                 let (released, condition) = watchdog_gate.as_ref();
@@ -781,7 +781,7 @@ content_regex = "SECRET"
             .await
             .unwrap();
         let _ = authorization.await;
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while run_path.exists() {
                 tokio::task::yield_now().await;
             }

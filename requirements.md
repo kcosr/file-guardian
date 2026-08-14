@@ -57,6 +57,11 @@ Requirements:
   including exit `2` for syntax errors.
 - After recognizing a valid `authorize` shape, operational failures attempt to
   emit a schema-valid error report and exit `30`.
+- SIGINT and SIGTERM cancel in-flight authorization, signal supervised analyzer
+  teardown, release private workspace state, and attempt a schema-valid error
+  report with exit `30`. Uncatchable termination such as SIGKILL, OOM kill,
+  power loss, or a process crash requires protected stale-workspace cleanup at
+  deployment startup.
 - Obsolete implicit invocation, `--once`, and `--dry-run` are rejected. No
   compatibility parser or environment-based semantic override is retained.
 
@@ -253,8 +258,10 @@ all enabled jobs run.
 
 Each policy scan asynchronously invokes the same compiled evaluate-only
 pipeline engine used by one-shot authorization. It captures each configured
-target independently, records the decision through protected logging, never
-modifies targets, and treats capture or analysis uncertainty as an error. The
+target independently, records the complete schema-valid decision on stderr and
+through configured protected structured logging, never modifies targets, and
+treats capture or analysis uncertainty as an error. Missed schedules delay the
+next scan rather than creating a burst of catch-up work. The
 daemon configuration states what the process does; simply starting File
 Guardian does not imply directory scanning.
 
@@ -355,12 +362,15 @@ The runtime configuration fixes `platform = "linux"`,
 `sandbox = "bubblewrap-v1"`, `network = "host_internal_model"`, absolute
 administrator roots and executables, normalized runtime-relative manifest,
 Node launcher and Pi entrypoint paths, expected Bubblewrap and Pi versions,
-provider/model/thinking, the instruction and reviewed extension, isolated agent
-state, output schema, tool grant, closed vocabulary, and exhaustive nonzero
-limits. Credential values come only from explicit, dedicated
-parent-environment mappings at execution; the values, run token, proxy endpoint,
-and invocation paths are neither config identity nor report material. Secret
-values and the run token must not appear in process arguments or other
+provider/model/thinking, the instruction and reviewed extension, the isolated
+agent-state path and security contract, output schema, tool grant, closed
+vocabulary, and exhaustive nonzero limits. Mutable agent-state contents are
+not hashed into pipeline identity because Pi may update locks, settings, and
+OAuth credentials during a run; ownership and owner-only permissions are
+revalidated before each launch. Credential values come only from explicit,
+dedicated parent-environment mappings at execution; the values, run token, proxy
+endpoint, and invocation paths are neither config identity nor report material.
+Secret values and the run token must not appear in process arguments or other
 process-list-visible command material.
 
 The manifest-pinned runtime bundle is self-contained, including Node, its
@@ -385,6 +395,11 @@ implementation's preflight hashing and revalidation detect ordinary changes,
 but path-based reopening and writable agent state do not eliminate hostile
 same-UID mutation races; administrative ownership is part of the deployment
 trust boundary.
+
+`RLIMIT_NPROC` is a per-real-UID host-wide ceiling on Linux rather than a
+sandbox-local process count. Deploy Pi under a dedicated service UID and leave
+enough headroom for Node threads and concurrently running analyzers; use cgroup
+PID and memory controls when hard per-invocation aggregate limits are required.
 
 Every classification code for every profile that selects Pi has exactly one
 classification binding and its directive is `audit`. Wildcard, missing,
