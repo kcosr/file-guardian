@@ -171,10 +171,12 @@ Built-in analysis requirements:
   captured immutable bytes.
 - Return every match in canonical order rather than stopping at the first.
 - Never include the matched value or raw content in a finding or report.
-- Treat invalid UTF-8 and over-limit content as failures by default. Explicit
-  analyzer configuration may classify either as inapplicable.
-- Count intentional inapplicability once as excluded coverage while still
-  evaluating filename rules.
+- Treat invalid UTF-8 or any NUL byte as ordinary binary and count it once as
+  `not_applicable` while still evaluating filename rules. A binary path matched
+  by `content_applicability.required_text_include` is incomplete required
+  analysis.
+- Treat valid text over the configured content limit as incomplete rather than
+  `not_applicable`.
 - Treat object read, length, or digest disagreement as incomplete required
   coverage and exit `30`.
 
@@ -227,15 +229,15 @@ the requested remediation cannot be applied.
 
 ## Coverage requirements
 
-Coverage is phase-aware and records eligible, assigned, completed, and excluded
-candidate counts for every analyzer.
+Coverage is phase-aware and records `eligible`, `assigned`, `completed`, and
+`not_applicable` candidate counts for every analyzer.
 
-- `completed` and `excluded` are disjoint.
-- An explicitly inapplicable assigned artifact counts as excluded, not
+- `completed` and `not_applicable` are disjoint.
+- An explicitly inapplicable assigned artifact counts as `not_applicable`, not
   completed.
-- `completed + excluded == assigned` is necessary but not sufficient for a
-  complete analyzer row; protocol, budget, tool, or execution failure keeps it
-  incomplete.
+- `completed + not_applicable == assigned` is necessary but not sufficient for
+  a complete analyzer row; protocol, budget, tool, or execution failure keeps
+  it incomplete.
 - A phase is complete only when all required analyzer rows are complete.
 - Exits `0` and `20` require complete initial coverage. Exit `10` will also
   require complete post-action verification.
@@ -279,7 +281,7 @@ Analyzer selection is compiled from `include` and `exclude` globs plus
 `artifact_kinds`. Globs match the canonical raw bytes of root-relative logical
 path segments joined by `/`, without lossy UTF-8 conversion; separator matching
 is explicit and exclusions win. An artifact outside the selector is not
-eligible and does not increment `excluded`. The current capture produces
+eligible and does not increment `not_applicable`. The current capture produces
 `physical_file` artifacts; `archive_member` becomes useful when archive
 materialization is implemented.
 
@@ -292,10 +294,10 @@ Limit or serialization failure stops the stage and makes required analysis
 incomplete.
 
 Schema 2 currently requires every analyzer to have `required = true`; optional
-advisory coverage has not been enabled. Eligible, assigned, completed, and
-excluded counters are explicit and disjoint. Complete coverage requires the
-analyzer to return valid output, no issue, and
-`completed + excluded == assigned`; arithmetic equality alone cannot turn a
+advisory coverage has not been enabled. `eligible`, `assigned`, `completed`,
+and `not_applicable` counters are explicit and disjoint. Complete coverage
+requires the analyzer to return valid output, no issue, and
+`completed + not_applicable == assigned`; arithmetic equality alone cannot turn a
 protocol, task, budget, or read failure into success.
 
 ### Internal Pi classifier
@@ -303,29 +305,36 @@ protocol, task, budget, or read failure into success.
 The internal Pi-based LLM may read sensitive captured content because the
 selected model and transport are approved for it. It remains transaction-scoped
 and read-only. File Guardian invokes an administrator-pinned Pi runtime without
-a shell or discovered user customizations, exposes only bounded host-controlled
-artifact tools, requires strict terminal structured output, and validates all
-classifications against an administrator vocabulary.
+a shell or discovered user customizations, exposes only the pinned
+File Guardian `read`, `grep`, `find`, `ls`, `manifest_list`,
+`prior_observations`, and `submit_classification` tools, requires strict
+terminal structured output, and validates all classifications against an
+administrator vocabulary.
 
 On Linux, Bubblewrap confinement is mandatory and has no unsandboxed fallback.
 The sandbox mounts the administrator-prepared runtime and policy material, but
-neither live staging nor the invocation object store. A private per-run Unix
-socket gives the reviewed extension access to assigned artifacts by opaque
-host IDs only. The host authenticates and schema-validates requests and enforces
-tool-call, byte-read, output, time, and process limits. Unsupported platforms,
+neither live staging nor the invocation object store. It mounts a generated,
+immutable, text-only assigned-file view at `/input`. A private per-run Unix
+socket carries authenticated `file-guardian-pi-proxy/2` audit/control records,
+manifest mappings, compact prior observations, and terminal output. The host
+schema-validates requests and enforces tool-call, byte-read, output, view, time,
+and process limits. Unsupported platforms,
 missing or mismatched runtime assets, sandbox startup failure, handshake or
 protocol disagreement, unavailable tools, invalid terminal output, budget
 exhaustion, timeout, abnormal exit, and incomplete coverage all produce exit
 `30`.
 
-The exact grant is closed: manifest listing, artifact metadata, whole or ranged
-artifact reads, bounded literal artifact search, safe prior-observation access,
-and one terminal classification submission. There is no shell, subprocess,
-arbitrary-path, mutation, quarantine, deletion, credential, or File Guardian
-control tool. The sandbox keeps network access required by Pi's configured
-model transport. Bubblewrap therefore provides filesystem/process confinement,
-not destination-limited model egress; deployments must restrict the shared
-transport to approved internal endpoints.
+The exact grant is closed. `read` and `ls` are bounded Node implementations;
+`grep` and `find` invoke only manifest-pinned `rg` and `fd` directly, without a
+shell or inherited helper environment, and always use `--hidden --no-ignore`.
+All native paths are relative to `/input`, every call has paired authenticated
+begin/end accounting, and any native validation/execution/accounting failure
+invalidates the run. There is no model-callable bash, general subprocess,
+arbitrary path or `/proc` access, mutation, write/edit, quarantine, deletion,
+credential, or File Guardian control tool. The sandbox keeps network access
+required by Pi's configured model transport. Bubblewrap therefore provides
+filesystem/process confinement, not destination-limited model egress;
+deployments must restrict the shared transport to approved internal endpoints.
 
 The runtime configuration fixes `platform = "linux"`,
 `sandbox = "bubblewrap-v1"`, `network = "host_internal_model"`, absolute
@@ -365,6 +374,26 @@ ambiguous, or non-audit Pi bindings are invalid configuration. Audit-only means
 a successfully normalized Pi result cannot cause allow, deny, or mutation and
 cannot remove any deterministic observation. It does not make Pi optional:
 required Pi failure still makes the authorization result untrustworthy.
+
+Pi applicability is text-only. Assigned content is fully re-read from the
+immutable object, digest/length checked, and streamed through strict UTF-8/NUL
+validation before materialization. Ordinary binary files are complete
+`not_applicable` coverage and do not invoke Pi; if every assignment is binary,
+the audit analyzer completes with no classification. This can participate in an
+allow only because the configured Pi analyzer has no applicable text; it is not
+a positive LLM approval of binary content. Paths selected by
+`content_applicability.required_text_include` must be valid text or required
+analysis fails closed. Valid text exceeding `max_read_bytes_per_call` (which is
+capped at one MiB), object errors, or identity disagreement also fail closed.
+Archive members are not currently
+materialized or inspected; an archive is merely an ordinary physical file and
+normally becomes `not_applicable` when its bytes are binary.
+
+Prior observations are bounded, compact normalized DTOs only. They can contain
+safe finding/classification identities, categories, severities, validated
+locations, confidence, and reason codes. They never enumerate clean files and
+never contain content, matched values, snippets, raw scanner output, prompts,
+or transcripts.
 
 The initial Pi rollout is audit-only. Model output cannot suppress a
 deterministic finding, and any required timeout, process, tool, budget, schema,
@@ -447,7 +476,7 @@ The normative implementation contract is
   and cannot produce exit `0` or `20`.
 - Privacy tests reject absolute paths, secrets, snippets, prompts, transcripts,
   credentials, environment values, and raw scanner output in reports.
-- Later fake Pi and delegate processes cover malformed output, crashes,
-  timeouts, pipe floods, budget exhaustion, and incomplete coverage.
+- Offline Pi fixtures and later fake delegate processes cover malformed output,
+  crashes, timeouts, pipe floods, budget exhaustion, and incomplete coverage.
 - Each behavior change updates tests and public documentation and passes
   `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`.

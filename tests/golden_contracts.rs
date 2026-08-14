@@ -40,6 +40,17 @@ fn golden_reports_match_typed_domain_contracts_and_exit_invariants() {
     }
 
     assert!(reports[0].observations.is_empty());
+    let pi_allow_coverage = reports[0]
+        .coverage
+        .initial
+        .analyzers
+        .iter()
+        .find(|coverage| coverage.analyzer_id.as_str() == "publication-llm")
+        .expect("Pi coverage in allow golden");
+    assert_eq!(pi_allow_coverage.assigned, 1);
+    assert_eq!(pi_allow_coverage.completed, 0);
+    assert_eq!(pi_allow_coverage.not_applicable, 1);
+    assert!(pi_allow_coverage.is_complete());
     assert_eq!(reports[1].observations.len(), 1);
     assert_eq!(reports[2].issues.len(), 1);
     assert_eq!(
@@ -172,6 +183,15 @@ fn checked_in_configuration_and_classifier_examples_parse() {
 
 #[test]
 fn run_coverage_deserialization_is_strict_and_phase_safe() {
+    let obsolete_excluded = r#"{
+        "initial":{"status":"complete","analyzers":[{
+            "analyzer_id":"builtin","phase":"initial","eligible":1,
+            "assigned":1,"completed":0,"excluded":1,"status":"complete"
+        }]},
+        "verification":{"status":"not_run","analyzers":[]}
+    }"#;
+    assert!(serde_json::from_str::<RunCoverage>(obsolete_excluded).is_err());
+
     let unknown_field = r#"{
         "initial":{"status":"incomplete","analyzers":[]},
         "verification":{"status":"not_run","analyzers":[]},
@@ -182,7 +202,7 @@ fn run_coverage_deserialization_is_strict_and_phase_safe() {
     let misplaced_phase = r#"{
         "initial":{"status":"complete","analyzers":[{
             "analyzer_id":"builtin","phase":"verification","eligible":0,
-            "assigned":0,"completed":0,"excluded":0,"status":"complete"
+            "assigned":0,"completed":0,"not_applicable":0,"status":"complete"
         }]},
         "verification":{"status":"not_run","analyzers":[]}
     }"#;
@@ -191,7 +211,7 @@ fn run_coverage_deserialization_is_strict_and_phase_safe() {
     let fully_accounted_but_incomplete = r#"{
         "initial":{"status":"incomplete","analyzers":[{
             "analyzer_id":"builtin","phase":"initial","eligible":1,
-            "assigned":1,"completed":1,"excluded":0,"status":"incomplete"
+            "assigned":1,"completed":1,"not_applicable":0,"status":"incomplete"
         }]},
         "verification":{"status":"not_run","analyzers":[]}
     }"#;

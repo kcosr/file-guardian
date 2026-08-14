@@ -24,7 +24,7 @@ pub struct AnalyzerCoverage {
     pub eligible: u64,
     pub assigned: u64,
     pub completed: u64,
-    pub excluded: u64,
+    pub not_applicable: u64,
     pub status: CoverageStatus,
 }
 
@@ -35,17 +35,17 @@ impl AnalyzerCoverage {
         eligible: u64,
         assigned: u64,
         completed: u64,
-        excluded: u64,
+        not_applicable: u64,
         status: CoverageStatus,
     ) -> Result<Self, CoverageError> {
         if assigned > eligible {
             return Err(CoverageError::AssignedExceedsEligible);
         }
-        if excluded > eligible {
-            return Err(CoverageError::ExcludedExceedsEligible);
+        if not_applicable > eligible {
+            return Err(CoverageError::NotApplicableExceedsEligible);
         }
         let accounted = completed
-            .checked_add(excluded)
+            .checked_add(not_applicable)
             .ok_or(CoverageError::AccountedExceedsAssigned)?;
         if accounted > assigned {
             return Err(CoverageError::AccountedExceedsAssigned);
@@ -59,14 +59,14 @@ impl AnalyzerCoverage {
             eligible,
             assigned,
             completed,
-            excluded,
+            not_applicable,
             status,
         })
     }
 
     pub fn is_complete(&self) -> bool {
         self.status == CoverageStatus::Complete
-            && self.completed.checked_add(self.excluded) == Some(self.assigned)
+            && self.completed.checked_add(self.not_applicable) == Some(self.assigned)
     }
 }
 
@@ -83,7 +83,7 @@ impl<'de> Deserialize<'de> for AnalyzerCoverage {
             eligible: u64,
             assigned: u64,
             completed: u64,
-            excluded: u64,
+            not_applicable: u64,
             status: CoverageStatus,
         }
 
@@ -94,7 +94,7 @@ impl<'de> Deserialize<'de> for AnalyzerCoverage {
             fields.eligible,
             fields.assigned,
             fields.completed,
-            fields.excluded,
+            fields.not_applicable,
             fields.status,
         )
         .map_err(serde::de::Error::custom)
@@ -214,9 +214,9 @@ pub enum CoverageError {
     DuplicateAnalyzer(AnalyzerId),
     #[error("assigned artifact count exceeds eligible artifact count")]
     AssignedExceedsEligible,
-    #[error("excluded artifact count exceeds eligible artifact count")]
-    ExcludedExceedsEligible,
-    #[error("completed plus excluded artifact count exceeds assigned artifact count")]
+    #[error("not-applicable artifact count exceeds eligible artifact count")]
+    NotApplicableExceedsEligible,
+    #[error("completed plus not-applicable artifact count exceeds assigned artifact count")]
     AccountedExceedsAssigned,
     #[error("complete coverage requires all assigned artifacts to be accounted for")]
     StatusMismatch,
@@ -266,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusions_are_accounted_work_but_not_completed_work() {
+    fn not_applicable_is_accounted_work_but_not_completed_work() {
         let coverage = AnalyzerCoverage::new(
             AnalyzerId::new("builtin").unwrap(),
             InspectionPhase::Initial,
@@ -279,7 +279,7 @@ mod tests {
         .unwrap();
         assert!(coverage.is_complete());
         assert_eq!(coverage.completed, 1);
-        assert_eq!(coverage.excluded, 2);
+        assert_eq!(coverage.not_applicable, 2);
 
         assert_eq!(
             AnalyzerCoverage::new(
@@ -297,23 +297,26 @@ mod tests {
 
     #[test]
     fn deserialization_revalidates_coverage_and_rejects_unknown_fields() {
-        let false_complete = r#"{"analyzer_id":"builtin","phase":"initial","eligible":2,"assigned":2,"completed":1,"excluded":0,"status":"complete"}"#;
+        let false_complete = r#"{"analyzer_id":"builtin","phase":"initial","eligible":2,"assigned":2,"completed":1,"not_applicable":0,"status":"complete"}"#;
         assert!(serde_json::from_str::<AnalyzerCoverage>(false_complete).is_err());
 
         let unknown = r#"{"status":"not_run","analyzers":[],"extra":true}"#;
         assert!(serde_json::from_str::<PhaseCoverage>(unknown).is_err());
 
-        let analyzer_unknown = r#"{"analyzer_id":"builtin","phase":"initial","eligible":1,"assigned":1,"completed":1,"excluded":0,"status":"complete","extra":true}"#;
+        let analyzer_unknown = r#"{"analyzer_id":"builtin","phase":"initial","eligible":1,"assigned":1,"completed":1,"not_applicable":0,"status":"complete","extra":true}"#;
         assert!(serde_json::from_str::<AnalyzerCoverage>(analyzer_unknown).is_err());
 
-        let not_run_with_row = r#"{"status":"not_run","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"excluded":0,"status":"complete"}]}"#;
+        let not_run_with_row = r#"{"status":"not_run","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"not_applicable":0,"status":"complete"}]}"#;
         assert!(serde_json::from_str::<PhaseCoverage>(not_run_with_row).is_err());
 
-        let fully_accounted_incomplete = r#"{"status":"incomplete","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":1,"assigned":1,"completed":1,"excluded":0,"status":"complete"}]}"#;
+        let fully_accounted_incomplete = r#"{"status":"incomplete","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":1,"assigned":1,"completed":1,"not_applicable":0,"status":"complete"}]}"#;
         assert!(serde_json::from_str::<PhaseCoverage>(fully_accounted_incomplete).is_ok());
 
-        let duplicates = r#"{"status":"complete","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"excluded":0,"status":"complete"},{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"excluded":0,"status":"complete"}]}"#;
+        let duplicates = r#"{"status":"complete","analyzers":[{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"not_applicable":0,"status":"complete"},{"analyzer_id":"builtin","phase":"initial","eligible":0,"assigned":0,"completed":0,"not_applicable":0,"status":"complete"}]}"#;
         assert!(serde_json::from_str::<PhaseCoverage>(duplicates).is_err());
+
+        let obsolete_excluded = r#"{"analyzer_id":"builtin","phase":"initial","eligible":1,"assigned":1,"completed":0,"excluded":1,"status":"complete"}"#;
+        assert!(serde_json::from_str::<AnalyzerCoverage>(obsolete_excluded).is_err());
     }
 
     #[test]

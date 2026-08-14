@@ -3,19 +3,18 @@ use crate::domain::{
     ConfiguredConfidence, Digest, InspectionPhase, NormalizedObservation, ObservationId,
     ReasonCode, RunId,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: &str = "file-guardian-pi-proxy/1";
+pub const PROTOCOL_VERSION: &str = "file-guardian-pi-proxy/2";
 pub const OUTPUT_SCHEMA_VERSION: &str = "file-guardian-pi-classifier/1";
 
 pub const REQUIRED_TOOLS: &[&str] = &[
-    "artifact_metadata",
-    "artifact_read",
-    "artifact_read_range",
-    "artifact_search",
+    "read",
+    "grep",
+    "find",
+    "ls",
     "manifest_list",
     "prior_observations",
     "submit_classification",
@@ -57,9 +56,15 @@ impl<'de> Deserialize<'de> for ProxyRequest {
                 "active_tools",
             ],
             "instruction" | "manifest_list" | "prior_observations" => &[],
-            "artifact_metadata" | "artifact_read" => &["artifact_id"],
-            "artifact_read_range" => &["artifact_id", "offset", "length"],
-            "artifact_search" => &["artifact_id", "literal", "max_matches"],
+            "native_tool_begin" => &["tool_call_id", "tool", "path"],
+            "native_tool_end" => &[
+                "tool_call_id",
+                "tool",
+                "path",
+                "success",
+                "output_bytes",
+                "result_count",
+            ],
             "submit_classification" => &["payload"],
             _ => return Err(serde::de::Error::custom("unknown proxy request type")),
         };
@@ -132,21 +137,18 @@ pub enum ProxyOperation {
     },
     Instruction {},
     ManifestList {},
-    ArtifactMetadata {
-        artifact_id: ArtifactId,
+    NativeToolBegin {
+        tool_call_id: String,
+        tool: NativeTool,
+        path: String,
     },
-    ArtifactRead {
-        artifact_id: ArtifactId,
-    },
-    ArtifactReadRange {
-        artifact_id: ArtifactId,
-        offset: u64,
-        length: u64,
-    },
-    ArtifactSearch {
-        artifact_id: ArtifactId,
-        literal: Base64UrlBytes,
-        max_matches: u64,
+    NativeToolEnd {
+        tool_call_id: String,
+        tool: NativeTool,
+        path: String,
+        success: bool,
+        output_bytes: u64,
+        result_count: u64,
     },
     PriorObservations {},
     SubmitClassification {
@@ -154,49 +156,13 @@ pub enum ProxyOperation {
     },
 }
 
-/// Binary-safe bytes with one canonical, unpadded base64url representation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Base64UrlBytes(Vec<u8>);
-
-impl Base64UrlBytes {
-    pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
-    }
-}
-
-impl Serialize for Base64UrlBytes {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&URL_SAFE_NO_PAD.encode(&self.0))
-    }
-}
-
-impl<'de> Deserialize<'de> for Base64UrlBytes {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let encoded = String::deserialize(deserializer)?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(&encoded)
-            .map_err(serde::de::Error::custom)?;
-        if URL_SAFE_NO_PAD.encode(&bytes) != encoded {
-            return Err(serde::de::Error::custom(
-                "bytes must use canonical unpadded base64url",
-            ));
-        }
-        Ok(Self(bytes))
-    }
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTool {
+    Read,
+    Grep,
+    Find,
+    Ls,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -808,15 +774,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_envelope_and_binary_literal_are_strict_and_canonical() {
-        let bytes = Base64UrlBytes::new(vec![0, 255, 1]);
-        assert_eq!(serde_json::to_string(&bytes).unwrap(), "\"AP8B\"");
-        assert_eq!(
-            serde_json::from_str::<Base64UrlBytes>("\"AP8B\"").unwrap(),
-            bytes
-        );
-        assert!(serde_json::from_str::<Base64UrlBytes>("\"AP8B=\"").is_err());
-
+    fn proxy_envelope_and_native_tool_operations_are_strict() {
         let request = json!({
             "protocol": PROTOCOL_VERSION,
             "run_token": "opaque",
@@ -830,7 +788,41 @@ mod tests {
         let mut with_unknown = request;
         with_unknown["path"] = json!("/secret");
         assert!(serde_json::from_value::<ProxyRequest>(with_unknown).is_err());
-        assert_eq!(REQUIRED_TOOLS.len(), 7);
+        let begin = json!({
+            "protocol": PROTOCOL_VERSION,
+            "run_token": "opaque",
+            "request_id": 2,
+            "run_id": "run_01",
+            "analyzer_id": "pi-review",
+            "manifest_identity": manifest_identity(),
+            "type": "native_tool_begin",
+            "tool_call_id": "call_01",
+            "tool": "read",
+            "path": "src/lib.rs"
+        });
+        let parsed: ProxyRequest = serde_json::from_value(begin.clone()).unwrap();
+        assert!(matches!(
+            parsed.operation,
+            ProxyOperation::NativeToolBegin {
+                tool: NativeTool::Read,
+                ..
+            }
+        ));
+        let mut obsolete = begin;
+        obsolete["artifact_id"] = json!("a_01");
+        assert!(serde_json::from_value::<ProxyRequest>(obsolete).is_err());
+        assert_eq!(
+            REQUIRED_TOOLS,
+            [
+                "read",
+                "grep",
+                "find",
+                "ls",
+                "manifest_list",
+                "prior_observations",
+                "submit_classification"
+            ]
+        );
         assert!(!REQUIRED_TOOLS.contains(&"instruction"));
     }
 }

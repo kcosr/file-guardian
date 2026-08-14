@@ -1,20 +1,19 @@
 use super::protocol::{
-    ClassificationVocabulary, ProxyError as WireError, ProxyErrorCode, ProxyOperation,
+    ClassificationVocabulary, NativeTool, ProxyError as WireError, ProxyErrorCode, ProxyOperation,
     ProxyRequest, ProxyResponse, TerminalValidationContext, TerminalValidationLimits,
     ValidatedSubmission, PROTOCOL_VERSION, REQUIRED_TOOLS,
 };
-use crate::authorization::{InvocationWorkspace, ObjectStore, WorkspaceError};
+use crate::authorization::{AnalyzerView, AnalyzerViewNode, InvocationWorkspace, WorkspaceError};
 use crate::domain::{
-    AnalyzerId, Artifact, ArtifactId, ArtifactKind, ArtifactManifest, CandidateId,
-    ClassificationScope, Digest, InspectionPhase, LogicalPath, Provenance, RunId,
+    AnalyzerId, ArtifactId, ArtifactManifest, CandidateId, ClassificationScope, InspectionPhase,
+    RunId,
 };
 use crate::pipeline::{ArtifactAssignment, PriorObservationProjection};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +24,9 @@ use tokio::sync::{oneshot, watch};
 
 const SOCKET_NAME: &str = "proxy.sock";
 pub(crate) const EXTENSION_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const NATIVE_READ_MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const NATIVE_TOOL_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub(crate) const NATIVE_SEARCH_MAX_RESULTS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PiProxyLimits {
@@ -34,7 +36,6 @@ pub struct PiProxyLimits {
     pub max_tool_calls: u64,
     pub max_bytes_read: u64,
     pub max_read_bytes_per_call: u64,
-    pub max_search_pattern_bytes: usize,
     pub max_search_matches: u64,
     pub max_search_bytes_per_call: u64,
     pub max_search_calls: u64,
@@ -49,14 +50,15 @@ impl PiProxyLimits {
             || self.max_tool_calls == 0
             || self.max_bytes_read == 0
             || self.max_read_bytes_per_call == 0
-            || self.max_search_pattern_bytes == 0
+            || self.max_read_bytes_per_call > NATIVE_READ_MAX_BYTES
+            || self.max_read_bytes_per_call > self.max_bytes_read
             || self.max_search_matches == 0
+            || self.max_search_matches > NATIVE_SEARCH_MAX_RESULTS
             || self.max_search_bytes_per_call == 0
+            || self.max_search_bytes_per_call > self.max_bytes_read
             || self.max_search_calls == 0
             || self.frame_read_timeout.is_zero()
             || self.max_response_bytes > EXTENSION_MAX_RESPONSE_BYTES
-            || encoded_response_upper_bound(self.max_read_bytes_per_call)
-                .is_none_or(|size| size > self.max_response_bytes as u64)
         {
             return Err(PiProxyError::InvalidLimits);
         }
@@ -78,7 +80,7 @@ pub struct PiProxyInput {
     pub analyzer_id: AnalyzerId,
     pub manifest: Arc<ArtifactManifest>,
     pub assignments: Vec<ArtifactAssignment>,
-    pub objects: Arc<ObjectStore>,
+    pub view: Arc<AnalyzerView>,
     pub prior_observations: Arc<PriorObservationProjection>,
     pub instruction: Arc<str>,
     pub expected_runtime: ExpectedPiRuntime,
@@ -245,11 +247,20 @@ struct Server {
     assignments: BTreeMap<ArtifactId, CandidateId>,
     limits: PiProxyLimits,
     calls: u64,
+    tool_calls: u64,
     bytes_read: u64,
     search_calls: u64,
+    outstanding_native_tool: Option<OutstandingNativeTool>,
     next_request_id: u64,
     ready: bool,
     progress: watch::Sender<ProxyProgress>,
+}
+
+#[derive(Debug)]
+struct OutstandingNativeTool {
+    tool_call_id: String,
+    tool: NativeTool,
+    path: String,
 }
 
 enum OperationResult {
@@ -283,8 +294,10 @@ impl Server {
             assignments,
             limits,
             calls: 0,
+            tool_calls: 0,
             bytes_read: 0,
             search_calls: 0,
+            outstanding_native_tool: None,
             next_request_id: 1,
             ready: false,
             progress,
@@ -305,10 +318,14 @@ impl Server {
                 .calls
                 .checked_add(1)
                 .ok_or(PiProxyError::BudgetExceeded)?;
+            // Every model-callable native operation uses a begin/end pair. The
+            // runtime-ready and instruction bootstrap requests are not model
+            // tools and account for the fixed allowance of two.
             let connection_limit = self
                 .limits
                 .max_tool_calls
-                .checked_add(2)
+                .checked_mul(2)
+                .and_then(|limit| limit.checked_add(2))
                 .ok_or(PiProxyError::BudgetExceeded)?;
             if self.calls > connection_limit {
                 return Err(PiProxyError::BudgetExceeded);
@@ -456,114 +473,108 @@ impl Server {
             }
             ProxyOperation::ManifestList {} => {
                 self.require_ready()?;
-                Ok(OperationResult::Continue(manifest_list_value(
-                    &self.input,
-                    &self.assignments,
-                )?))
+                self.charge_tool_call()?;
+                Ok(OperationResult::Continue(manifest_list_value(&self.input)?))
             }
-            ProxyOperation::ArtifactMetadata { artifact_id } => {
-                self.require_ready()?;
-                let candidate_id = self.authorize(&artifact_id)?;
-                let artifact = self.artifact(&artifact_id)?;
-                Ok(OperationResult::Continue(to_value(ManifestEntry {
-                    candidate_id,
-                    artifact_id: &artifact.id,
-                    logical_path: logical_path(artifact),
-                    kind: artifact.kind,
-                    byte_len: artifact.byte_len,
-                    content_digest: artifact.content_digest,
-                })?))
-            }
-            ProxyOperation::ArtifactRead { artifact_id } => {
-                self.require_ready()?;
-                let artifact = self.authorized_artifact(&artifact_id)?;
-                self.reserve_read(artifact.byte_len, self.limits.max_read_bytes_per_call)?;
-                self.reserve_encoded_response(artifact.byte_len)?;
-                let object_id = artifact.object_id.clone();
-                let expected = artifact.byte_len;
-                let objects = Arc::clone(&self.input.objects);
-                let bytes = blocking(move || read_whole(&objects, &object_id, expected)).await?;
-                self.charge_read(bytes.len() as u64)?;
-                Ok(OperationResult::Continue(json!({
-                    "encoding": "base64",
-                    "bytes": STANDARD.encode(bytes),
-                    "complete": true
-                })))
-            }
-            ProxyOperation::ArtifactReadRange {
-                artifact_id,
-                offset,
-                length,
+            ProxyOperation::NativeToolBegin {
+                tool_call_id,
+                tool,
+                path,
             } => {
                 self.require_ready()?;
-                let artifact = self.authorized_artifact(&artifact_id)?;
-                let end = offset
-                    .checked_add(length)
-                    .ok_or(PiProxyError::InvalidRequest)?;
-                if length == 0 || end > artifact.byte_len {
-                    return Err(PiProxyError::InvalidRequest);
+                if self.outstanding_native_tool.is_some() || !valid_tool_call_id(&tool_call_id) {
+                    return Err(PiProxyError::ProtocolViolation);
                 }
-                self.reserve_read(length, self.limits.max_read_bytes_per_call)?;
-                self.reserve_encoded_response(length)?;
-                let object_id = artifact.object_id.clone();
-                let objects = Arc::clone(&self.input.objects);
-                let bytes =
-                    blocking(move || read_range(&objects, &object_id, offset, length)).await?;
-                self.charge_read(bytes.len() as u64)?;
-                Ok(OperationResult::Continue(json!({
-                    "encoding": "base64",
-                    "offset": offset,
-                    "bytes": STANDARD.encode(bytes),
-                    "complete": true
-                })))
+                let node = self
+                    .input
+                    .view
+                    .resolve_relative_path(&path)
+                    .ok_or(PiProxyError::Unauthorized)?;
+                let charged_bytes = match (tool, node) {
+                    (NativeTool::Read, AnalyzerViewNode::File(entry)) => entry.byte_len,
+                    (NativeTool::Grep, AnalyzerViewNode::File(entry)) => entry.byte_len,
+                    (
+                        NativeTool::Grep,
+                        AnalyzerViewNode::Directory {
+                            recursive_file_bytes,
+                            ..
+                        },
+                    ) => recursive_file_bytes,
+                    (NativeTool::Find | NativeTool::Ls, AnalyzerViewNode::Directory { .. }) => 0,
+                    _ => return Err(PiProxyError::InvalidRequest),
+                };
+                self.charge_tool_call()?;
+                match tool {
+                    NativeTool::Read => {
+                        if charged_bytes > NATIVE_READ_MAX_BYTES {
+                            return Err(PiProxyError::BudgetExceeded);
+                        }
+                        self.reserve_read(charged_bytes, self.limits.max_read_bytes_per_call)?;
+                    }
+                    NativeTool::Grep => {
+                        self.search_calls = self
+                            .search_calls
+                            .checked_add(1)
+                            .filter(|calls| *calls <= self.limits.max_search_calls)
+                            .ok_or(PiProxyError::BudgetExceeded)?;
+                        self.reserve_read(charged_bytes, self.limits.max_search_bytes_per_call)?;
+                    }
+                    NativeTool::Find | NativeTool::Ls => {}
+                }
+                self.charge_read(charged_bytes)?;
+                self.outstanding_native_tool = Some(OutstandingNativeTool {
+                    tool_call_id,
+                    tool,
+                    path,
+                });
+                Ok(OperationResult::Continue(json!({"accepted": true})))
             }
-            ProxyOperation::ArtifactSearch {
-                artifact_id,
-                literal,
-                max_matches,
+            ProxyOperation::NativeToolEnd {
+                tool_call_id,
+                tool,
+                path,
+                success,
+                output_bytes,
+                result_count,
             } => {
                 self.require_ready()?;
-                self.search_calls = self
-                    .search_calls
-                    .checked_add(1)
-                    .ok_or(PiProxyError::BudgetExceeded)?;
-                if self.search_calls > self.limits.max_search_calls {
-                    return Err(PiProxyError::BudgetExceeded);
+                let outstanding = self
+                    .outstanding_native_tool
+                    .take()
+                    .ok_or(PiProxyError::ProtocolViolation)?;
+                if outstanding.tool_call_id != tool_call_id
+                    || outstanding.tool != tool
+                    || outstanding.path != path
+                {
+                    return Err(PiProxyError::ProtocolViolation);
                 }
-                let pattern = literal.into_bytes();
-                if pattern.is_empty()
-                    || pattern.len() > self.limits.max_search_pattern_bytes
-                    || max_matches == 0
-                    || max_matches > self.limits.max_search_matches
+                if !success {
+                    if output_bytes != 0 || result_count != 0 {
+                        return Err(PiProxyError::ProtocolViolation);
+                    }
+                    return Err(PiProxyError::NativeToolFailed);
+                }
+                if output_bytes > NATIVE_TOOL_MAX_OUTPUT_BYTES as u64
+                    || result_count > self.limits.max_search_matches
+                    || (tool == NativeTool::Read && result_count != 1)
                 {
                     return Err(PiProxyError::BudgetExceeded);
                 }
-                let artifact = self.authorized_artifact(&artifact_id)?;
-                self.reserve_read(artifact.byte_len, self.limits.max_search_bytes_per_call)?;
-                let match_bytes = max_matches
-                    .checked_mul(22)
-                    .ok_or(PiProxyError::BudgetExceeded)?;
-                if match_bytes > self.limits.max_response_bytes as u64 {
-                    return Err(PiProxyError::BudgetExceeded);
-                }
-                let object_id = artifact.object_id.clone();
-                let expected = artifact.byte_len;
-                let objects = Arc::clone(&self.input.objects);
-                let matches = blocking(move || {
-                    literal_search(&objects, &object_id, expected, &pattern, max_matches)
-                })
-                .await?;
-                self.charge_read(artifact.byte_len)?;
-                Ok(OperationResult::Continue(json!({"offsets": matches})))
+                Ok(OperationResult::Continue(json!({"accepted": true})))
             }
             ProxyOperation::PriorObservations {} => {
                 self.require_ready()?;
+                self.charge_tool_call()?;
                 let value = serde_json::from_slice(self.input.prior_observations.canonical_json())
                     .map_err(|_| PiProxyError::Internal)?;
                 Ok(OperationResult::Continue(value))
             }
             ProxyOperation::SubmitClassification { payload } => {
                 self.require_ready()?;
+                if self.outstanding_native_tool.is_some() {
+                    return Err(PiProxyError::ProtocolViolation);
+                }
+                self.charge_tool_call()?;
                 if serde_json::to_vec(&payload)
                     .map_err(|_| PiProxyError::InvalidTerminalSubmission)?
                     .len()
@@ -593,20 +604,13 @@ impl Server {
             .ok_or(PiProxyError::ProtocolViolation)
     }
 
-    fn authorize(&self, id: &ArtifactId) -> Result<&CandidateId, PiProxyError> {
-        self.assignments.get(id).ok_or(PiProxyError::Unauthorized)
-    }
-
-    fn artifact(&self, id: &ArtifactId) -> Result<&Artifact, PiProxyError> {
-        self.input
-            .manifest
-            .artifact(id)
-            .ok_or(PiProxyError::Internal)
-    }
-
-    fn authorized_artifact(&self, id: &ArtifactId) -> Result<&Artifact, PiProxyError> {
-        self.authorize(id)?;
-        self.artifact(id)
+    fn charge_tool_call(&mut self) -> Result<(), PiProxyError> {
+        self.tool_calls = self
+            .tool_calls
+            .checked_add(1)
+            .filter(|calls| *calls <= self.limits.max_tool_calls)
+            .ok_or(PiProxyError::BudgetExceeded)?;
+        Ok(())
     }
 
     fn reserve_read(&self, amount: u64, per_call: u64) -> Result<(), PiProxyError> {
@@ -630,42 +634,14 @@ impl Server {
             .ok_or(PiProxyError::BudgetExceeded)?;
         Ok(())
     }
-
-    fn reserve_encoded_response(&self, raw_bytes: u64) -> Result<(), PiProxyError> {
-        // Base64 expands to four bytes per three input bytes. The fixed 512-byte
-        // allowance covers the response envelope and numeric metadata.
-        let encoded =
-            encoded_response_upper_bound(raw_bytes).ok_or(PiProxyError::BudgetExceeded)?;
-        if encoded > self.limits.max_response_bytes as u64 {
-            return Err(PiProxyError::BudgetExceeded);
-        }
-        Ok(())
-    }
 }
 
-fn encoded_response_upper_bound(raw_bytes: u64) -> Option<u64> {
-    raw_bytes
-        .checked_add(2)
-        .and_then(|value| value.checked_div(3))
-        .and_then(|value| value.checked_mul(4))
-        .and_then(|value| value.checked_add(512))
-}
-
-#[derive(Serialize)]
-struct ManifestEntry<'a> {
-    candidate_id: &'a CandidateId,
-    artifact_id: &'a ArtifactId,
-    logical_path: &'a LogicalPath,
-    kind: ArtifactKind,
-    byte_len: u64,
-    content_digest: Digest,
-}
-
-fn logical_path(artifact: &Artifact) -> &LogicalPath {
-    match &artifact.provenance {
-        Provenance::Physical { logical_path } => logical_path,
-        Provenance::Derived { member_path, .. } => member_path,
-    }
+fn valid_tool_call_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 fn validate_input(input: &PiProxyInput) -> Result<(), PiProxyError> {
@@ -688,42 +664,30 @@ fn validate_input(input: &PiProxyInput) -> Result<(), PiProxyError> {
         })
         .collect::<BTreeMap<_, _>>();
     if assignments.len() != input.assignments.len()
-        || input
-            .assignments
-            .iter()
-            .any(|assignment| input.manifest.artifact(&assignment.artifact_id).is_none())
+        || input.view.entries().len() != assignments.len()
+        || input.view.entries().iter().any(|entry| {
+            assignments.get(&entry.artifact_id) != Some(&entry.candidate_id)
+                || input
+                    .manifest
+                    .artifact(&entry.artifact_id)
+                    .is_none_or(|artifact| {
+                        artifact.kind != entry.kind
+                            || artifact.byte_len != entry.byte_len
+                            || artifact.content_digest != entry.content_digest
+                    })
+        })
     {
         return Err(PiProxyError::InvalidAssignment);
     }
-    let manifest_list = manifest_list_value(input, &assignments)?;
+    let manifest_list = manifest_list_value(input)?;
     if !response_fits(manifest_list, input.limits.max_response_bytes)? {
         return Err(PiProxyError::ManifestResponseTooLarge);
     }
     Ok(())
 }
 
-fn manifest_list_value(
-    input: &PiProxyInput,
-    assignments: &BTreeMap<ArtifactId, CandidateId>,
-) -> Result<Value, PiProxyError> {
-    let entries = assignments
-        .iter()
-        .map(|(artifact_id, candidate_id)| {
-            let artifact = input
-                .manifest
-                .artifact(artifact_id)
-                .ok_or(PiProxyError::InvalidAssignment)?;
-            Ok(ManifestEntry {
-                candidate_id,
-                artifact_id,
-                logical_path: logical_path(artifact),
-                kind: artifact.kind,
-                byte_len: artifact.byte_len,
-                content_digest: artifact.content_digest,
-            })
-        })
-        .collect::<Result<Vec<_>, PiProxyError>>()?;
-    to_value(entries)
+fn manifest_list_value(input: &PiProxyInput) -> Result<Value, PiProxyError> {
+    to_value(input.view.entries())
 }
 
 fn response_fits(result: Value, max_response_bytes: usize) -> Result<bool, PiProxyError> {
@@ -823,73 +787,6 @@ async fn write_response(
     stream.shutdown().await.map_err(PiProxyError::WriteEndpoint)
 }
 
-async fn blocking<T: Send + 'static>(
-    operation: impl FnOnce() -> Result<T, PiProxyError> + Send + 'static,
-) -> Result<T, PiProxyError> {
-    tokio::task::spawn_blocking(operation)
-        .await
-        .map_err(|_| PiProxyError::Internal)?
-}
-
-fn read_whole(
-    objects: &ObjectStore,
-    id: &crate::domain::ObjectId,
-    expected: u64,
-) -> Result<Vec<u8>, PiProxyError> {
-    let capacity = usize::try_from(expected).map_err(|_| PiProxyError::BudgetExceeded)?;
-    let mut bytes = Vec::with_capacity(capacity);
-    objects
-        .open(id)
-        .map_err(|_| PiProxyError::ObjectRead)?
-        .take(expected.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|_| PiProxyError::ObjectRead)?;
-    if bytes.len() as u64 != expected {
-        return Err(PiProxyError::ObjectRead);
-    }
-    Ok(bytes)
-}
-
-fn read_range(
-    objects: &ObjectStore,
-    id: &crate::domain::ObjectId,
-    offset: u64,
-    length: u64,
-) -> Result<Vec<u8>, PiProxyError> {
-    let capacity = usize::try_from(length).map_err(|_| PiProxyError::BudgetExceeded)?;
-    let mut file = objects.open(id).map_err(|_| PiProxyError::ObjectRead)?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|_| PiProxyError::ObjectRead)?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(length)
-        .read_to_end(&mut bytes)
-        .map_err(|_| PiProxyError::ObjectRead)?;
-    if bytes.len() as u64 != length {
-        return Err(PiProxyError::ObjectRead);
-    }
-    Ok(bytes)
-}
-
-fn literal_search(
-    objects: &ObjectStore,
-    id: &crate::domain::ObjectId,
-    expected: u64,
-    pattern: &[u8],
-    max_matches: u64,
-) -> Result<Vec<u64>, PiProxyError> {
-    let bytes = read_whole(objects, id, expected)?;
-    let mut offsets = Vec::new();
-    for (offset, window) in bytes.windows(pattern.len()).enumerate() {
-        if window == pattern {
-            offsets.push(u64::try_from(offset).map_err(|_| PiProxyError::Internal)?);
-            if offsets.len() as u64 == max_matches {
-                break;
-            }
-        }
-    }
-    Ok(offsets)
-}
-
 fn to_value(value: impl Serialize) -> Result<Value, PiProxyError> {
     serde_json::to_value(value).map_err(|_| PiProxyError::Internal)
 }
@@ -954,8 +851,8 @@ pub enum PiProxyError {
     BudgetExceeded,
     #[error("Pi proxy response exceeds its configured limit")]
     ResponseTooLarge,
-    #[error("Pi proxy could not read an immutable object")]
-    ObjectRead,
+    #[error("Pi native read-only tool execution failed")]
+    NativeToolFailed,
     #[error("Pi proxy internal operation failed")]
     Internal,
     #[error("Pi proxy was stopped by its owner")]
@@ -973,9 +870,10 @@ impl PiProxyError {
             Self::BudgetExceeded | Self::FrameTooLarge | Self::ResponseTooLarge => {
                 ProxyErrorCode::BudgetExceeded
             }
-            Self::MalformedFrame | Self::InvalidRequest | Self::InvalidTerminalSubmission => {
-                ProxyErrorCode::InvalidRequest
-            }
+            Self::MalformedFrame
+            | Self::InvalidRequest
+            | Self::InvalidTerminalSubmission
+            | Self::NativeToolFailed => ProxyErrorCode::InvalidRequest,
             Self::FrameReadTimeout => ProxyErrorCode::ProtocolViolation,
             Self::ProtocolViolation | Self::ConcurrentRequest | Self::RuntimeMismatch => {
                 ProxyErrorCode::ProtocolViolation
@@ -995,9 +893,11 @@ impl PiProxyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authorization::{AnalyzerViewBuilder, AnalyzerViewLimits};
     use crate::domain::{
-        ClassificationCode, ConfiguredConfidence, ObjectId, PathSegment, PhysicalSubject,
-        ReasonCode, SourceFileType, SourceIdentity, SubjectId,
+        Artifact, ArtifactKind, ClassificationCode, ConfiguredConfidence, Digest, LogicalPath,
+        PathSegment, PhysicalSubject, Provenance, ReasonCode, SourceFileType, SourceIdentity,
+        SubjectId,
     };
     use crate::pipeline::{PriorObservationMode, ProjectionLimits};
     use std::fs;
@@ -1088,7 +988,6 @@ mod tests {
             max_tool_calls: 16,
             max_bytes_read: 1024,
             max_read_bytes_per_call: 1024,
-            max_search_pattern_bytes: 32,
             max_search_matches: 8,
             max_search_bytes_per_call: 1024,
             max_search_calls: 1,
@@ -1104,7 +1003,29 @@ mod tests {
             analyzer_id: fixture.analyzer_id.clone(),
             manifest: Arc::clone(&fixture.manifest),
             assignments: vec![fixture.assignment.clone()],
-            objects: fixture.workspace.objects_arc(),
+            view: Arc::new(
+                AnalyzerViewBuilder::new(
+                    &fixture.workspace,
+                    &fixture.manifest,
+                    std::slice::from_ref(&fixture.assignment),
+                    AnalyzerViewLimits {
+                        per_view: crate::authorization::AnalyzerViewQuota {
+                            max_files: 8,
+                            max_entries: 16,
+                            max_total_bytes: 8 * 1024,
+                            max_depth: 8,
+                        },
+                        invocation: crate::authorization::AnalyzerViewQuota {
+                            max_files: 8,
+                            max_entries: 16,
+                            max_total_bytes: 8 * 1024,
+                            max_depth: 8,
+                        },
+                    },
+                )
+                .materialize("proxy-input")
+                .unwrap(),
+            ),
             prior_observations: Arc::new(
                 PriorObservationProjection::build(
                     PriorObservationMode::None,
@@ -1222,6 +1143,32 @@ mod tests {
         }
     }
 
+    fn native_begin(tool_call_id: &str, tool: NativeTool, path: &str) -> ProxyOperation {
+        ProxyOperation::NativeToolBegin {
+            tool_call_id: tool_call_id.to_owned(),
+            tool,
+            path: path.to_owned(),
+        }
+    }
+
+    fn native_end(
+        tool_call_id: &str,
+        tool: NativeTool,
+        path: &str,
+        success: bool,
+        output_bytes: u64,
+        result_count: u64,
+    ) -> ProxyOperation {
+        ProxyOperation::NativeToolEnd {
+            tool_call_id: tool_call_id.to_owned(),
+            tool,
+            path: path.to_owned(),
+            success,
+            output_bytes,
+            result_count,
+        }
+    }
+
     #[tokio::test]
     async fn validates_terminal_before_acknowledging_and_keeps_content_private() {
         let fixture = fixture(b"private\0content");
@@ -1295,24 +1242,40 @@ mod tests {
             exchange(&socket, &instruction).await,
             ProxyResponse::Ok { .. }
         ));
-        let search = |request_id| {
-            bound_request(
+        let response = exchange(
+            &socket,
+            &bound_request(
                 &proxy,
                 &fixture,
-                request_id,
-                ProxyOperation::ArtifactSearch {
-                    artifact_id: fixture.assignment.artifact_id.clone(),
-                    literal: super::super::protocol::Base64UrlBytes::new(b"a".to_vec()),
-                    max_matches: 2,
-                },
+                3,
+                native_begin("grep-1", NativeTool::Grep, "artifact.bin"),
+            ),
+        )
+        .await;
+        assert!(matches!(response, ProxyResponse::Ok { .. }));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    4,
+                    native_end("grep-1", NativeTool::Grep, "artifact.bin", true, 4, 2),
+                ),
             )
-        };
-        let response = exchange(&socket, &search(3)).await;
-        match response {
-            ProxyResponse::Ok { result, .. } => assert_eq!(result["offsets"], json!([0, 2])),
-            _ => panic!("search at the exact call budget must succeed"),
-        }
-        let response = exchange(&socket, &search(4)).await;
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        let response = exchange(
+            &socket,
+            &bound_request(
+                &proxy,
+                &fixture,
+                5,
+                native_begin("grep-2", NativeTool::Grep, "artifact.bin"),
+            ),
+        )
+        .await;
         assert!(matches!(
             response,
             ProxyResponse::Error {
@@ -1325,6 +1288,39 @@ mod tests {
         assert!(matches!(
             proxy.finish().await,
             Err(PiProxyError::BudgetExceeded)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn manifest_lists_only_view_entries_with_presentation_paths() {
+        let fixture = fixture(b"private-content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        let response = exchange(
+            &socket,
+            &bound_request(&proxy, &fixture, 2, ProxyOperation::ManifestList {}),
+        )
+        .await;
+        let ProxyResponse::Ok { result, .. } = response else {
+            panic!("manifest list must succeed");
+        };
+        assert_eq!(result.as_array().unwrap().len(), 1);
+        assert_eq!(result[0]["view_path"], "artifact.bin");
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("private-content"));
+        assert!(!encoded.contains("object_id"));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::MissingTerminalSubmission)
         ));
         fixture.workspace.remove().unwrap();
     }
@@ -1501,7 +1497,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreign_or_unassigned_artifact_is_fatal_without_opening_an_object() {
+    async fn absolute_or_unassigned_view_path_is_fatal() {
         let fixture = fixture(b"content");
         let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
         let socket = socket(&proxy);
@@ -1514,9 +1510,7 @@ mod tests {
             &proxy,
             &fixture,
             2,
-            ProxyOperation::ArtifactRead {
-                artifact_id: ArtifactId::from_suffix("foreign").unwrap(),
-            },
+            native_begin("read-1", NativeTool::Read, "/proc/self/environ"),
         );
         assert!(matches!(
             exchange(&socket, &foreign).await,
@@ -1535,7 +1529,211 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_assigned_artifact_is_rejected_before_search_allocation() {
+    async fn native_tool_end_must_match_the_outstanding_begin_exactly() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    2,
+                    native_begin("read-1", NativeTool::Read, "artifact.bin"),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        let mismatched = bound_request(
+            &proxy,
+            &fixture,
+            3,
+            native_end("read-1", NativeTool::Read, "other.txt", true, 7, 1),
+        );
+        assert!(matches!(
+            exchange(&socket, &mismatched).await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::ProtocolViolation
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::ProtocolViolation)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_tool_output_is_bounded_independently_of_proxy_responses() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    2,
+                    native_begin("read-1", NativeTool::Read, "artifact.bin"),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    3,
+                    native_end(
+                        "read-1",
+                        NativeTool::Read,
+                        "artifact.bin",
+                        true,
+                        NATIVE_TOOL_MAX_OUTPUT_BYTES as u64 + 1,
+                        1,
+                    ),
+                ),
+            )
+            .await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::BudgetExceeded
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::BudgetExceeded)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_native_tool_permanently_prevents_terminal_submission() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    2,
+                    native_begin("grep-1", NativeTool::Grep, "."),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    3,
+                    native_end("grep-1", NativeTool::Grep, ".", false, 0, 0),
+                ),
+            )
+            .await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::InvalidRequest
+                },
+                ..
+            }
+        ));
+        assert!(UnixStream::connect(&socket).await.is_err());
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::NativeToolFailed)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_is_rejected_while_a_native_tool_is_outstanding() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    2,
+                    native_begin("read-1", NativeTool::Read, "artifact.bin"),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 3, terminal(&fixture, 1)),
+            )
+            .await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::ProtocolViolation
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::ProtocolViolation)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_assigned_artifact_is_rejected_before_native_search() {
         let fixture = fixture(b"five!");
         let mut configured = input(&fixture);
         configured.limits.max_search_bytes_per_call = 4;
@@ -1553,11 +1751,7 @@ mod tests {
             &proxy,
             &fixture,
             2,
-            ProxyOperation::ArtifactSearch {
-                artifact_id: fixture.assignment.artifact_id.clone(),
-                literal: super::super::protocol::Base64UrlBytes::new(b"f".to_vec()),
-                max_matches: 1,
-            },
+            native_begin("grep-1", NativeTool::Grep, "."),
         );
         assert!(matches!(
             exchange(&socket, &search).await,
@@ -1640,11 +1834,11 @@ mod tests {
     }
 
     #[test]
-    fn encoded_response_boundary_is_checked_without_allocating_content() {
+    fn extension_response_ceiling_is_checked_without_allocating_content() {
         let mut configured = limits();
-        configured.max_response_bytes = encoded_response_upper_bound(1024).unwrap() as usize;
+        configured.max_response_bytes = EXTENSION_MAX_RESPONSE_BYTES;
         assert!(configured.validate().is_ok());
-        configured.max_response_bytes -= 1;
+        configured.max_response_bytes += 1;
         assert!(matches!(
             configured.validate(),
             Err(PiProxyError::InvalidLimits)
@@ -1655,9 +1849,7 @@ mod tests {
     fn error_debug_never_contains_raw_content() {
         let content = b"super-secret-value";
         let fixture = fixture(content);
-        let missing = ObjectId::from_suffix("missing").unwrap();
-        let error =
-            read_whole(fixture.workspace.objects(), &missing, content.len() as u64).unwrap_err();
+        let error = PiProxyError::NativeToolFailed;
         assert!(!format!("{error:?}").contains("super-secret-value"));
         fixture.workspace.remove().unwrap();
     }

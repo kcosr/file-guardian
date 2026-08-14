@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 use globset::Glob;
 use serde::{Deserialize, Serialize};
 
-use crate::analyzers::pi::proxy::EXTENSION_MAX_RESPONSE_BYTES;
+use crate::analyzers::pi::proxy::{
+    EXTENSION_MAX_RESPONSE_BYTES, NATIVE_READ_MAX_BYTES, NATIVE_SEARCH_MAX_RESULTS,
+};
+use crate::analyzers::RequiredTextMatcher;
 use crate::logging::LoggingSettings;
 use crate::policy::PolicyDirective;
 
@@ -646,6 +649,8 @@ pub struct AnalyzerConfig {
     pub selection: SelectionConfig,
     #[serde(default)]
     pub limits: AnalyzerLimits,
+    #[serde(default)]
+    pub content_applicability: ContentApplicabilityConfig,
 }
 
 fn default_required() -> bool {
@@ -659,8 +664,6 @@ pub enum AnalyzerKind {
         rule_files: Vec<PathBuf>,
         #[serde(default = "default_builtin_max_content_bytes")]
         max_content_bytes: u64,
-        #[serde(default)]
-        content_applicability: ContentApplicabilityConfig,
     },
     PiClassifier {
         #[serde(default)]
@@ -692,6 +695,7 @@ impl AnalyzerConfig {
         }
         self.selection.validate(&self.id)?;
         self.limits.validate(&self.id)?;
+        self.content_applicability.validate(&self.id)?;
         match &self.kind {
             AnalyzerKind::BuiltinRules {
                 rule_files,
@@ -768,30 +772,22 @@ pub enum ClassifierScope {
     Tree,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentApplicabilityConfig {
     #[serde(default)]
-    pub invalid_utf8: ApplicabilityPolicy,
-    #[serde(default)]
-    pub over_max_bytes: ApplicabilityPolicy,
+    pub required_text_include: Vec<String>,
 }
 
-impl Default for ContentApplicabilityConfig {
-    fn default() -> Self {
-        Self {
-            invalid_utf8: ApplicabilityPolicy::Fail,
-            over_max_bytes: ApplicabilityPolicy::Fail,
-        }
+impl ContentApplicabilityConfig {
+    fn validate(&self, id: &str) -> Result<(), ConfigError> {
+        RequiredTextMatcher::compile(&self.required_text_include).map_err(|error| {
+            ConfigError::Invalid(format!(
+                "analyzer '{id}' has invalid content_applicability.required_text_include: {error}"
+            ))
+        })?;
+        Ok(())
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApplicabilityPolicy {
-    #[default]
-    Fail,
-    Exclude,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -875,9 +871,9 @@ impl PiConfig {
                 "Pi analyzer '{id}' requires output_schema = 'file-guardian-pi-classifier/1'"
             ));
         }
-        if self.tool_grant != "artifact-readonly-v1" {
+        if self.tool_grant != "native-readonly-v1" {
             return invalid(format!(
-                "Pi analyzer '{id}' requires tool_grant = 'artifact-readonly-v1'"
+                "Pi analyzer '{id}' requires tool_grant = 'native-readonly-v1'"
             ));
         }
         if self.credentials.is_empty() {
@@ -1122,9 +1118,13 @@ pub struct AnalyzerLimits {
     pub max_tool_calls: Option<u64>,
     pub max_bytes_read: Option<u64>,
     pub max_read_bytes_per_call: Option<u64>,
+    pub max_search_bytes_per_call: Option<u64>,
     pub max_search_calls: Option<u64>,
-    pub max_search_query_bytes: Option<u64>,
     pub max_search_results: Option<u64>,
+    pub max_view_files: Option<u64>,
+    pub max_view_entries: Option<u64>,
+    pub max_view_bytes: Option<u64>,
+    pub max_view_depth: Option<u64>,
 }
 
 impl AnalyzerLimits {
@@ -1145,9 +1145,13 @@ impl AnalyzerLimits {
             self.max_tool_calls,
             self.max_bytes_read,
             self.max_read_bytes_per_call,
+            self.max_search_bytes_per_call,
             self.max_search_calls,
-            self.max_search_query_bytes,
             self.max_search_results,
+            self.max_view_files,
+            self.max_view_entries,
+            self.max_view_bytes,
+            self.max_view_depth,
         ]
         .into_iter()
         .flatten()
@@ -1175,9 +1179,13 @@ impl AnalyzerLimits {
             ("max_tool_calls", self.max_tool_calls),
             ("max_bytes_read", self.max_bytes_read),
             ("max_read_bytes_per_call", self.max_read_bytes_per_call),
+            ("max_search_bytes_per_call", self.max_search_bytes_per_call),
             ("max_search_calls", self.max_search_calls),
-            ("max_search_query_bytes", self.max_search_query_bytes),
             ("max_search_results", self.max_search_results),
+            ("max_view_files", self.max_view_files),
+            ("max_view_entries", self.max_view_entries),
+            ("max_view_bytes", self.max_view_bytes),
+            ("max_view_depth", self.max_view_depth),
         ]
         .into_iter()
         .filter_map(|(name, value)| value.is_none().then_some(name))
@@ -1204,18 +1212,24 @@ impl AnalyzerLimits {
                 "Pi analyzer '{id}' max_read_bytes_per_call must not exceed max_bytes_read"
             ));
         }
-        let maximum_output = self.max_output_bytes.expect("checked above");
-        let maximum_read = self.max_read_bytes_per_call.expect("checked above");
-        let required_response = pi_encoded_response_upper_bound(maximum_read).ok_or_else(|| {
-            ConfigError::Invalid(format!(
-                "Pi analyzer '{id}' max_read_bytes_per_call is too large to bound a base64 response"
-            ))
-        })?;
-        if maximum_output < required_response {
+        if self.max_read_bytes_per_call.expect("checked above") > NATIVE_READ_MAX_BYTES {
             return invalid(format!(
-                "Pi analyzer '{id}' max_output_bytes must be at least {required_response} to contain a base64 response for max_read_bytes_per_call"
+                "Pi analyzer '{id}' max_read_bytes_per_call must not exceed the native read limit of {NATIVE_READ_MAX_BYTES}"
             ));
         }
+        if self.max_search_bytes_per_call.expect("checked above")
+            > self.max_bytes_read.expect("checked above")
+        {
+            return invalid(format!(
+                "Pi analyzer '{id}' max_search_bytes_per_call must not exceed max_bytes_read"
+            ));
+        }
+        if self.max_search_results.expect("checked above") > NATIVE_SEARCH_MAX_RESULTS {
+            return invalid(format!(
+                "Pi analyzer '{id}' max_search_results must not exceed the native schema limit of {NATIVE_SEARCH_MAX_RESULTS}"
+            ));
+        }
+        let maximum_output = self.max_output_bytes.expect("checked above");
         let extension_maximum = u64::try_from(EXTENSION_MAX_RESPONSE_BYTES).map_err(|_| {
             ConfigError::Invalid(
                 "trusted extension response limit exceeds the configuration integer range"
@@ -1229,17 +1243,6 @@ impl AnalyzerLimits {
         }
         Ok(())
     }
-}
-
-/// Base64 expands to four bytes per three input bytes. The fixed allowance
-/// covers the versioned JSON response envelope and numeric metadata. This is
-/// kept equal to the proxy's host-side reservation contract.
-fn pi_encoded_response_upper_bound(raw_bytes: u64) -> Option<u64> {
-    raw_bytes
-        .checked_add(2)
-        .and_then(|value| value.checked_div(3))
-        .and_then(|value| value.checked_mul(4))
-        .and_then(|value| value.checked_add(512))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1933,6 +1936,17 @@ path = "/srv/uploads"
         assert!(error.contains("idle_timeout_secs"));
 
         let mut config = pi_example();
+        config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .limits
+            .max_view_files = None;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("max_view_files"));
+
+        let mut config = pi_example();
         let AnalyzerKind::PiClassifier { pi, .. } = &mut config
             .analyzers
             .iter_mut()
@@ -1947,29 +1961,16 @@ path = "/srv/uploads"
     }
 
     #[test]
-    fn pi_output_budget_contains_maximum_base64_read_response() {
+    fn pi_output_budget_respects_the_shared_extension_ceiling() {
         let mut config = pi_example();
-        let limits = &mut config
+        config
             .analyzers
             .iter_mut()
             .find(|analyzer| analyzer.id == "publication-llm")
             .unwrap()
-            .limits;
-        limits.max_output_bytes = Some(1024 * 1024);
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("max_output_bytes must be at least"));
-
-        let mut config = pi_example();
-        let limits = &mut config
-            .analyzers
-            .iter_mut()
-            .find(|analyzer| analyzer.id == "publication-llm")
-            .unwrap()
-            .limits;
-        limits.max_bytes_read = Some(u64::MAX);
-        limits.max_read_bytes_per_call = Some(u64::MAX);
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("too large to bound a base64 response"));
+            .limits
+            .max_output_bytes = Some(64 * 1024);
+        config.validate().unwrap();
 
         let mut config = pi_example();
         let limits = &mut config
@@ -1986,6 +1987,90 @@ path = "/srv/uploads"
         );
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("must not exceed the trusted extension limit"));
+    }
+
+    #[test]
+    fn native_pi_contract_rejects_legacy_grant_and_search_query_limit() {
+        let old_grant = include_str!("../../docs/examples/active-authorization-v2.toml")
+            .replace("native-readonly-v1", "artifact-readonly-v1");
+        let config = parse(&old_grant).unwrap();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("requires tool_grant = 'native-readonly-v1'"));
+
+        let old_search_limit = include_str!("../../docs/examples/active-authorization-v2.toml")
+            .replace(
+                "max_search_calls = 100",
+                "max_search_calls = 100\nmax_search_query_bytes = 4096",
+            );
+        assert!(parse(&old_search_limit).is_err());
+    }
+
+    #[test]
+    fn native_pi_read_and_search_scan_caps_are_bounded() {
+        let mut config = pi_example();
+        let limits = &mut config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .limits;
+        limits.max_read_bytes_per_call = Some(NATIVE_READ_MAX_BYTES + 1);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("must not exceed the native read limit"));
+
+        let mut config = pi_example();
+        let limits = &mut config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .limits;
+        limits.max_search_bytes_per_call = limits.max_bytes_read.map(|value| value + 1);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("max_search_bytes_per_call must not exceed max_bytes_read"));
+
+        let mut config = pi_example();
+        config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .limits
+            .max_search_results = Some(1);
+        config.validate().unwrap();
+
+        let mut config = pi_example();
+        config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .limits
+            .max_search_results = Some(NATIVE_SEARCH_MAX_RESULTS + 1);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("must not exceed the native schema limit"));
+    }
+
+    #[test]
+    fn required_text_policy_uses_strict_byte_path_globs() {
+        let mut config = parse(MINIMAL).unwrap();
+        config.analyzers[0]
+            .content_applicability
+            .required_text_include = vec!["[".to_string()];
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("content_applicability.required_text_include"));
+
+        let old = MINIMAL.replace(
+            "rule_files = [\"/etc/file-guardian/rules.d/publication.toml\"]",
+            "rule_files = [\"/etc/file-guardian/rules.d/publication.toml\"]\n\n[analyzers.content_applicability]\ninvalid_utf8 = \"fail\"",
+        );
+        assert!(parse(&old).is_err());
     }
 
     #[test]

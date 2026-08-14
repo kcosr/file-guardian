@@ -27,11 +27,12 @@ caller-owned staging tree.
 - Compiled multi-stage pipelines with serial or bounded-parallel stage
   execution and deterministic aggregation.
 - Per-analyzer, byte-safe include/exclude selectors over immutable logical
-  paths, with explicit eligible/assigned/completed/excluded coverage.
+  paths, with explicit `eligible`, `assigned`, `completed`, and
+  `not_applicable` coverage.
 - Bounded projections of prior normalized observations for later stages.
-- Linux Pi classification through a required Bubblewrap sandbox, a private
-  bounded artifact proxy, strict terminal structured output, and a closed
-  administrator vocabulary.
+- Linux Pi classification through a required Bubblewrap sandbox, a generated
+  immutable text view, a private authenticated audit proxy, strict terminal
+  structured output, and a closed administrator vocabulary.
 - Strict schema-v2 configuration and action-free TOML rule files.
 - Policy bindings that resolve findings independently of rule detection.
 - Exactly one compact JSON report on stdout for a recognized authorization
@@ -183,10 +184,11 @@ bindings in the main configuration determine what a finding means for a
 profile, keeping detection reusable and policy resolution centralized. See the
 shipped [rule examples](config/rules.d/).
 
-Built-in content inspection fails closed by default when an assigned file is
-invalid UTF-8 or larger than its configured content ceiling. A configuration
-may explicitly make either case inapplicable; object read failures and digest
-or length disagreement are always errors.
+Built-in content inspection treats invalid UTF-8 or NUL-containing content as
+ordinary binary `not_applicable` coverage while still applying filename rules.
+Paths selected by `content_applicability.required_text_include` must be text.
+Valid oversized text, object read failures, and digest or length disagreement
+always fail closed.
 
 ### Pi runtime deployment
 
@@ -240,6 +242,25 @@ configuration root-owned and not owner-writable, then run File Guardian under a
 dedicated service UID. Preflight hashing and revalidation detect ordinary
 changes, but the current path-based reopen permits service-UID-owned assets and
 does not defend against hostile concurrent mutation by that same UID.
+
+The model sees a generated immutable, text-only `/input` view, never live
+staging or the object store. Pi's built-ins are disabled; the reviewed extension
+provides only `read`, `grep`, `find`, `ls`, `manifest_list`,
+`prior_observations`, and `submit_classification`. Paths are confined beneath
+`/input`; `grep` and `find` use pinned `rg`/`fd` with `--hidden --no-ignore`;
+every native call is bounded and recorded through the authenticated
+`file-guardian-pi-proxy/2` protocol. There is no model-callable bash, general
+subprocess, arbitrary-path or `/proc` reader, write, or edit capability.
+
+Binary assigned files are ordinary `not_applicable` Pi coverage and are omitted
+from `/input`. An all-binary Pi assignment completes without a classification
+and may allow only under the remaining complete policy; it is not positive
+approval of binary bytes. Configured required-text paths fail closed if binary;
+oversized text and immutable-object disagreement also fail closed. Archive
+inspection remains deferred: archive bytes receive no recursive treatment and
+normally behave as an ordinary binary physical file. Prior observations expose
+only bounded normalized findings/classifications—not clean-file output,
+content, matches, snippets, prompts, transcripts, or raw scanner output.
 
 Bubblewrap must be present at the configured absolute path and match its pinned
 version. File Guardian does not fall back to launching Pi directly. Because the

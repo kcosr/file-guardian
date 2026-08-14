@@ -15,7 +15,7 @@
           "eligible": 1,
           "assigned": 1,
           "completed": 1,
-          "excluded": 0,
+          "not_applicable": 0,
           "status": "complete"
         },
         {
@@ -24,7 +24,7 @@
           "eligible": 1,
           "assigned": 1,
           "completed": 1,
-          "excluded": 0,
+          "not_applicable": 0,
           "status": "complete"
         },
         {
@@ -33,7 +33,7 @@
           "eligible": 1,
           "assigned": 1,
           "completed": 1,
-          "excluded": 0,
+          "not_applicable": 0,
           "status": "complete"
         },
         {
@@ -42,7 +42,7 @@
           "eligible": 1,
           "assigned": 1,
           "completed": 1,
-          "excluded": 0,
+          "not_applicable": 0,
           "status": "complete"
         }
       ]

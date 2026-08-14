@@ -66,8 +66,7 @@ rule_files = ["/etc/file-guardian/rules.d/publication.toml"]
 max_content_bytes = 16777216
 
 [analyzers.content_applicability]
-invalid_utf8 = "fail"
-over_max_bytes = "fail"
+required_text_include = ["**/*.md", "**/*.rs", "**/*.toml"]
 
 [[analyzers]]
 id = "password-scanner"
@@ -81,7 +80,7 @@ sandbox = "required"
 [analyzers.selection]
 include = ["**"]
 exclude = ["**/vendor/**"]
-artifact_kinds = ["physical_file", "archive_member"]
+artifact_kinds = ["physical_file"]
 
 [analyzers.limits]
 wall_timeout_secs = 60
@@ -101,7 +100,7 @@ sandbox = "required"
 [analyzers.selection]
 include = ["**"]
 exclude = []
-artifact_kinds = ["physical_file", "archive_member"]
+artifact_kinds = ["physical_file"]
 
 [analyzers.limits]
 wall_timeout_secs = 90
@@ -135,7 +134,7 @@ instruction_file = "/etc/file-guardian/prompts/publication-review.md"
 trusted_extension = "/usr/libexec/file-guardian/pi-classifier-extension.js"
 isolated_agent_dir = "/etc/file-guardian/pi-agent"
 output_schema = "file-guardian-pi-classifier/1"
-tool_grant = "artifact-readonly-v1"
+tool_grant = "native-readonly-v1"
 
 [[analyzers.pi.credentials]]
 label = "internal-model-primary"
@@ -155,7 +154,10 @@ reason_codes = [
 [analyzers.selection]
 include = ["**"]
 exclude = ["**/vendor/**"]
-artifact_kinds = ["physical_file", "archive_member"]
+artifact_kinds = ["physical_file"]
+
+[analyzers.content_applicability]
+required_text_include = ["**/*.md", "**/*.rs", "**/*.toml"]
 
 [analyzers.limits]
 startup_timeout_secs = 20
@@ -173,9 +175,13 @@ max_findings = 1000
 max_tool_calls = 1000
 max_bytes_read = 268435456
 max_read_bytes_per_call = 1048576
+max_search_bytes_per_call = 67108864
 max_search_calls = 100
-max_search_query_bytes = 4096
 max_search_results = 1000
+max_view_files = 100000
+max_view_entries = 200000
+max_view_bytes = 268435456
+max_view_depth = 64
 
 [[policy_bindings]]
 id = "builtin-deny"

@@ -522,7 +522,6 @@ mod tests {
     use super::*;
     use crate::analyzers::{
         BuiltinAnalyzerLimits, BuiltinContentApplicability, BuiltinRulesAnalyzer,
-        UnsupportedContentPolicy,
     };
     use crate::domain::{ArtifactKind, FindingCategory, RuleId};
     use crate::pipeline::{
@@ -624,10 +623,7 @@ content_regex = "SECRET"
                 BuiltinAnalyzerLimits {
                     max_content_bytes: 1024,
                     max_findings: 100,
-                    content_applicability: BuiltinContentApplicability {
-                        invalid_utf8: UnsupportedContentPolicy::Fail,
-                        over_max_bytes: UnsupportedContentPolicy::Fail,
-                    },
+                    content_applicability: BuiltinContentApplicability::default(),
                 },
             )
             .unwrap(),
@@ -649,6 +645,26 @@ content_regex = "SECRET"
         assert_eq!(result.initial_manifest, result.final_manifest);
         assert!(!fixture.workspace_root.join("run_allow").exists());
         assert!(fixture.root.path().exists());
+    }
+
+    #[tokio::test]
+    async fn ordinary_binary_is_complete_not_applicable_and_allows() {
+        let fixture = Fixture::new();
+        fs::write(fixture.input.join("upload.bin"), [0xff, 0x00, 0xfe]).unwrap();
+
+        let result =
+            AuthorizationService::authorize(fixture.request("allow-binary", "builtin", builtin()))
+                .await;
+
+        assert_eq!(result.outcome, ServiceOutcome::Allow);
+        assert!(result.issues.is_empty());
+        assert!(result.observations.is_empty());
+        let coverage = &result.coverage.initial.analyzers[0];
+        assert!(coverage.is_complete());
+        assert_eq!(coverage.assigned, 1);
+        assert_eq!(coverage.completed, 0);
+        assert_eq!(coverage.not_applicable, 1);
+        assert!(!fixture.workspace_root.join("run_allow-binary").exists());
     }
 
     #[tokio::test]

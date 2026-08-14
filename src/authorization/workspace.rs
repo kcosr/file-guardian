@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -26,6 +26,7 @@ pub struct InvocationWorkspace {
     run_identity: FilesystemIdentity,
     layout_identities: Vec<FilesystemIdentity>,
     analyzer_views_dir: OwnedFd,
+    pub(super) analyzer_view_usage: Arc<Mutex<super::analyzer_view::AnalyzerViewUsage>>,
     objects: Arc<ObjectStore>,
 }
 
@@ -88,6 +89,9 @@ impl InvocationWorkspace {
                 run_identity,
                 layout_identities,
                 analyzer_views_dir,
+                analyzer_view_usage: Arc::new(Mutex::new(
+                    super::analyzer_view::AnalyzerViewUsage::default(),
+                )),
                 objects: Arc::new(ObjectStore {
                     object_dir,
                     tmp_dir,
@@ -107,6 +111,7 @@ impl InvocationWorkspace {
         &self.objects
     }
 
+    #[cfg(test)]
     pub(crate) fn objects_arc(&self) -> Arc<ObjectStore> {
         Arc::clone(&self.objects)
     }
@@ -119,14 +124,7 @@ impl InvocationWorkspace {
         &self,
         name: &str,
     ) -> Result<AnalyzerEndpointDirectory, WorkspaceError> {
-        if name.is_empty()
-            || name.len() > 128
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        {
-            return Err(WorkspaceError::InvalidEndpointName);
-        }
+        validate_analyzer_directory_name(name)?;
         fs::mkdirat(&self.analyzer_views_dir, name, Mode::from_raw_mode(0o700))
             .map_err(WorkspaceError::CreateAnalyzerEndpoint)?;
         let directory = fs::openat(
@@ -146,6 +144,27 @@ impl InvocationWorkspace {
         })
     }
 
+    pub(super) fn create_analyzer_view_directory(
+        &self,
+        name: &str,
+    ) -> Result<(PathBuf, OwnedFd), WorkspaceError> {
+        validate_analyzer_directory_name(name)?;
+        fs::mkdirat(&self.analyzer_views_dir, name, Mode::from_raw_mode(0o700))
+            .map_err(WorkspaceError::CreateAnalyzerView)?;
+        let directory = fs::openat(
+            &self.analyzer_views_dir,
+            name,
+            DIRECTORY_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(WorkspaceError::OpenAnalyzerView)?;
+        let stat = fs::fstat(&directory).map_err(WorkspaceError::InspectAnalyzerView)?;
+        if stat.st_uid != geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
+            return Err(WorkspaceError::InsecureAnalyzerView);
+        }
+        Ok((self.run_path.join("analyzer-views").join(name), directory))
+    }
+
     pub(super) fn contains_identity(&self, identity: FilesystemIdentity) -> bool {
         identity == self.root_identity
             || identity == self.run_identity
@@ -155,15 +174,29 @@ impl InvocationWorkspace {
     /// Deletes this invocation's private state. Secure erasure is not claimed.
     pub fn remove(mut self) -> Result<(), WorkspaceError> {
         let path = self.run_path.clone();
+        super::analyzer_view::make_tree_owner_writable(&path);
         std::fs::remove_dir_all(path).map_err(WorkspaceError::RemoveRun)?;
         self.cleanup_armed = false;
         Ok(())
     }
 }
 
+fn validate_analyzer_directory_name(name: &str) -> Result<(), WorkspaceError> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(WorkspaceError::InvalidEndpointName);
+    }
+    Ok(())
+}
+
 impl Drop for InvocationWorkspace {
     fn drop(&mut self) {
         if self.cleanup_armed {
+            super::analyzer_view::make_tree_owner_writable(&self.run_path);
             let _ = std::fs::remove_dir_all(&self.run_path);
         }
     }
@@ -392,6 +425,14 @@ pub enum WorkspaceError {
     RemoveAnalyzerSocket(rustix::io::Errno),
     #[error("could not remove private analyzer endpoint: {0}")]
     RemoveAnalyzerEndpoint(io::Error),
+    #[error("could not create private analyzer view: {0}")]
+    CreateAnalyzerView(rustix::io::Errno),
+    #[error("could not open private analyzer view: {0}")]
+    OpenAnalyzerView(rustix::io::Errno),
+    #[error("could not inspect private analyzer view: {0}")]
+    InspectAnalyzerView(rustix::io::Errno),
+    #[error("private analyzer view has insecure permissions or ownership")]
+    InsecureAnalyzerView,
     #[error("could not remove invocation workspace: {0}")]
     RemoveRun(io::Error),
     #[error("could not create temporary object: {0}")]

@@ -95,6 +95,16 @@ fn runtime_manifest_example_is_valid_json_with_canonical_placeholder_hashes() {
     assert_eq!(manifest["pi_version"], "0.83.0");
     let files = manifest["files"].as_array().expect("manifest file list");
     assert!(!files.is_empty());
+    let paths = files
+        .iter()
+        .map(|file| file["path"].as_str().expect("string path"))
+        .collect::<std::collections::BTreeSet<_>>();
+    for required in ["bin/node", "bin/rg", "bin/fd", "lib/pi/dist/cli.js"] {
+        assert!(
+            paths.contains(required),
+            "missing pinned runtime asset {required}"
+        );
+    }
     for file in files {
         let hash = file["sha256"].as_str().expect("string digest");
         assert_eq!(hash.len(), 64);

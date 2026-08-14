@@ -40,8 +40,7 @@ rule_files = ["/etc/file-guardian/rules.d/publication.toml"]
 max_content_bytes = 16777216
 
 [analyzers.content_applicability]
-invalid_utf8 = "fail"
-over_max_bytes = "fail"
+required_text_include = []
 
 [analyzers.selection]
 include = ["**"]

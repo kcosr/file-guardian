@@ -15,7 +15,7 @@
           "eligible": 0,
           "assigned": 0,
           "completed": 0,
-          "excluded": 0,
+          "not_applicable": 0,
           "status": "incomplete"
         }
       ]

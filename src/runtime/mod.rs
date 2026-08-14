@@ -18,13 +18,12 @@ use crate::analyzers::pi::runner::PiRunLimits;
 use crate::analyzers::pi::sandbox::{PiRuntimeSpec, PI_RUNTIME_CONTEXT_MODE};
 use crate::analyzers::pi::{PiClassifierAnalyzer, PiClassifierSpec};
 use crate::analyzers::{
-    BuiltinAnalyzerLimits, BuiltinContentApplicability, BuiltinRulesAnalyzer,
-    UnsupportedContentPolicy,
+    BuiltinAnalyzerLimits, BuiltinContentApplicability, BuiltinRulesAnalyzer, RequiredTextMatcher,
 };
-use crate::authorization::SnapshotInputKind;
+use crate::authorization::{AnalyzerViewLimits, AnalyzerViewQuota, SnapshotInputKind};
 use crate::config::{
-    ActionMode as ConfigActionMode, AnalyzerKind, ApplicabilityPolicy, ArtifactKindConfig,
-    ClassifierScope, Config, PriorObservations, StageExecution as ConfigStageExecution,
+    ActionMode as ConfigActionMode, AnalyzerKind, ArtifactKindConfig, ClassifierScope, Config,
+    ContentApplicabilityConfig, PriorObservations, StageExecution as ConfigStageExecution,
     UnboundObservation, SYNTHESIZED_POLICY_BINDING_PREFIX,
 };
 use crate::domain::{
@@ -91,6 +90,7 @@ pub fn compile_invocation(
             "apply authorization is not implemented".to_string(),
         ));
     }
+    let invocation_view_quota = compile_invocation_view_quota(config, selection.pipeline)?;
 
     let mut stages = Vec::with_capacity(selection.pipeline.stages.len());
     let mut known_rules = Vec::new();
@@ -112,7 +112,6 @@ pub fn compile_invocation(
                 AnalyzerKind::BuiltinRules {
                     rule_files,
                     max_content_bytes,
-                    content_applicability,
                 } => {
                     let rules = load_rule_files(rule_files)?;
                     known_rules.extend(rules.iter().map(|rule| (id.clone(), rule.name.clone())));
@@ -141,8 +140,10 @@ pub fn compile_invocation(
                             max_content_bytes: *max_content_bytes,
                             max_findings,
                             content_applicability: BuiltinContentApplicability {
-                                invalid_utf8: applicability(content_applicability.invalid_utf8),
-                                over_max_bytes: applicability(content_applicability.over_max_bytes),
+                                required_text: compile_required_text(
+                                    id,
+                                    &config_analyzer.content_applicability,
+                                )?,
                             },
                         },
                     )?)
@@ -165,7 +166,9 @@ pub fn compile_invocation(
                         run_id.clone(),
                         pi,
                         vocabulary,
+                        &config_analyzer.content_applicability,
                         &config_analyzer.limits,
+                        invocation_view_quota.expect("a selected Pi analyzer provides a quota"),
                     )?;
                     pi_identity_material.push((id.clone(), analyzer.identity()));
                     AnalyzerImplementation::Pi(Box::new(analyzer))
@@ -277,11 +280,64 @@ pub fn compile_invocation(
     })
 }
 
-fn applicability(value: ApplicabilityPolicy) -> UnsupportedContentPolicy {
-    match value {
-        ApplicabilityPolicy::Fail => UnsupportedContentPolicy::Fail,
-        ApplicabilityPolicy::Exclude => UnsupportedContentPolicy::Exclude,
+fn compile_required_text(
+    id: &str,
+    config: &ContentApplicabilityConfig,
+) -> Result<RequiredTextMatcher, RuntimeError> {
+    RequiredTextMatcher::compile(&config.required_text_include).map_err(|error| {
+        RuntimeError::Configuration(format!(
+            "analyzer '{id}' required-text policy could not be compiled: {error}"
+        ))
+    })
+}
+
+fn compile_invocation_view_quota(
+    config: &Config,
+    pipeline: &crate::config::PipelineConfig,
+) -> Result<Option<AnalyzerViewQuota>, RuntimeError> {
+    let mut invocation: Option<AnalyzerViewQuota> = None;
+    for analyzer_id in pipeline.stages.iter().flat_map(|stage| &stage.analyzers) {
+        let analyzer = config
+            .analyzer(analyzer_id)
+            .expect("validated analyzer reference");
+        if !matches!(&analyzer.kind, AnalyzerKind::PiClassifier { .. }) {
+            continue;
+        }
+        let quota = compile_view_quota(analyzer_id, &analyzer.limits)?;
+        invocation = Some(match invocation {
+            None => quota,
+            Some(current) => AnalyzerViewQuota {
+                max_files: current.max_files.max(quota.max_files),
+                max_entries: current.max_entries.max(quota.max_entries),
+                max_total_bytes: current.max_total_bytes.max(quota.max_total_bytes),
+                max_depth: current.max_depth.max(quota.max_depth),
+            },
+        });
     }
+    Ok(invocation)
+}
+
+fn compile_view_quota(
+    id: &str,
+    limits: &crate::config::AnalyzerLimits,
+) -> Result<AnalyzerViewQuota, RuntimeError> {
+    let required = |name: &str, value: Option<u64>| {
+        value.ok_or_else(|| {
+            RuntimeError::Configuration(format!("Pi analyzer '{id}' requires limit {name}"))
+        })
+    };
+    Ok(AnalyzerViewQuota {
+        max_files: required("max_view_files", limits.max_view_files)?,
+        max_entries: required("max_view_entries", limits.max_view_entries)?,
+        max_total_bytes: required("max_view_bytes", limits.max_view_bytes)?,
+        max_depth: usize::try_from(required("max_view_depth", limits.max_view_depth)?).map_err(
+            |_| {
+                RuntimeError::Configuration(format!(
+                    "Pi analyzer '{id}' max_view_depth exceeds this platform"
+                ))
+            },
+        )?,
+    })
 }
 
 fn compile_pi_analyzer(
@@ -289,7 +345,9 @@ fn compile_pi_analyzer(
     run_id: RunId,
     pi: &crate::config::PiConfig,
     vocabulary: &crate::config::VocabularyConfig,
+    content_applicability: &ContentApplicabilityConfig,
     limits: &crate::config::AnalyzerLimits,
+    invocation_view_quota: AnalyzerViewQuota,
 ) -> Result<PiClassifierAnalyzer, RuntimeError> {
     let required = |name: &str, value: Option<u64>| {
         value.ok_or_else(|| {
@@ -358,6 +416,8 @@ fn compile_pi_analyzer(
     .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
 
     let max_findings = required("max_findings", limits.max_findings)?;
+    let max_read_bytes_per_call =
+        required("max_read_bytes_per_call", limits.max_read_bytes_per_call)?;
     let wall = required("wall_timeout_secs", limits.wall_timeout_secs)?;
     let credentials = pi
         .credentials
@@ -382,6 +442,13 @@ fn compile_pi_analyzer(
         &pi.thinking,
         &pi.output_schema,
         &pi.tool_grant,
+        &content_applicability.required_text_include,
+        (
+            invocation_view_quota.max_files,
+            invocation_view_quota.max_entries,
+            invocation_view_quota.max_total_bytes,
+            invocation_view_quota.max_depth,
+        ),
         limits,
         &pi.expected_pi_version,
     ))?;
@@ -415,24 +482,24 @@ fn compile_pi_analyzer(
             checked_usize("max_findings", max_findings)?,
         )
         .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
+        max_search_results: required("max_search_results", limits.max_search_results)?,
+        required_text: compile_required_text(id.as_str(), content_applicability)?,
+        max_text_bytes: max_read_bytes_per_call,
+        view_limits: AnalyzerViewLimits {
+            per_view: compile_view_quota(id.as_str(), limits)?,
+            invocation: invocation_view_quota,
+        },
         proxy_limits: PiProxyLimits {
             max_frame_bytes: checked_usize("max_output_bytes", max_output)?,
             max_response_bytes: checked_usize("max_output_bytes", max_output)?,
             max_terminal_bytes: checked_usize("max_output_bytes", max_output)?,
             max_tool_calls: required("max_tool_calls", limits.max_tool_calls)?,
             max_bytes_read: required("max_bytes_read", limits.max_bytes_read)?,
-            max_read_bytes_per_call: required(
-                "max_read_bytes_per_call",
-                limits.max_read_bytes_per_call,
-            )?,
-            max_search_pattern_bytes: checked_usize(
-                "max_search_query_bytes",
-                required("max_search_query_bytes", limits.max_search_query_bytes)?,
-            )?,
+            max_read_bytes_per_call,
             max_search_matches: required("max_search_results", limits.max_search_results)?,
             max_search_bytes_per_call: required(
-                "max_read_bytes_per_call",
-                limits.max_read_bytes_per_call,
+                "max_search_bytes_per_call",
+                limits.max_search_bytes_per_call,
             )?,
             max_search_calls: required("max_search_calls", limits.max_search_calls)?,
             frame_read_timeout: Duration::from_secs(required(
@@ -929,6 +996,46 @@ directive = "deny"
         assert!(ids
             .iter()
             .all(|id| { id.starts_with(SYNTHESIZED_POLICY_BINDING_PREFIX) && id.len() <= 128 }));
+    }
+
+    #[test]
+    fn invocation_view_quota_is_component_wise_maximum_for_selected_pi_analyzers() {
+        let mut config: Config = toml::from_str(include_str!(
+            "../../docs/examples/active-authorization-v2.toml"
+        ))
+        .unwrap();
+        let pi_index = config
+            .analyzers
+            .iter()
+            .position(|analyzer| matches!(&analyzer.kind, AnalyzerKind::PiClassifier { .. }))
+            .unwrap();
+        let mut second = config.analyzers[pi_index].clone();
+        second.id = "publication-llm-secondary".to_string();
+
+        let first = &mut config.analyzers[pi_index].limits;
+        first.max_view_files = Some(10);
+        first.max_view_entries = Some(200);
+        first.max_view_bytes = Some(300);
+        first.max_view_depth = Some(4);
+        second.limits.max_view_files = Some(20);
+        second.limits.max_view_entries = Some(100);
+        second.limits.max_view_bytes = Some(400);
+        second.limits.max_view_depth = Some(3);
+        config.analyzers.push(second);
+        config.pipelines[0].stages[0]
+            .analyzers
+            .push("publication-llm-secondary".to_string());
+        let pipeline = config.pipelines[0].clone();
+
+        assert_eq!(
+            compile_invocation_view_quota(&config, &pipeline).unwrap(),
+            Some(AnalyzerViewQuota {
+                max_files: 20,
+                max_entries: 200,
+                max_total_bytes: 400,
+                max_depth: 4,
+            })
+        );
     }
 
     #[tokio::test]

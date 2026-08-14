@@ -12,37 +12,37 @@
         {
           "analyzer_id": "password-scanner",
           "phase": "initial",
-          "eligible": 0,
-          "assigned": 0,
-          "completed": 0,
-          "excluded": 0,
+          "eligible": 1,
+          "assigned": 1,
+          "completed": 1,
+          "not_applicable": 0,
           "status": "complete"
         },
         {
           "analyzer_id": "publication-llm",
           "phase": "initial",
-          "eligible": 0,
-          "assigned": 0,
+          "eligible": 1,
+          "assigned": 1,
           "completed": 0,
-          "excluded": 0,
+          "not_applicable": 1,
           "status": "complete"
         },
         {
           "analyzer_id": "publication-rules",
           "phase": "initial",
-          "eligible": 0,
-          "assigned": 0,
+          "eligible": 1,
+          "assigned": 1,
           "completed": 0,
-          "excluded": 0,
+          "not_applicable": 1,
           "status": "complete"
         },
         {
           "analyzer_id": "secret-scanner",
           "phase": "initial",
-          "eligible": 0,
-          "assigned": 0,
-          "completed": 0,
-          "excluded": 0,
+          "eligible": 1,
+          "assigned": 1,
+          "completed": 1,
+          "not_applicable": 0,
           "status": "complete"
         }
       ]
@@ -64,7 +64,18 @@
     "initial_manifest_identity": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
     "final_manifest_identity": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
   },
-  "artifacts": [],
+  "artifacts": [
+    {
+      "artifact_id": "a_01",
+      "subject_id": "subject_01",
+      "kind": "physical_file",
+      "relative_path": {
+        "segments": [{"encoding": "utf8", "value": "opaque.bin"}]
+      },
+      "byte_len": 4,
+      "content_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888"
+    }
+  ],
   "pipeline_runs": [
     {
       "phase": "initial",
@@ -78,8 +89,8 @@
   "actions": [],
   "issues": [],
   "statistics": {
-    "physical_artifacts": 0,
-    "logical_artifacts": 0,
+    "physical_artifacts": 1,
+    "logical_artifacts": 1,
     "observations": 0,
     "duration_ms": 1840
   }

@@ -225,7 +225,7 @@ joined with `/`, glob separators remain literal, and no lossy UTF-8 conversion
 is used. This permits wildcard selection of non-UTF-8 names without changing
 their identity. An artifact must match an include and no exclude; exclusions
 win. Artifacts outside the selected kinds or globs are outside the eligible set
-and do not increment `excluded`. The current capture creates
+and do not increment `not_applicable`. The current capture creates
 `physical_file` artifacts; `archive_member` selection becomes active with the
 archive phase.
 
@@ -244,18 +244,19 @@ and canonical serialized form. Overflow or serialization failure stops the
 stage as incomplete required analysis. The obsolete `all_summary` spelling is
 not accepted.
 
-Coverage records the inspection phase and eligible, assigned, completed, and
-excluded candidate counts. An analyzer's inability to inspect an assigned
-candidate is incomplete coverage, not an exclusion.
+Coverage records the inspection phase and `eligible`, `assigned`, `completed`,
+and `not_applicable` candidate counts. An analyzer's inability to inspect an
+assigned candidate is incomplete coverage, not non-applicability.
 
 The counters are disjoint: `completed` counts assigned artifacts the analyzer
-inspected, while `excluded` counts assigned artifacts made explicitly
-inapplicable by policy. `completed + excluded == assigned` is required for a
-`complete` analyzer row, but it is not sufficient: protocol, budget, tool, or
-other execution failures keep the analyzer and phase `incomplete` even when all
-assigned artifacts are arithmetically accounted for. A `complete` phase requires
-every analyzer row to be complete. Excluded artifacts never also increment
-`completed`.
+inspected, while `not_applicable` counts assigned artifacts made explicitly
+inapplicable by policy. `completed + not_applicable == assigned` is required
+for a `complete` analyzer row, but it is not sufficient: protocol, budget,
+tool, or other execution failures keep the analyzer and phase `incomplete`
+even when all assigned artifacts are arithmetically accounted for. A
+`complete` phase requires every analyzer row to be complete. Artifacts omitted
+by selectors remain outside the eligible set and never increment either
+accounting field.
 
 Pi and external-tool analyzer definitions are accepted by the strict parser so
 the end-state configuration has one shape. Pi has a Linux Bubblewrap runner;
@@ -271,12 +272,12 @@ reports binary, encoding, size, and read applicability explicitly. Existing
 rule-embedded `warn`, `remove`, and `recover` behavior is replaced in schema v2
 by normalized findings plus policy bindings.
 
-Invalid UTF-8 and content larger than `max_content_bytes` fail closed by
-default. A built-in analyzer may explicitly configure either condition as
-`exclude`; such an artifact is counted once in that analyzer's `excluded`
-coverage while its filename rules still run. This is intentional configured
-non-applicability, not a successful content inspection. Object read failures
-and manifest length or digest mismatches are always incomplete coverage.
+Invalid UTF-8 or any NUL byte makes an ordinary assigned file binary: it counts
+once as `not_applicable` for content inspection while filename rules still run.
+`content_applicability.required_text_include` is a byte-preserving glob list;
+a matching binary file is instead incomplete required analysis. Valid text
+larger than `max_content_bytes`, object read failures, and manifest length or
+digest mismatches always fail closed.
 
 ## Internal Pi classifier
 
@@ -309,21 +310,50 @@ fixed by configuration and incorporated into pipeline identity.
 
 ### Read-only tools
 
-The preferred runner exposes only host-controlled operations over assigned
-artifact IDs:
+Pi's built-ins remain disabled. The pinned File Guardian extension registers
+exactly seven sequential tools:
 
+- `read`
+- `grep`
+- `find`
+- `ls`
 - `manifest_list`
-- `artifact_metadata`
-- `artifact_read`
-- `artifact_read_range`
-- `artifact_search`
 - `prior_observations`
+- `submit_classification`
 
-Each operation is schema-validated, bounded, audited, and resolves immutable
-objects. Pi receives no write, rename, delete, quarantine, shell, subprocess,
-arbitrary-path read, credential, or File Guardian control capability. If a
-filesystem view is temporarily required, it is a generated read-only tree of
-opaque artifact IDs with enforced confinement.
+`read`, `grep`, `find`, and `ls` are custom implementations, not ambient Pi
+tools. They accept only normalized relative paths beneath a generated immutable
+text-only view mounted read-only at `/input`. Absolute paths, `..`, NUL, `~`,
+leading `@`, symlinks, special files, and canonicalization escapes fail the
+run. The sandbox exposes no model-callable `bash`, shell, general subprocess,
+write, edit, delete, quarantine, arbitrary host-path, `/proc`, credential, or
+File Guardian control tool.
+
+`read` and `ls` use bounded Node operations. `grep` and `find` execute only the
+manifest-pinned `/runtime/bin/rg` and `/runtime/bin/fd`, directly without a
+shell, with an empty helper environment and explicit `--hidden --no-ignore` so
+ignore files cannot hide assigned content. Native calls run sequentially and
+have closed parameter schemas, a 4,096-character path ceiling, a one-MiB file
+ceiling for `read`, a 64-KiB returned-output ceiling, bounded result counts,
+4-KiB helper diagnostic ceiling, and a ten-second helper deadline. Configured
+global/per-call read, search-scan, search-count, process-output, response, view
+file/entry/byte/depth, and wall-clock limits apply in addition; the extension
+rejects proxy responses larger than two MiB.
+
+Every native call is bracketed by authenticated `native_tool_begin` and
+`native_tool_end` records over `file-guardian-pi-proxy/2`. The host validates
+the presentation path against the materialized view, charges the exact file or
+directory operation to configured budgets, and accepts the tool result only
+when its path, call ID, result count, output bytes, and success state match. Any
+validation, helper, accounting, or proxy error permanently invalidates the run.
+
+`manifest_list` maps presentation paths to immutable artifact IDs.
+`prior_observations` returns only the compact, canonically ordered normalized
+projection selected for the stage: analyzer/rule/artifact identities,
+categories, severities, validated locations, classification codes/confidence,
+and safe reason codes as applicable. It never returns clean-file records,
+content, matched values, snippets, prompts, transcripts, or raw scanner output.
+Terminal classifications remain artifact-ID based.
 
 ### Instruction and output
 
@@ -351,10 +381,20 @@ output, invalid counts, inability to complete, timeout, process failure, or
 budget exhaustion make a required analyzer incomplete and produce exit `30`.
 
 The Pi process runs in a required OS sandbox. The Linux backend uses Bubblewrap
-and mounts neither live staging nor the invocation object store; artifact bytes
-are available only through a bounded File Guardian-owned Unix socket proxy in
-a private per-run endpoint directory. There is no unsandboxed fallback, and a
-selected Pi analyzer is unsupported on non-Linux platforms.
+and mounts neither live staging nor the invocation object store. Only verified
+UTF-8, NUL-free assigned files within the configured
+`max_read_bytes_per_call` ceiling (at most one MiB) are materialized into the
+read-only `/input` view; the proxy carries audit/control records and safe
+metadata/projections rather than file bytes. There is no unsandboxed fallback,
+and a selected Pi analyzer is unsupported on non-Linux platforms.
+
+Ordinary binary assignments count as complete `not_applicable` coverage and do
+not invoke Pi. When every assignment is binary, Pi completes without emitting a
+classification; a resulting allow depends on the remaining complete policy and
+does not mean the model approved binary content. A binary path selected by
+`content_applicability.required_text_include` fails required analysis instead.
+Recursive archive inspection is deferred: an archive is currently only an
+ordinary physical file and generally follows the binary rule above.
 
 An administrator prepares and protects the Pi runtime bundle, reviewed
 extension, instruction, and isolated agent configuration. The bundle manifest
@@ -386,19 +426,21 @@ The sandbox does not mount host `/lib`, `/usr`, or `/etc`. A runtime bundle
 that omits its loader, libraries, trust roots, resolver configuration, or any
 declared dependency cannot execute and fails authorization closed.
 
-The private proxy authenticates a run and accepts only versioned,
-schema-validated requests with monotonic request identities. It maps opaque
-candidate and artifact IDs to immutable objects and enforces configured tool
-calls, returned bytes, search matches, prior-observation size, and terminal
-output limits. It never accepts host paths. A terminal submission closes
-content access for that run.
+The private `file-guardian-pi-proxy/2` authenticates a run and accepts only
+versioned, schema-validated requests with monotonic request identities. It maps
+opaque artifact IDs and presentation paths to the frozen view and enforces
+configured tool calls, charged bytes, search calls/results, prior-observation
+size, and terminal output limits. It never accepts a host path. A terminal
+submission closes access for that run.
 
 The reviewed extension obtains the trusted host instruction through a private
 authenticated bootstrap proxy operation before the agent starts. That
 operation is not model-callable. The exact active model grant remains the seven
 tools listed above, including the terminal submission tool. `max_tool_calls`
-counts those model-callable operations; the runtime-ready and instruction
-bootstrap connections are separate mandatory protocol operations.
+charges one unit for each model-tool invocation. A native invocation uses two
+authenticated proxy connections for its begin/end pair; the connection ceiling
+accounts for that pair separately. Runtime-ready and instruction bootstrap are
+mandatory protocol operations outside the model-tool budget.
 
 After an authenticated tool, protocol, object-read, output, or budget error,
 the proxy permanently invalidates the run. A later well-formed terminal call
@@ -572,11 +614,12 @@ task completion order; every required failure yields `30`.
 ### Phase 3b: Pi classifier
 
 Implemented on Linux: Pi process lifecycle, Bubblewrap confinement, private
-read-only artifact tools, instruction/runtime identity, strict structured
-output, normalized classifications, and audit-only policy bindings.
+text-only input materialization, the seven custom native/host tools and v2 audit
+proxy, instruction/runtime identity, strict structured output, normalized
+classifications, and audit-only policy bindings.
 
-Gate: the approved internal model classifies a staged tree through read-only
-artifact capabilities; every required Pi failure yields `30`; audit
+Gate: the approved internal model classifies a staged tree through its confined
+immutable input view; every required Pi failure yields `30`; audit
 classifications cannot change the decision.
 
 ### Phase 4: Deterministic scanner adapters

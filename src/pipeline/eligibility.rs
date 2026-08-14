@@ -20,7 +20,8 @@ pub struct ArtifactAssignment {
 /// The complete, canonically ordered set of artifacts eligible for an analyzer.
 ///
 /// Artifacts outside the compiled selector are outside the eligible set. They
-/// are not analyzer exclusions and must not increment an `excluded` coverage
+/// are not analyzer applicability decisions and must not increment a
+/// `not_applicable` coverage
 /// counter.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArtifactSelection {

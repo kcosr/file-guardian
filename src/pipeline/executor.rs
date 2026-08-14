@@ -373,19 +373,10 @@ async fn execute_analyzer(
                 )
                 .await
             {
-                Ok(observations) => AnalyzerResult {
-                    observations,
+                Ok(result) => AnalyzerResult {
+                    observations: result.observations,
                     issues: Vec::new(),
-                    coverage: AnalyzerCoverage::new(
-                        analyzer_id.clone(),
-                        InspectionPhase::Initial,
-                        assigned,
-                        assigned,
-                        assigned,
-                        0,
-                        CoverageStatus::Complete,
-                    )
-                    .expect("complete Pi coverage is valid"),
+                    coverage: result.coverage,
                 },
                 Err(error) => AnalyzerResult {
                     observations: Vec::new(),
@@ -586,7 +577,33 @@ fn issue(
 fn pi_issue_code(error: &crate::analyzers::pi::PiClassifierError) -> IssueCode {
     use crate::analyzers::pi::proxy::PiProxyError;
     use crate::analyzers::pi::runner::{PiRunError, PiTimeoutKind};
+    use crate::analyzers::TextApplicabilityError;
+    use crate::authorization::AnalyzerViewError;
     match error {
+        crate::analyzers::pi::PiClassifierError::InvalidAssignment => {
+            IssueCode::InvalidAnalyzerOutput
+        }
+        crate::analyzers::pi::PiClassifierError::Applicability(
+            TextApplicabilityError::ObjectUnavailable
+            | TextApplicabilityError::ObjectReadFailed
+            | TextApplicabilityError::ObjectIdentityMismatch,
+        ) => IssueCode::AnalyzerFailure,
+        crate::analyzers::pi::PiClassifierError::Applicability(
+            TextApplicabilityError::RequiredTextBinaryContent,
+        ) => IssueCode::InvalidAnalyzerOutput,
+        crate::analyzers::pi::PiClassifierError::Applicability(
+            TextApplicabilityError::TextLimitExceeded,
+        ) => IssueCode::SizeLimitExceeded,
+        crate::analyzers::pi::PiClassifierError::View(
+            AnalyzerViewError::ViewQuotaExceeded
+            | AnalyzerViewError::InvocationQuotaExceeded
+            | AnalyzerViewError::QuotaOverflow
+            | AnalyzerViewError::ViewDepthLimitExceeded,
+        ) => IssueCode::RequiredAnalyzerBudgetExceeded,
+        crate::analyzers::pi::PiClassifierError::View(_) => IssueCode::AnalyzerFailure,
+        crate::analyzers::pi::PiClassifierError::PreparationTask => {
+            IssueCode::RequiredAnalyzerProcessFailure
+        }
         crate::analyzers::pi::PiClassifierError::Runner(PiRunError::Timeout(
             PiTimeoutKind::Startup | PiTimeoutKind::Idle | PiTimeoutKind::Wall,
         )) => IssueCode::RequiredAnalyzerTimeout,
@@ -611,6 +628,38 @@ fn pi_issue_code(error: &crate::analyzers::pi::PiClassifierError) -> IssueCode {
 }
 
 fn pi_issue_message(error: &crate::analyzers::pi::PiClassifierError) -> &'static str {
+    use crate::analyzers::TextApplicabilityError;
+    use crate::authorization::AnalyzerViewError;
+    match error {
+        crate::analyzers::pi::PiClassifierError::InvalidAssignment => {
+            return "Pi analyzer assignment does not match the immutable manifest";
+        }
+        crate::analyzers::pi::PiClassifierError::Applicability(
+            TextApplicabilityError::ObjectUnavailable | TextApplicabilityError::ObjectReadFailed,
+        ) => return "Pi analyzer could not read an immutable object",
+        crate::analyzers::pi::PiClassifierError::Applicability(
+            TextApplicabilityError::ObjectIdentityMismatch,
+        ) => return "immutable object does not match its manifest identity",
+        crate::analyzers::pi::PiClassifierError::Applicability(
+            TextApplicabilityError::RequiredTextBinaryContent,
+        ) => return "required text artifact was classified as binary content",
+        crate::analyzers::pi::PiClassifierError::Applicability(
+            TextApplicabilityError::TextLimitExceeded,
+        ) => return "text artifact exceeds the Pi content inspection limit",
+        crate::analyzers::pi::PiClassifierError::View(
+            AnalyzerViewError::ViewQuotaExceeded
+            | AnalyzerViewError::InvocationQuotaExceeded
+            | AnalyzerViewError::QuotaOverflow
+            | AnalyzerViewError::ViewDepthLimitExceeded,
+        ) => return "Pi analyzer input view exceeds its configured limit",
+        crate::analyzers::pi::PiClassifierError::View(_) => {
+            return "Pi analyzer input view could not be materialized";
+        }
+        crate::analyzers::pi::PiClassifierError::PreparationTask => {
+            return "Pi analyzer input preparation did not complete";
+        }
+        _ => {}
+    }
     match pi_issue_code(error) {
         IssueCode::RequiredAnalyzerTimeout => "required Pi analyzer exceeded a time budget",
         IssueCode::RequiredAnalyzerBudgetExceeded => {

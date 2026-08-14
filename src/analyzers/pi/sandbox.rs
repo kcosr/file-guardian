@@ -1,3 +1,4 @@
+use super::proxy::NATIVE_SEARCH_MAX_RESULTS;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +15,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 pub(crate) const SANDBOX_PROXY_SOCKET: &str = "/run/file-guardian/proxy.sock";
-pub(crate) const PI_TOOLS: &str = "manifest_list,artifact_metadata,artifact_read,artifact_read_range,artifact_search,prior_observations,submit_classification";
+pub(crate) const PI_TOOLS: &str =
+    "read,grep,find,ls,manifest_list,prior_observations,submit_classification";
 /// Pi's `--mode` controls serialized stdout, independently of the extension
 /// context mode selected by `--print`.
 pub(crate) const PI_CLI_OUTPUT_MODE: &str = "text";
@@ -202,6 +204,8 @@ pub(crate) struct SandboxInvocation<'a> {
     pub model: &'a str,
     pub thinking: &'a str,
     pub proxy_endpoint_dir: &'a Path,
+    pub analyzer_input_view: &'a Path,
+    pub max_search_results: u64,
     pub proxy_token: &'a str,
     pub analyzer_id: &'a str,
     pub run_id: &'a str,
@@ -216,8 +220,11 @@ pub(crate) fn compile_sandbox_command(
     debug_assert_eq!(PI_RUNTIME_CONTEXT_MODE, "print");
     runtime.revalidate()?;
     validate_proxy_dir(invocation.proxy_endpoint_dir)?;
+    validate_input_view(invocation.analyzer_input_view)?;
+    validate_max_search_results(invocation.max_search_results)?;
     let mut environment = vec![
         (OsString::from("HOME"), OsString::from("/home/pi")),
+        (OsString::from("PATH"), OsString::from("/runtime/bin")),
         (OsString::from("TMPDIR"), OsString::from("/tmp")),
         (
             OsString::from("PI_CODING_AGENT_DIR"),
@@ -244,6 +251,10 @@ pub(crate) fn compile_sandbox_command(
         (
             OsString::from("FILE_GUARDIAN_PI_MANIFEST_IDENTITY"),
             OsString::from(invocation.manifest_identity),
+        ),
+        (
+            OsString::from("FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS"),
+            OsString::from(invocation.max_search_results.to_string()),
         ),
     ];
     let mut names = environment
@@ -280,6 +291,8 @@ pub(crate) fn compile_sandbox_command(
         "--dir",
         "/config",
         "--dir",
+        "/input",
+        "--dir",
         "/etc",
         "--dir",
         "/etc/ssl",
@@ -294,11 +307,7 @@ pub(crate) fn compile_sandbox_command(
         "--dir",
         "/home/pi",
         "--dir",
-        "/work",
-        "--dir",
         "/tmp",
-        "--proc",
-        "/proc",
         "--dev",
         "/dev",
         "--ro-bind",
@@ -334,7 +343,13 @@ pub(crate) fn compile_sandbox_command(
         invocation.proxy_endpoint_dir,
         Path::new("/run/file-guardian"),
     );
-    arguments.extend(os_args(&["--chdir", "/work", "--"]));
+    arguments.push(OsString::from("--ro-bind"));
+    push_pair(
+        &mut arguments,
+        invocation.analyzer_input_view,
+        Path::new("/input"),
+    );
+    arguments.extend(os_args(&["--chdir", "/input", "--"]));
     arguments.push(sandbox_runtime_path(&spec.launcher)?);
     arguments.push(sandbox_runtime_path(&spec.pi_entrypoint)?);
     arguments.extend(os_args(&[
@@ -439,6 +454,8 @@ fn verify_runtime_manifest(
     if !declared.get(launcher).is_some_and(|entry| entry.executable)
         || !declared.contains_key(entrypoint)
         || [
+            "bin/rg",
+            "bin/fd",
             "etc/resolv.conf",
             "etc/hosts",
             "etc/nsswitch.conf",
@@ -446,6 +463,12 @@ fn verify_runtime_manifest(
         ]
         .iter()
         .any(|path| !declared.contains_key(Path::new(path)))
+        || !declared
+            .get(Path::new("bin/rg"))
+            .is_some_and(|entry| entry.executable)
+        || !declared
+            .get(Path::new("bin/fd"))
+            .is_some_and(|entry| entry.executable)
     {
         return Err(PiSandboxError::InvalidRuntime);
     }
@@ -474,6 +497,38 @@ fn validate_proxy_dir(path: &Path) -> Result<(), PiSandboxError> {
     Ok(())
 }
 
+fn validate_input_view(path: &Path) -> Result<(), PiSandboxError> {
+    if !path.is_absolute() {
+        return Err(PiSandboxError::InvalidRuntime);
+    }
+    let current_uid = rustix::process::geteuid().as_raw();
+    let mut pending = vec![path.to_owned()];
+    while let Some(entry_path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&entry_path).map_err(invalid_io)?;
+        if metadata.file_type().is_symlink()
+            || metadata.uid() != current_uid
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(PiSandboxError::InvalidRuntime);
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&entry_path).map_err(invalid_io)? {
+                pending.push(entry.map_err(invalid_io)?.path());
+            }
+        } else if !metadata.is_file() || metadata.nlink() != 1 {
+            return Err(PiSandboxError::InvalidRuntime);
+        }
+    }
+    Ok(())
+}
+
+fn validate_max_search_results(value: u64) -> Result<(), PiSandboxError> {
+    if value == 0 || value > NATIVE_SEARCH_MAX_RESULTS {
+        return Err(PiSandboxError::InvalidRuntime);
+    }
+    Ok(())
+}
+
 fn validate_environment(
     name: &OsStr,
     value: &OsStr,
@@ -495,6 +550,7 @@ fn validate_environment(
         "FILE_GUARDIAN_PI_ANALYZER_ID",
         "FILE_GUARDIAN_PI_RUN_ID",
         "FILE_GUARDIAN_PI_MANIFEST_IDENTITY",
+        "FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS",
     ];
     if name.is_empty()
         || !name
@@ -724,6 +780,7 @@ mod tests {
         _root: TempDir,
         spec: PiRuntimeSpec,
         proxy: PathBuf,
+        input: PathBuf,
         _socket: UnixListener,
     }
 
@@ -747,12 +804,15 @@ mod tests {
                 runtime.join("etc/ssl/certs"),
                 root.path().join("config"),
                 root.path().join("proxy"),
+                root.path().join("input"),
             ] {
                 fs::create_dir_all(&directory).unwrap();
                 fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
             }
             let files = [
                 ("bin/node", b"static-node".as_slice(), true),
+                ("bin/rg", b"static-ripgrep", true),
+                ("bin/fd", b"static-fd", true),
                 ("lib/pi/dist/cli.js", b"pi-entrypoint", false),
                 ("etc/resolv.conf", b"nameserver 127.0.0.1\n", false),
                 ("etc/hosts", b"127.0.0.1 localhost\n", false),
@@ -800,6 +860,10 @@ mod tests {
             let proxy = root.path().join("proxy");
             fs::set_permissions(&proxy, fs::Permissions::from_mode(0o700)).unwrap();
             let socket = UnixListener::bind(proxy.join("proxy.sock")).unwrap();
+            let input = root.path().join("input");
+            let input_file = input.join("artifact.txt");
+            fs::write(&input_file, b"immutable artifact").unwrap();
+            fs::set_permissions(&input_file, fs::Permissions::from_mode(0o600)).unwrap();
             Self {
                 spec: PiRuntimeSpec {
                     bubblewrap_executable: bwrap,
@@ -814,6 +878,7 @@ mod tests {
                     isolated_agent_dir: root.path().join("config"),
                 },
                 proxy,
+                input,
                 _socket: socket,
                 _root: root,
             }
@@ -894,6 +959,58 @@ mod tests {
     }
 
     #[test]
+    fn analyzer_input_view_must_be_private_real_and_unlinked() {
+        let relative = Path::new("relative-input");
+        assert_eq!(
+            validate_input_view(relative),
+            Err(PiSandboxError::InvalidRuntime)
+        );
+
+        let fixture = Fixture::new();
+        assert_eq!(validate_input_view(&fixture.input), Ok(()));
+
+        fs::set_permissions(&fixture.input, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            validate_input_view(&fixture.input),
+            Err(PiSandboxError::InvalidRuntime)
+        );
+        fs::set_permissions(&fixture.input, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let original = fixture.input.join("artifact.txt");
+        let hardlink = fixture.input.join("hardlink.txt");
+        fs::hard_link(&original, &hardlink).unwrap();
+        assert_eq!(
+            validate_input_view(&fixture.input),
+            Err(PiSandboxError::InvalidRuntime)
+        );
+        fs::remove_file(hardlink).unwrap();
+
+        let symlink_path = fixture.input.join("symlink.txt");
+        symlink(&original, &symlink_path).unwrap();
+        assert_eq!(
+            validate_input_view(&fixture.input),
+            Err(PiSandboxError::InvalidRuntime)
+        );
+    }
+
+    #[test]
+    fn search_result_limit_must_fit_extension_schema() {
+        assert_eq!(validate_max_search_results(1), Ok(()));
+        assert_eq!(
+            validate_max_search_results(NATIVE_SEARCH_MAX_RESULTS),
+            Ok(())
+        );
+        assert_eq!(
+            validate_max_search_results(0),
+            Err(PiSandboxError::InvalidRuntime)
+        );
+        assert_eq!(
+            validate_max_search_results(NATIVE_SEARCH_MAX_RESULTS + 1),
+            Err(PiSandboxError::InvalidRuntime)
+        );
+    }
+
+    #[test]
     fn manifest_pinned_bundle_compiles_exact_confinement_command() {
         let fixture = Fixture::new();
         let prepared = fixture.prepare();
@@ -906,6 +1023,8 @@ mod tests {
                 model: "classified-model",
                 thinking: "high",
                 proxy_endpoint_dir: &fixture.proxy,
+                analyzer_input_view: &fixture.input,
+                max_search_results: 37,
                 proxy_token: "token",
                 analyzer_id: "semantic",
                 run_id: "run-1",
@@ -929,7 +1048,6 @@ mod tests {
             "--new-session",
             "--cap-drop",
             "--tmpfs",
-            "--proc",
             "--dev",
             "/runtime/bin/node",
             "/runtime/lib/pi/dist/cli.js",
@@ -953,6 +1071,12 @@ mod tests {
             );
         }
         assert!(!args.iter().any(|value| value == "--system-prompt"));
+        assert!(!args
+            .iter()
+            .any(|value| value == "--proc" || value == "/proc"));
+        assert!(args
+            .windows(2)
+            .any(|values| values == ["--chdir", "/input"]));
         assert!(args
             .windows(2)
             .any(|values| values == ["--mode", PI_CLI_OUTPUT_MODE]));
@@ -967,6 +1091,7 @@ mod tests {
             "/runtime",
             "/policy/file-guardian-extension.js",
             "/config",
+            "/input",
             "/run/file-guardian",
             "/etc/resolv.conf",
             "/etc/hosts",
@@ -983,6 +1108,10 @@ mod tests {
             .filter(|values| values[0] == "--ro-bind")
             .map(|values| (values[1].clone(), values[2].clone()))
             .collect::<BTreeSet<_>>();
+        assert!(!actual_mounts.iter().any(|(source, _)| {
+            Path::new(source) == fixture._root.path()
+                || Path::new(source) == fixture.input.parent().unwrap()
+        }));
         let expected_mounts = [
             (fixture.spec.runtime_root.clone(), PathBuf::from("/runtime")),
             (
@@ -1013,6 +1142,7 @@ mod tests {
                 PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
             ),
             (fixture.proxy.clone(), PathBuf::from("/run/file-guardian")),
+            (fixture.input.clone(), PathBuf::from("/input")),
         ]
         .into_iter()
         .map(|(source, target)| {
@@ -1023,6 +1153,11 @@ mod tests {
         })
         .collect::<BTreeSet<_>>();
         assert_eq!(actual_mounts, expected_mounts);
+        let debug = format!("{command:?}");
+        assert!(!args
+            .iter()
+            .any(|value| value.contains("secret") || value.contains("token")));
+        assert!(!debug.contains("secret") && !debug.contains("token"));
         let names = command
             .environment
             .iter()
@@ -1030,6 +1165,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         for name in [
             "HOME",
+            "PATH",
             "TMPDIR",
             "PI_CODING_AGENT_DIR",
             "PI_OFFLINE",
@@ -1039,13 +1175,30 @@ mod tests {
             "FILE_GUARDIAN_PI_ANALYZER_ID",
             "FILE_GUARDIAN_PI_RUN_ID",
             "FILE_GUARDIAN_PI_MANIFEST_IDENTITY",
+            "FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS",
             "INTERNAL_API_KEY",
         ] {
             assert!(names.contains(name));
         }
-        for forbidden in ["PATH", "NODE_PATH", "NODE_OPTIONS"] {
+        for forbidden in ["NODE_PATH", "NODE_OPTIONS"] {
             assert!(!names.contains(forbidden));
         }
+        assert_eq!(
+            command
+                .environment
+                .iter()
+                .find(|(name, _)| name == "PATH")
+                .map(|(_, value)| value),
+            Some(&OsString::from("/runtime/bin"))
+        );
+        assert_eq!(
+            command
+                .environment
+                .iter()
+                .find(|(name, _)| name == "FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS")
+                .map(|(_, value)| value),
+            Some(&OsString::from("37"))
+        );
     }
 
     #[test]
@@ -1128,6 +1281,18 @@ mod tests {
         )
         .unwrap();
         assert!(PreparedPiRuntime::prepare(wrong_mode.spec).is_err());
+
+        let missing_helper = Fixture::new();
+        fs::remove_file(missing_helper.spec.runtime_root.join("bin/rg")).unwrap();
+        assert!(PreparedPiRuntime::prepare(missing_helper.spec).is_err());
+
+        let non_executable_helper = Fixture::new();
+        fs::set_permissions(
+            non_executable_helper.spec.runtime_root.join("bin/fd"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(PreparedPiRuntime::prepare(non_executable_helper.spec).is_err());
     }
 
     #[tokio::test]

@@ -17,12 +17,22 @@ tool requests and responses, transport credentials, proxy token/socket, and
 Pi stdout/stderr are not copied into the authorization report.
 
 Automated tests use fake processes and synthetic artifacts and do not contact a
-model. Live acceptance is deliberately operator opt-in: prepare the pinned
-runtime bundle and approved provider configuration, supply only synthetic
-sensitive content unless a protected fixture is intentional, invoke the normal
-`authorize` command, and require matching exit/report status. A live pass tests
-that configured integration and scenario; it does not promote Pi from
-audit-only or establish the model as a filesystem security boundary.
+model. Live acceptance is deliberately operator opt-in. Build the release
+binary, prepare the pinned runtime bundle and approved provider configuration,
+and use synthetic sensitive content unless a protected fixture is intentional:
+
+```bash
+export FILE_GUARDIAN_PI_LIVE_CONFIG=/absolute/path/to/config.toml
+export FILE_GUARDIAN_PI_LIVE_INPUT=/absolute/path/to/private-synthetic-staging
+export FILE_GUARDIAN_BIN=target/release/file-guardian
+tests/pi_live_acceptance.sh
+```
+
+The executable script contacts the configured model, requires one schema-valid
+allow report with matching exit status, checks that stdout omits the staging
+path, and verifies the input remains unchanged. It is not part of `cargo test`.
+A live pass tests that configured integration and scenario; it does not promote
+Pi from audit-only or establish the model as a filesystem security boundary.
 
 [`runtime-manifest.example.json`](runtime-manifest.example.json) illustrates
 the strict runtime-manifest shape. Its hashes are placeholders, and a real
@@ -31,4 +41,6 @@ manifest itself. The `executable` flag must match file mode. In addition to the
 shown categories, include every Pi/Node dependency and shared library actually
 needed by the selected platform. The Node ELF interpreter and runtime search
 path must resolve below sandbox `/runtime`; the example is not a ready-to-run
-bundle.
+bundle. `bin/rg` and `bin/fd` are mandatory manifest-pinned helpers used by the
+custom `grep` and `find` tools; they run without a shell, without an inherited
+environment, and with ignore processing disabled.

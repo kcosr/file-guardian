@@ -6,14 +6,24 @@ pub(crate) mod runner;
 pub(crate) mod sandbox;
 
 use self::protocol::{ClassificationVocabulary, TerminalValidationLimits};
-use self::proxy::{ExpectedPiRuntime, PiProxy, PiProxyInput, PiProxyLimits};
+use self::proxy::{
+    ExpectedPiRuntime, PiProxy, PiProxyInput, PiProxyLimits, NATIVE_SEARCH_MAX_RESULTS,
+};
 use self::runner::{PiInvocationSpec, PiRunError, PiRunLimits, PiRunSignals, PiRunner};
 #[cfg(test)]
 use self::sandbox::PI_RUNTIME_CONTEXT_MODE;
 use self::sandbox::{PiRuntimeSpec, PreparedPiRuntime};
-use crate::authorization::InvocationWorkspace;
+use crate::analyzers::{
+    assess_text_artifact, RequiredTextMatcher, TextApplicabilityError, TextArtifactDisposition,
+};
+#[cfg(test)]
+use crate::authorization::AnalyzerViewQuota;
+use crate::authorization::{
+    AnalyzerView, AnalyzerViewBuilder, AnalyzerViewError, AnalyzerViewLimits, InvocationWorkspace,
+};
 use crate::domain::{
-    AnalyzerId, ArtifactManifest, Digest, InspectionPhase, NormalizedObservation, RunId,
+    AnalyzerCoverage, AnalyzerId, ArtifactManifest, CoverageStatus, Digest, InspectionPhase,
+    NormalizedObservation, RunId,
 };
 use crate::pipeline::{ArtifactAssignment, PriorObservationProjection};
 use std::ffi::OsString;
@@ -95,6 +105,10 @@ pub struct PiClassifierAnalyzer {
     terminal_limits: TerminalValidationLimits,
     proxy_limits: PiProxyLimits,
     run_limits: PiRunLimits,
+    max_search_results: u64,
+    required_text: RequiredTextMatcher,
+    max_text_bytes: u64,
+    view_limits: AnalyzerViewLimits,
     credential_environment: Arc<Vec<(OsString, OsString)>>,
     identity: Digest,
 }
@@ -113,6 +127,7 @@ type FakePiFuture = Pin<Box<dyn Future<Output = Result<(), PiRunError>> + Send>>
 #[derive(Clone)]
 struct FakePiInvocation {
     socket_path: std::path::PathBuf,
+    input_view: std::path::PathBuf,
     token: String,
     run_id: RunId,
     analyzer_id: AnalyzerId,
@@ -147,12 +162,22 @@ pub(crate) struct PiClassifierSpec {
     pub terminal_limits: TerminalValidationLimits,
     pub proxy_limits: PiProxyLimits,
     pub run_limits: PiRunLimits,
+    pub max_search_results: u64,
+    pub required_text: RequiredTextMatcher,
+    pub max_text_bytes: u64,
+    pub view_limits: AnalyzerViewLimits,
     pub credential_environment: Vec<(OsString, OsString)>,
     pub identity_material: Vec<u8>,
 }
 
 impl PiClassifierAnalyzer {
     pub(crate) fn compile(spec: PiClassifierSpec) -> Result<Self, PiClassifierCompileError> {
+        if spec.max_search_results == 0
+            || spec.max_search_results > NATIVE_SEARCH_MAX_RESULTS
+            || spec.max_search_results != spec.proxy_limits.max_search_matches
+        {
+            return Err(PiClassifierCompileError::InconsistentSearchLimits);
+        }
         let runtime = PreparedPiRuntime::prepare(spec.runtime)?;
         let mut identity_material = spec.identity_material;
         identity_material.extend_from_slice(&runtime.identity());
@@ -168,6 +193,10 @@ impl PiClassifierAnalyzer {
             terminal_limits: spec.terminal_limits,
             proxy_limits: spec.proxy_limits,
             run_limits: spec.run_limits,
+            max_search_results: spec.max_search_results,
+            required_text: spec.required_text,
+            max_text_bytes: spec.max_text_bytes,
+            view_limits: spec.view_limits,
             credential_environment: Arc::new(spec.credential_environment),
             identity,
         })
@@ -183,7 +212,75 @@ impl PiClassifierAnalyzer {
         assignments: Vec<ArtifactAssignment>,
         workspace: Arc<InvocationWorkspace>,
         prior: Arc<PriorObservationProjection>,
-    ) -> Result<Vec<NormalizedObservation>, PiClassifierError> {
+    ) -> Result<PiClassifierResult, PiClassifierError> {
+        let assigned =
+            u64::try_from(assignments.len()).map_err(|_| PiClassifierError::PreparationTask)?;
+        let manifest_for_preparation = Arc::clone(&manifest);
+        let workspace_for_preparation = Arc::clone(&workspace);
+        let required_text = self.required_text.clone();
+        let max_text_bytes = self.max_text_bytes;
+        let view_limits = self.view_limits;
+        let view_digest = Digest::sha256(self.id.as_str()).to_string();
+        let view_name = format!(
+            "pi-{}",
+            view_digest
+                .strip_prefix("sha256:")
+                .expect("Digest display has a fixed algorithm prefix")
+        );
+        let prepared = tokio::task::spawn_blocking(move || -> Result<_, PiClassifierError> {
+            let mut applicable = Vec::with_capacity(assignments.len());
+            let mut not_applicable = 0_u64;
+            for assignment in assignments {
+                let artifact = manifest_for_preparation
+                    .artifact(&assignment.artifact_id)
+                    .ok_or(PiClassifierError::InvalidAssignment)?;
+                match assess_text_artifact(
+                    artifact,
+                    workspace_for_preparation.objects(),
+                    max_text_bytes,
+                    &required_text,
+                )? {
+                    TextArtifactDisposition::Text(_) => applicable.push(assignment),
+                    TextArtifactDisposition::NotApplicableBinary => {
+                        not_applicable = not_applicable
+                            .checked_add(1)
+                            .ok_or(PiClassifierError::PreparationTask)?;
+                    }
+                }
+            }
+            if applicable.is_empty() {
+                return Ok(PreparedPiAssignments::AllNotApplicable { not_applicable });
+            }
+            let view = AnalyzerViewBuilder::new(
+                &workspace_for_preparation,
+                &manifest_for_preparation,
+                &applicable,
+                view_limits,
+            )
+            .materialize(&view_name)?;
+            Ok(PreparedPiAssignments::Applicable {
+                assignments: applicable,
+                not_applicable,
+                view: Arc::new(view),
+            })
+        })
+        .await
+        .map_err(|_| PiClassifierError::PreparationTask)??;
+        let (assignments, not_applicable, view) = match prepared {
+            PreparedPiAssignments::AllNotApplicable { not_applicable } => {
+                return Ok(PiClassifierResult {
+                    observations: Vec::new(),
+                    coverage: complete_coverage(self.id.clone(), assigned, 0, not_applicable),
+                });
+            }
+            PreparedPiAssignments::Applicable {
+                assignments,
+                not_applicable,
+                view,
+            } => (assignments, not_applicable, view),
+        };
+        let completed =
+            u64::try_from(assignments.len()).map_err(|_| PiClassifierError::PreparationTask)?;
         let proxy = PiProxy::start(
             &workspace,
             PiProxyInput {
@@ -191,7 +288,7 @@ impl PiClassifierAnalyzer {
                 analyzer_id: self.id.clone(),
                 manifest: Arc::clone(&manifest),
                 assignments,
-                objects: workspace.objects_arc(),
+                view: Arc::clone(&view),
                 prior_observations: prior,
                 instruction: Arc::clone(&self.instruction),
                 expected_runtime: self.expected_runtime.clone(),
@@ -211,12 +308,14 @@ impl PiClassifierAnalyzer {
             model: &self.expected_runtime.model,
             thinking: &self.expected_runtime.thinking,
             proxy_endpoint_dir: &endpoint_dir,
+            analyzer_input_view: view.host_path(),
             proxy_token: &token,
             analyzer_id: self.id.as_str(),
             run_id: self.run_id.as_str(),
             manifest_identity: &manifest_identity,
             credential_environment: &self.credential_environment,
             fixed_task: FIXED_TASK,
+            max_search_results: self.max_search_results,
             limits: self.run_limits.clone(),
             signals: bridge.take_signals(),
         };
@@ -226,6 +325,7 @@ impl PiClassifierAnalyzer {
             PiRunnerBackend::Fake(fake) => {
                 fake(FakePiInvocation {
                     socket_path: proxy.endpoint().host_socket_path().to_path_buf(),
+                    input_view: view.host_path().to_path_buf(),
                     token: token.clone(),
                     run_id: self.run_id.clone(),
                     analyzer_id: self.id.clone(),
@@ -237,7 +337,10 @@ impl PiClassifierAnalyzer {
         bridge.stop().await;
         let proxy_result = proxy.finish().await;
         match (run, proxy_result) {
-            (Ok(()), Ok(outcome)) => Ok(outcome.submission.into_observations()),
+            (Ok(()), Ok(outcome)) => Ok(PiClassifierResult {
+                observations: outcome.submission.into_observations(),
+                coverage: complete_coverage(self.id.clone(), assigned, completed, not_applicable),
+            }),
             (Ok(()), Err(error)) => Err(PiClassifierError::Proxy(error)),
             (Err(runner), Ok(_)) => Err(PiClassifierError::Runner(runner)),
             (Err(_runner), Err(proxy)) if proxy_failure_is_primary(&proxy) => {
@@ -248,6 +351,40 @@ impl PiClassifierAnalyzer {
             }
         }
     }
+}
+
+enum PreparedPiAssignments {
+    AllNotApplicable {
+        not_applicable: u64,
+    },
+    Applicable {
+        assignments: Vec<ArtifactAssignment>,
+        not_applicable: u64,
+        view: Arc<AnalyzerView>,
+    },
+}
+
+pub(crate) struct PiClassifierResult {
+    pub observations: Vec<NormalizedObservation>,
+    pub coverage: AnalyzerCoverage,
+}
+
+fn complete_coverage(
+    analyzer_id: AnalyzerId,
+    assigned: u64,
+    completed: u64,
+    not_applicable: u64,
+) -> AnalyzerCoverage {
+    AnalyzerCoverage::new(
+        analyzer_id,
+        InspectionPhase::Initial,
+        assigned,
+        assigned,
+        completed,
+        not_applicable,
+        CoverageStatus::Complete,
+    )
+    .expect("Pi applicability counters account for every frozen assignment")
 }
 
 fn proxy_failure_is_primary(error: &proxy::PiProxyError) -> bool {
@@ -268,19 +405,29 @@ fn proxy_failure_is_primary(error: &proxy::PiProxyError) -> bool {
             | PiProxyError::InvalidTerminalSubmission
             | PiProxyError::BudgetExceeded
             | PiProxyError::ResponseTooLarge
-            | PiProxyError::ObjectRead
+            | PiProxyError::NativeToolFailed
             | PiProxyError::Internal
     )
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PiClassifierCompileError {
+    #[error("Pi search-result limits are inconsistent")]
+    InconsistentSearchLimits,
     #[error("Pi sandbox preflight failed")]
     Sandbox(#[from] sandbox::PiSandboxError),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PiClassifierError {
+    #[error("Pi assignment is not present in the immutable manifest")]
+    InvalidAssignment,
+    #[error("Pi content applicability assessment failed")]
+    Applicability(#[from] TextApplicabilityError),
+    #[error("Pi analyzer view materialization failed")]
+    View(#[from] AnalyzerViewError),
+    #[error("Pi input preparation task did not complete")]
+    PreparationTask,
     #[error("Pi sandboxed process failed")]
     Runner(#[from] PiRunError),
     #[error("Pi proxy failed")]
@@ -291,7 +438,9 @@ pub(crate) enum PiClassifierError {
 mod tests {
     use super::*;
     use crate::authorization::{CaptureLimits, Snapshotter};
-    use crate::domain::{ArtifactKind, ClassificationCode, ConfiguredConfidence, ReasonCode};
+    use crate::domain::{
+        ArtifactKind, ClassificationCode, ConfiguredConfidence, IssueCode, ReasonCode,
+    };
     use crate::pipeline::{
         CompiledAnalyzer, CompiledPipeline, CompiledStage, EligibilitySelector, PipelineExecutor,
         PriorObservationMode, ProjectionLimits, StageExecution, StageId,
@@ -308,6 +457,7 @@ mod tests {
     struct Fixture {
         _temporary: TempDir,
         input: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
         workspace: Arc<InvocationWorkspace>,
         manifest: Arc<ArtifactManifest>,
         run_id: RunId,
@@ -315,13 +465,19 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
+            Self::with_files(&[("artifact.txt", b"immutable sensitive fixture")])
+        }
+
+        fn with_files(files: &[(&str, &[u8])]) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let input = temporary.path().join("input");
             let root = temporary.path().join("workspaces");
             fs::create_dir(&input).unwrap();
             fs::create_dir(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-            fs::write(input.join("artifact.txt"), b"immutable sensitive fixture").unwrap();
+            for (name, bytes) in files {
+                fs::write(input.join(name), bytes).unwrap();
+            }
             let run_id = RunId::from_suffix("pi-e2e").unwrap();
             let workspace = Arc::new(InvocationWorkspace::create(&root, &run_id).unwrap());
             let manifest = Arc::new(
@@ -333,10 +489,22 @@ mod tests {
             Self {
                 _temporary: temporary,
                 input,
+                workspace_root: root,
                 workspace,
                 manifest,
                 run_id,
             }
+        }
+
+        fn analyzer_views_are_empty(&self) -> bool {
+            fs::read_dir(
+                self.workspace_root
+                    .join(self.run_id.as_str())
+                    .join("analyzer-views"),
+            )
+            .unwrap()
+            .next()
+            .is_none()
         }
     }
 
@@ -374,7 +542,6 @@ mod tests {
                 max_tool_calls: 16,
                 max_bytes_read: 64 * 1024,
                 max_read_bytes_per_call: 64 * 1024,
-                max_search_pattern_bytes: 128,
                 max_search_matches: 10,
                 max_search_bytes_per_call: 64 * 1024,
                 max_search_calls: 2,
@@ -391,6 +558,23 @@ mod tests {
                 processes: 4,
                 stdout_bytes: 1024,
                 stderr_bytes: 1024,
+            },
+            max_search_results: 10,
+            required_text: RequiredTextMatcher::default(),
+            max_text_bytes: 64 * 1024,
+            view_limits: AnalyzerViewLimits {
+                per_view: AnalyzerViewQuota {
+                    max_files: 16,
+                    max_entries: 64,
+                    max_total_bytes: 64 * 1024,
+                    max_depth: 16,
+                },
+                invocation: AnalyzerViewQuota {
+                    max_files: 16,
+                    max_entries: 64,
+                    max_total_bytes: 64 * 1024,
+                    max_depth: 16,
+                },
             },
             credential_environment: Arc::new(Vec::new()),
             identity: Digest::sha256(b"fake-pi-integration"),
@@ -462,7 +646,7 @@ mod tests {
     async fn run_analyzer(
         fixture: &Fixture,
         analyzer: &PiClassifierAnalyzer,
-    ) -> Result<Vec<NormalizedObservation>, PiClassifierError> {
+    ) -> Result<PiClassifierResult, PiClassifierError> {
         let analyzer_id = AnalyzerId::new("pi-review").unwrap();
         let assignments =
             EligibilitySelector::compile(&["**".to_string()], &[], [ArtifactKind::PhysicalFile])
@@ -590,8 +774,20 @@ mod tests {
 
     #[tokio::test]
     async fn fake_pi_uses_real_proxy_and_completes_pipeline_without_mutation() {
-        let fixture = Fixture::new();
-        let artifact_id = fixture.manifest.artifacts()[0].id.clone();
+        let fixture = Fixture::with_files(&[
+            ("artifact.txt", b"immutable sensitive fixture"),
+            ("opaque.bin", b"opaque\0bytes"),
+        ]);
+        let artifact_id = fixture
+            .manifest
+            .artifacts()
+            .iter()
+            .find(|artifact| {
+                artifact.content_digest == Digest::sha256(b"immutable sensitive fixture")
+            })
+            .unwrap()
+            .id
+            .clone();
         let analyzer = analyzer(&fixture, move |invocation| {
             let artifact_id = artifact_id.clone();
             Box::pin(async move {
@@ -611,10 +807,33 @@ mod tests {
                     .await["status"],
                     "ok"
                 );
+                let manifest_list = exchange(
+                    &invocation.socket_path,
+                    bound(&invocation, 3, json!({"type":"manifest_list"})),
+                )
+                .await;
+                assert_eq!(manifest_list["status"], "ok");
+                assert_eq!(manifest_list["result"].as_array().unwrap().len(), 1);
+                let view_path = manifest_list["result"][0]["view_path"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let bytes = tokio::fs::read(invocation.input_view.join(&view_path))
+                    .await
+                    .unwrap();
                 assert_eq!(
                     exchange(
                         &invocation.socket_path,
-                        bound(&invocation, 3, json!({"type":"manifest_list"}))
+                        bound(
+                            &invocation,
+                            4,
+                            json!({
+                                "type":"native_tool_begin",
+                                "tool_call_id":"read-1",
+                                "tool":"read",
+                                "path":view_path,
+                            })
+                        )
                     )
                     .await["status"],
                     "ok"
@@ -624,8 +843,16 @@ mod tests {
                         &invocation.socket_path,
                         bound(
                             &invocation,
-                            4,
-                            json!({"type":"artifact_read","artifact_id":artifact_id})
+                            5,
+                            json!({
+                                "type":"native_tool_end",
+                                "tool_call_id":"read-1",
+                                "tool":"read",
+                                "path":view_path,
+                                "success":true,
+                                "output_bytes":bytes.len(),
+                                "result_count":1,
+                            })
                         )
                     )
                     .await["status"],
@@ -634,7 +861,7 @@ mod tests {
                 assert_eq!(
                     exchange(
                         &invocation.socket_path,
-                        bound(&invocation, 5, json!({"type":"prior_observations"}))
+                        bound(&invocation, 6, json!({"type":"prior_observations"}))
                     )
                     .await["status"],
                     "ok"
@@ -651,14 +878,15 @@ mod tests {
                     }
                 });
                 assert_eq!(
-                    exchange(&invocation.socket_path, bound(&invocation, 6, terminal)).await
+                    exchange(&invocation.socket_path, bound(&invocation, 7, terminal)).await
                         ["status"],
                     "ok"
                 );
                 Ok(())
             })
         });
-        let before = fs::read(fixture.input.join("artifact.txt")).unwrap();
+        let before_text = fs::read(fixture.input.join("artifact.txt")).unwrap();
+        let before_binary = fs::read(fixture.input.join("opaque.bin")).unwrap();
         let result = PipelineExecutor::execute(
             &pipeline(analyzer),
             Arc::clone(&fixture.manifest),
@@ -666,12 +894,125 @@ mod tests {
         )
         .await;
         assert!(result.complete, "unexpected pipeline result: {result:?}");
+        assert_eq!(result.coverage[0].assigned, 2);
         assert_eq!(result.coverage[0].completed, 1);
+        assert_eq!(result.coverage[0].not_applicable, 1);
         assert_eq!(result.observations.len(), 1);
         assert_eq!(
             fs::read(fixture.input.join("artifact.txt")).unwrap(),
-            before
+            before_text
         );
+        assert_eq!(
+            fs::read(fixture.input.join("opaque.bin")).unwrap(),
+            before_binary
+        );
+        assert!(fixture.analyzer_views_are_empty());
+    }
+
+    #[tokio::test]
+    async fn all_binary_assignments_skip_pi_and_are_complete_not_applicable() {
+        let fixture = Fixture::with_files(&[
+            ("first.bin", b"first\0opaque"),
+            ("second.bin", &[0xff, 0xfe, 0xfd]),
+        ]);
+        let invoked = Arc::new(AtomicBool::new(false));
+        let analyzer = analyzer(&fixture, {
+            let invoked = Arc::clone(&invoked);
+            move |_| -> FakePiFuture {
+                invoked.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        });
+        let before_first = fs::read(fixture.input.join("first.bin")).unwrap();
+        let before_second = fs::read(fixture.input.join("second.bin")).unwrap();
+
+        let result = PipelineExecutor::execute(
+            &pipeline(analyzer),
+            Arc::clone(&fixture.manifest),
+            Arc::clone(&fixture.workspace),
+        )
+        .await;
+
+        assert!(result.complete, "unexpected pipeline result: {result:?}");
+        assert!(!invoked.load(Ordering::SeqCst));
+        assert_eq!(result.coverage[0].assigned, 2);
+        assert_eq!(result.coverage[0].completed, 0);
+        assert_eq!(result.coverage[0].not_applicable, 2);
+        assert!(result.observations.is_empty());
+        assert_eq!(
+            fs::read(fixture.input.join("first.bin")).unwrap(),
+            before_first
+        );
+        assert_eq!(
+            fs::read(fixture.input.join("second.bin")).unwrap(),
+            before_second
+        );
+        assert!(fixture.analyzer_views_are_empty());
+    }
+
+    #[tokio::test]
+    async fn applicability_failures_are_typed_and_leave_exact_incomplete_coverage() {
+        let invoked = Arc::new(AtomicBool::new(false));
+        let fake = {
+            let invoked = Arc::clone(&invoked);
+            move |_| -> FakePiFuture {
+                invoked.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        };
+
+        let required_binary = Fixture::with_files(&[("required.txt", &[0xff, 0xfe])]);
+        let mut required_analyzer = analyzer(&required_binary, fake.clone());
+        required_analyzer.required_text =
+            RequiredTextMatcher::compile(&["**".to_string()]).unwrap();
+        let required_result = PipelineExecutor::execute(
+            &pipeline(required_analyzer),
+            Arc::clone(&required_binary.manifest),
+            Arc::clone(&required_binary.workspace),
+        )
+        .await;
+        assert_eq!(
+            required_result.issues[0].code,
+            IssueCode::InvalidAnalyzerOutput
+        );
+        assert!(!required_result.coverage[0].is_complete());
+        assert_eq!(required_result.coverage[0].not_applicable, 0);
+
+        let oversized = Fixture::with_files(&[("oversized.txt", b"five!")]);
+        let mut oversized_analyzer = analyzer(&oversized, fake.clone());
+        oversized_analyzer.max_text_bytes = 4;
+        let oversized_result = PipelineExecutor::execute(
+            &pipeline(oversized_analyzer),
+            Arc::clone(&oversized.manifest),
+            Arc::clone(&oversized.workspace),
+        )
+        .await;
+        assert_eq!(
+            oversized_result.issues[0].code,
+            IssueCode::SizeLimitExceeded
+        );
+        assert!(!oversized_result.coverage[0].is_complete());
+        assert_eq!(oversized_result.coverage[0].not_applicable, 0);
+
+        let mismatched = Fixture::with_files(&[("changed.txt", b"before")]);
+        let artifact = &mismatched.manifest.artifacts()[0];
+        let object_path = mismatched
+            .workspace_root
+            .join(mismatched.run_id.as_str())
+            .join("objects")
+            .join(artifact.object_id.as_str());
+        fs::set_permissions(&object_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&object_path, b"change").unwrap();
+        let mismatched_result = PipelineExecutor::execute(
+            &pipeline(analyzer(&mismatched, fake)),
+            Arc::clone(&mismatched.manifest),
+            Arc::clone(&mismatched.workspace),
+        )
+        .await;
+        assert_eq!(mismatched_result.issues[0].code, IssueCode::AnalyzerFailure);
+        assert!(!mismatched_result.coverage[0].is_complete());
+        assert_eq!(mismatched_result.coverage[0].not_applicable, 0);
+        assert!(!invoked.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
