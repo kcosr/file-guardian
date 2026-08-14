@@ -17,7 +17,21 @@ tool requests and responses, transport credentials, proxy token/socket, and
 Pi stdout/stderr are not copied into the authorization report.
 
 Automated tests use fake processes and synthetic artifacts and do not contact a
-model. Live acceptance is deliberately operator opt-in. Build the release
+model. The offline extension checks can also be run directly from the repository
+root when Node is installed:
+
+```bash
+node --check src/analyzers/pi/assets/file_guardian_extension.js
+node --check tests/pi_extension_harness.mjs
+node tests/pi_extension_harness.mjs
+```
+
+The Rust `pi_extension_contract` test invokes the same harness when `node` is
+available; otherwise it retains the deterministic source-contract checks. The
+harness uses a mocked Pi/TypeBox environment and synthetic proxy pages, never a
+provider or artifact content.
+
+Live acceptance is deliberately operator opt-in. Build the release
 binary, prepare the pinned runtime bundle and approved provider configuration,
 and use synthetic sensitive content unless a protected fixture is intentional:
 

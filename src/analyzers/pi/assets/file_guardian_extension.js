@@ -52,6 +52,7 @@ let nextRequestId = 1;
 let terminalState = "open";
 let runtimeInstruction;
 let integrityFailure;
+let nextManifestCursor = 0;
 
 function requiredEnvironment(name) {
 	const value = process.env[name];
@@ -215,6 +216,12 @@ function manifestPageResult(result, cursor) {
 	return result;
 }
 
+function consumeManifestPage(result) {
+	const page = manifestPageResult(result, nextManifestCursor);
+	nextManifestCursor = page.next_cursor ?? page.total_count;
+	return page;
+}
+
 function latchIntegrityFailure() {
 	integrityFailure ??= new Error("Pi read-only tool integrity check failed");
 }
@@ -224,6 +231,15 @@ class RecoverableNativeToolError extends Error {
 		super(message);
 		this.name = "RecoverableNativeToolError";
 	}
+}
+
+function readLineWindow(content, offset, limit) {
+	const lines = content.split("\n");
+	const start = offset - 1;
+	if (start >= lines.length) {
+		throw new RecoverableNativeToolError("Read offset is beyond end of file. Revise it and retry.");
+	}
+	return lines.slice(start, Math.min(start + limit, lines.length)).join("\n");
 }
 
 function normalizedToolCallId(value) {
@@ -623,10 +639,7 @@ export default function fileGuardianClassifierExtension(pi) {
 				if (resolvedPath.metadata.size > MAX_NATIVE_READ_FILE_BYTES) throw new Error("file exceeds read limit");
 				const bytes = await readFile(resolvedPath.absolute);
 				const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-				const lines = content.split("\n");
-				const start = offset - 1;
-				if (start >= lines.length) throw new Error("offset is beyond end of file");
-				const selected = lines.slice(start, Math.min(start + limit, lines.length)).join("\n");
+				const selected = readLineWindow(content, offset, limit);
 				const truncated = truncateUtf8(selected, MAX_NATIVE_TOOL_OUTPUT_BYTES);
 				return {
 					text: truncated.text,
@@ -750,14 +763,13 @@ export default function fileGuardianClassifierExtension(pi) {
 		name: "manifest_list",
 		label: "List assigned artifacts",
 		description:
-			"List one bounded page of presentation paths and immutable artifact IDs. Start with cursor 0 and continue with next_cursor until it is null.",
-		parameters: strictObject({
-			cursor: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
-		}),
+			"List the next bounded page of presentation paths and immutable artifact IDs. Call repeatedly until next_cursor is null.",
+		parameters: strictObject({}),
 		executionMode: "sequential",
-		async execute(_toolCallId, { cursor = 0 }, signal) {
+		async execute(_toolCallId, _params, signal) {
+			const cursor = nextManifestCursor;
 			const page = await proxyRequest("manifest_list", { cursor }, signal);
-			return proxyToolResult(manifestPageResult(page, cursor));
+			return proxyToolResult(consumeManifestPage(page));
 		},
 	});
 

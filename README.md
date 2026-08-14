@@ -253,9 +253,11 @@ every native call is bounded and recorded through the authenticated
 subprocess, arbitrary-path or `/proc` reader, write, or edit capability.
 
 `manifest_list` returns byte-bounded pages containing `cursor`,
-`next_cursor`, and `entries`; the model follows pages until `next_cursor` is
-`null`. This supports the configured 100,000-file view without requiring one
-unbounded response. Native tool completion is recorded as `completed`,
+`next_cursor`, and `entries`. Its model-facing schema is an empty object: the
+model calls the tool repeatedly, while the trusted extension owns and advances
+the cursor until `next_cursor` is `null`. Calls after completion harmlessly
+return the same empty terminal page. This supports the configured 100,000-file
+view without requiring one unbounded response. Native tool completion is recorded as `completed`,
 `recoverable_error`, or `fatal_error`. Invalid model-supplied search patterns
 or arguments return a sanitized retryable result. Path confinement,
 authentication, accounting, helper process, and other integrity failures remain

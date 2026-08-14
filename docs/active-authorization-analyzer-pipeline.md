@@ -354,13 +354,17 @@ permanently invalidate the run. Search and listing output is truncated only at
 complete line boundaries and includes a deterministic bounded notice.
 
 `manifest_list` maps presentation paths to immutable artifact IDs through
-byte-bounded cursor pages. A request supplies `cursor`; the response returns
-that cursor, an `entries` slice, and `next_cursor`. The extension begins at zero
-and continues until `next_cursor` is `null`, validating monotonic progress and
-the fixed manifest identity on every page. Preflight rejects even one entry
-that cannot fit, but aggregate metadata is deliberately not constrained to one
-response. The configured 100,000-file view quota is therefore supported through
-bounded pages.
+byte-bounded cursor pages. The authenticated host-wire request supplies
+`cursor`; the response returns that cursor, an `entries` slice, and
+`next_cursor`. The model-facing tool schema is a strict empty object. The
+trusted extension begins at zero, advances the cursor privately, and tells the
+model only to call the tool repeatedly until `next_cursor` is `null`, validating
+monotonic progress and the fixed manifest identity on every page. Subsequent
+calls return a harmless empty terminal page whose cursor and total count are
+equal, with `next_cursor: null`; enumeration never restarts. Preflight rejects
+even one entry that cannot fit, but aggregate metadata is deliberately not
+constrained to one response. The configured 100,000-file view quota is
+therefore supported through bounded pages.
 `prior_observations` returns only the compact, canonically ordered normalized
 projection selected for the stage: analyzer/rule/artifact identities,
 categories, severities, validated locations, classification codes/confidence,

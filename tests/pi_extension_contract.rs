@@ -1,4 +1,6 @@
 use std::collections::BTreeSet;
+use std::io::ErrorKind;
+use std::process::Command;
 
 const EXTENSION: &str = include_str!("../src/analyzers/pi/assets/file_guardian_extension.js");
 const RUST_CONFIG: &str = include_str!("../src/config/mod.rs");
@@ -190,7 +192,7 @@ fn native_helpers_are_no_ignore_bounded_and_shell_free() {
 }
 
 #[test]
-fn every_native_call_is_audited_and_failure_invalidates_submission() {
+fn native_outcomes_are_audited_and_only_fatal_failures_latch() {
     for required in [
         "\"native_tool_begin\"",
         "\"native_tool_end\"",
@@ -221,18 +223,23 @@ fn every_native_call_is_audited_and_failure_invalidates_submission() {
     assert!(EXTENSION.contains("/^[A-Za-z0-9_.:-]{1,128}$/"));
     assert!(EXTENSION.contains("error instanceof RecoverableNativeToolError"));
     assert!(EXTENSION.contains("Invalid search arguments. Revise them and retry."));
+    assert!(EXTENSION.contains("Read offset is beyond end of file. Revise it and retry."));
+    assert!(NODE_HARNESS.contains("RecoverableNativeToolError"));
 }
 
 #[test]
 fn manifest_pages_are_cursor_bound_and_walkable() {
     for required in [
         "file-guardian-pi-manifest-page/1",
-        "cursor: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }))",
-        "async execute(_toolCallId, { cursor = 0 }, signal)",
+        "let nextManifestCursor = 0",
+        "parameters: strictObject({})",
+        "async execute(_toolCallId, _params, signal)",
+        "const cursor = nextManifestCursor",
         "proxyRequest(\"manifest_list\", { cursor }, signal)",
+        "nextManifestCursor = page.next_cursor ?? page.total_count",
         "result.next_cursor === null",
         "result.next_cursor !== pageEnd",
-        "Start with cursor 0 and continue with next_cursor until it is null.",
+        "Call repeatedly until next_cursor is null.",
     ] {
         assert!(
             EXTENSION.contains(required),
@@ -244,6 +251,26 @@ fn manifest_pages_are_cursor_bound_and_walkable() {
     assert!(RUST_PROXY.contains("next_cursor: Option<u64>"));
     assert!(NODE_HARNESS.contains("discontinuous manifest page"));
     assert!(NODE_HARNESS.contains("sensitive-partial-line"));
+    assert!(NODE_HARNESS.contains("getNextManifestCursor(), 3"));
+}
+
+#[test]
+fn executable_node_harness_passes_when_node_is_available() {
+    let output = match Command::new("node")
+        .arg("tests/pi_extension_harness.mjs")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == ErrorKind::NotFound => return,
+        Err(error) => panic!("could not execute Pi extension harness: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "Pi extension harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

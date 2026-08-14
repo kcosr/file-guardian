@@ -10,8 +10,11 @@ source = source
 source += `
 globalThis.__fileGuardianTestHooks = {
   boundedLineOutput,
+  consumeManifestPage,
   manifestPageResult,
+  readLineWindow,
   requiredBoundedIntegerEnvironment,
+  getNextManifestCursor: () => nextManifestCursor,
 };
 `;
 
@@ -59,13 +62,14 @@ const firstPage = {
 	entries: [{ artifact_id: "a_01" }, { artifact_id: "a_02" }],
 	next_cursor: 2,
 };
-assert.equal(hooks.manifestPageResult(firstPage, 0), firstPage);
+assert.equal(hooks.consumeManifestPage(firstPage), firstPage);
+assert.equal(hooks.getNextManifestCursor(), 2);
 assert.throws(
-	() => hooks.manifestPageResult({ ...firstPage, next_cursor: 1 }, 0),
+	() => hooks.manifestPageResult({ ...firstPage, cursor: 2, next_cursor: 1 }, 2),
 	/discontinuous manifest page/,
 );
 assert.equal(
-	hooks.manifestPageResult(
+	hooks.consumeManifestPage(
 		{
 			...firstPage,
 			cursor: 2,
@@ -75,6 +79,23 @@ assert.equal(
 		2,
 	).next_cursor,
 	null,
+);
+assert.equal(hooks.getNextManifestCursor(), 3);
+const terminalPage = {
+	...firstPage,
+	cursor: 3,
+	entries: [],
+	next_cursor: null,
+};
+assert.equal(hooks.consumeManifestPage(terminalPage), terminalPage);
+assert.equal(hooks.getNextManifestCursor(), 3);
+
+assert.equal(hooks.readLineWindow("one\ntwo\nthree", 2, 1), "two");
+assert.throws(
+	() => hooks.readLineWindow("one\ntwo", 3, 1),
+	(error) =>
+		error?.name === "RecoverableNativeToolError" &&
+		/Read offset is beyond end of file/.test(error.message),
 );
 
 const oversizedLine = "sensitive-partial-line".repeat(5000);

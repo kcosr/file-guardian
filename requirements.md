@@ -342,11 +342,14 @@ filesystem/process confinement, not destination-limited model egress;
 deployments must restrict the shared transport to approved internal endpoints.
 
 `manifest_list` is cursor-paged and byte-bounded. Each response contains its
-`cursor`, an `entries` slice, and `next_cursor`; callers continue until
-`next_cursor` is `null`. A single manifest entry that cannot fit is a preflight
-failure, while a large valid view—including the configured 100,000-file
-ceiling—is supported across multiple bounded responses rather than serialized
-as one message.
+host-wire `cursor`, an `entries` slice, and `next_cursor`. The model-facing tool
+accepts no cursor or other arguments. The trusted extension starts at zero,
+advances the cursor internally, and asks the model only to call the tool again
+until `next_cursor` is `null`. Repeated calls after completion return a valid
+empty terminal page at the total count and do not restart enumeration. A single
+manifest entry that cannot fit is a preflight failure, while a large valid
+view—including the configured 100,000-file ceiling—is supported across
+multiple bounded responses rather than serialized as one message.
 
 The runtime configuration fixes `platform = "linux"`,
 `sandbox = "bubblewrap-v1"`, `network = "host_internal_model"`, absolute

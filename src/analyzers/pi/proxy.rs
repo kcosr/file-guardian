@@ -752,8 +752,11 @@ fn manifest_page_value(input: &PiProxyInput, cursor: u64) -> Result<Value, PiPro
         }
         return manifest_page_payload(input, cursor, entries, None, total_count);
     }
-    if start >= entries.len() {
-        return Err(PiProxyError::InvalidRequest);
+    if start > entries.len() {
+        return Err(PiProxyError::ProtocolViolation);
+    }
+    if start == entries.len() {
+        return manifest_page_payload(input, cursor, &[], None, total_count);
     }
 
     let base = manifest_page_payload(input, cursor, &[], Some(u64::MAX), total_count)?;
@@ -1696,7 +1699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn out_of_range_manifest_cursor_is_fatal() {
+    async fn terminal_manifest_cursor_is_idempotent_but_above_total_is_fatal() {
         let fixture = fixture(b"content");
         let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
         let socket = socket(&proxy);
@@ -1708,27 +1711,46 @@ mod tests {
             .await,
             ProxyResponse::Ok { .. }
         ));
+        for request_id in [2, 3] {
+            let response = exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    request_id,
+                    ProxyOperation::ManifestList { cursor: 1 },
+                ),
+            )
+            .await;
+            let ProxyResponse::Ok { result, .. } = response else {
+                panic!("the terminal cursor must return an idempotent empty page");
+            };
+            assert_eq!(result["cursor"], 1);
+            assert_eq!(result["total_count"], 1);
+            assert_eq!(result["entries"], json!([]));
+            assert_eq!(result["next_cursor"], Value::Null);
+        }
         assert!(matches!(
             exchange(
                 &socket,
                 &bound_request(
                     &proxy,
                     &fixture,
-                    2,
-                    ProxyOperation::ManifestList { cursor: 1 },
+                    4,
+                    ProxyOperation::ManifestList { cursor: 2 },
                 ),
             )
             .await,
             ProxyResponse::Error {
                 error: WireError {
-                    code: ProxyErrorCode::InvalidRequest
+                    code: ProxyErrorCode::ProtocolViolation
                 },
                 ..
             }
         ));
         assert!(matches!(
             proxy.finish().await,
-            Err(PiProxyError::InvalidRequest)
+            Err(PiProxyError::ProtocolViolation)
         ));
         fixture.workspace.remove().unwrap();
     }

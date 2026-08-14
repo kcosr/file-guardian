@@ -119,7 +119,9 @@ fn runtime_manifest_example_is_valid_json_with_canonical_placeholder_hashes() {
 }
 
 #[test]
-fn proxy_v2_fixture_requires_paged_manifests_and_closed_native_outcomes() {
+fn host_proxy_v2_fixture_requires_manifest_cursor_and_closed_native_outcomes() {
+    // Cursor state is mandatory on the authenticated host wire. The trusted
+    // extension deliberately omits it from the model-facing tool schema.
     let page_request = serde_json::to_value(ProxyOperation::ManifestList { cursor: 65_536 })
         .expect("manifest operation serializes");
     assert_eq!(
