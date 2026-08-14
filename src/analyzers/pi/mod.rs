@@ -115,7 +115,7 @@ pub struct PiClassifierAnalyzer {
 
 #[derive(Clone)]
 enum PiRunnerBackend {
-    Sandbox(Box<PiRunner>),
+    Process(Box<PiRunner>),
     #[cfg(test)]
     Fake(Arc<dyn Fn(FakePiInvocation) -> FakePiFuture + Send + Sync>),
 }
@@ -186,7 +186,7 @@ impl PiClassifierAnalyzer {
         Ok(Self {
             id: spec.id,
             run_id: spec.run_id,
-            runner: PiRunnerBackend::Sandbox(Box::new(PiRunner::new(runtime))),
+            runner: PiRunnerBackend::Process(Box::new(PiRunner::new(runtime))),
             instruction: spec.instruction,
             vocabulary: Arc::new(spec.vocabulary),
             expected_runtime: spec.expected_runtime,
@@ -299,7 +299,6 @@ impl PiClassifierAnalyzer {
             },
         )?;
 
-        let endpoint_dir = proxy.endpoint().endpoint_dir().to_path_buf();
         let token = proxy.endpoint().run_token().to_owned();
         let mut bridge = ProxySignalBridge::start(proxy.progress());
         let manifest_identity = manifest.identity.to_string();
@@ -307,7 +306,8 @@ impl PiClassifierAnalyzer {
             provider: &self.expected_runtime.provider,
             model: &self.expected_runtime.model,
             thinking: &self.expected_runtime.thinking,
-            proxy_endpoint_dir: &endpoint_dir,
+            proxy_socket_path: proxy.endpoint().host_socket_path(),
+            proxy_directory_fd: proxy.endpoint().directory_fd(),
             analyzer_input_view: view.host_path(),
             proxy_token: &token,
             analyzer_id: self.id.as_str(),
@@ -320,7 +320,7 @@ impl PiClassifierAnalyzer {
             signals: bridge.take_signals(),
         };
         let run = match &self.runner {
-            PiRunnerBackend::Sandbox(runner) => runner.run(invocation).await.map(|_| ()),
+            PiRunnerBackend::Process(runner) => runner.run(invocation).await.map(|_| ()),
             #[cfg(test)]
             PiRunnerBackend::Fake(fake) => {
                 fake(FakePiInvocation {
@@ -414,8 +414,8 @@ fn proxy_failure_is_primary(error: &proxy::PiProxyError) -> bool {
 pub(crate) enum PiClassifierCompileError {
     #[error("Pi search-result limits are inconsistent")]
     InconsistentSearchLimits,
-    #[error("Pi sandbox preflight failed")]
-    Sandbox(#[from] sandbox::PiSandboxError),
+    #[error("Pi runtime or tool-sidecar preflight failed")]
+    Runtime(#[from] sandbox::PiSandboxError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -428,7 +428,7 @@ pub(crate) enum PiClassifierError {
     View(#[from] AnalyzerViewError),
     #[error("Pi input preparation task did not complete")]
     PreparationTask,
-    #[error("Pi sandboxed process failed")]
+    #[error("Pi process or tool sidecar failed")]
     Runner(#[from] PiRunError),
     #[error("Pi proxy failed")]
     Proxy(#[from] proxy::PiProxyError),

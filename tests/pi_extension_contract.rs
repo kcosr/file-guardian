@@ -3,6 +3,7 @@ use std::io::ErrorKind;
 use std::process::Command;
 
 const EXTENSION: &str = include_str!("../src/analyzers/pi/assets/file_guardian_extension.js");
+const SIDECAR: &str = include_str!("../src/analyzers/pi/assets/tool_sidecar_runner.js");
 const RUST_CONFIG: &str = include_str!("../src/config/mod.rs");
 const RUST_PI_MOD: &str = include_str!("../src/analyzers/pi/mod.rs");
 const RUST_PROTOCOL: &str = include_str!("../src/analyzers/pi/protocol.rs");
@@ -10,8 +11,10 @@ const RUST_PROXY: &str = include_str!("../src/analyzers/pi/proxy.rs");
 const RUST_RUNNER: &str = include_str!("../src/analyzers/pi/runner.rs");
 const RUST_SANDBOX: &str = include_str!("../src/analyzers/pi/sandbox.rs");
 const NODE_HARNESS: &str = include_str!("pi_extension_harness.mjs");
+const SIDECAR_HARNESS: &str = include_str!("pi_tool_sidecar_harness.mjs");
 
-const EXPECTED_TOOLS: [&str; 7] = [
+const EXPECTED_TOOLS: [&str; 8] = [
+    "bash",
     "find",
     "grep",
     "ls",
@@ -33,14 +36,13 @@ fn trusted_extension_registers_only_the_closed_tool_grant() {
     assert_eq!(registered, expected);
     assert_eq!(
         EXTENSION.matches("executionMode: \"sequential\"").count(),
-        7
+        8
     );
     assert!(EXTENSION.contains("terminate: true"));
     assert!(EXTENSION.contains("await proxyRequest(\"submit_classification\""));
     assert!(EXTENSION.contains("terminalState = \"accepted\""));
 
     for forbidden in [
-        "bash",
         "write",
         "edit",
         "artifact_metadata",
@@ -95,7 +97,7 @@ fn extension_and_host_share_the_native_tool_output_ceiling() {
 
 #[test]
 fn extension_host_and_config_share_the_native_read_ceiling() {
-    assert!(EXTENSION.contains("const MAX_NATIVE_READ_FILE_BYTES = 1024 * 1024;"));
+    assert!(SIDECAR.contains("const MAX_READ_FILE_BYTES = 1024 * 1024;"));
     assert!(RUST_PROXY.contains("NATIVE_READ_MAX_BYTES: u64 = 1024 * 1024;"));
     assert!(RUST_CONFIG.contains("self.max_read_bytes_per_call.expect(\"checked above\")"));
     assert!(RUST_CONFIG.contains("> NATIVE_READ_MAX_BYTES"));
@@ -105,17 +107,38 @@ fn extension_host_and_config_share_the_native_read_ceiling() {
 fn trusted_extension_has_only_the_reviewed_runtime_capabilities() {
     for required in [
         "from \"node:child_process\"",
-        "from \"node:fs/promises\"",
         "from \"node:net\"",
         "from \"node:path\"",
-        "const RG = \"/runtime/bin/rg\"",
-        "const FD = \"/runtime/bin/fd\"",
+        "from \"node:readline\"",
+        "--unshare-all",
+        "--die-with-parent",
+        "--ro-bind",
+        "--tmpfs",
+        "/policy/tool-sidecar-runner.mjs",
         "env: {}",
-        "stdio: [\"ignore\", \"pipe\", \"pipe\"]",
+        "stdio: [\"pipe\", \"pipe\", \"pipe\"]",
     ] {
         assert!(
             EXTENSION.contains(required),
             "missing reviewed capability {required}"
+        );
+    }
+
+    assert!(!EXTENSION.contains("from \"node:fs"));
+    assert!(!EXTENSION.contains("--share-net"));
+    for required in [
+        "from \"node:fs/promises\"",
+        "const INPUT_ROOT = testRoots?.[0] ?? \"/input\"",
+        "const WORK_ROOT = testRoots?.[1] ?? \"/work\"",
+        "runtimeExecutable(\"bash\")",
+        "runtimeExecutable(\"rg\")",
+        "runtimeExecutable(\"fd\")",
+        "detached: true",
+        "process.kill(-child.pid, \"SIGKILL\")",
+    ] {
+        assert!(
+            SIDECAR.contains(required),
+            "missing sidecar capability {required}"
         );
     }
 
@@ -145,9 +168,9 @@ fn trusted_extension_has_only_the_reviewed_runtime_capabilities() {
 #[test]
 fn native_paths_are_confined_to_the_read_only_input_tree() {
     for required in [
-        "const INPUT_ROOT = \"/input\"",
+        "const INPUT_ROOT = testRoots?.[0] ?? \"/input\"",
         "isAbsolute(rawPath)",
-        "rawPath.includes(\"\\0\")",
+        "!value.includes(\"\\0\")",
         "rawPath.startsWith(\"~\")",
         "rawPath.startsWith(\"@\")",
         "rawPath.split(\"/\").includes(\"..\")",
@@ -156,10 +179,10 @@ fn native_paths_are_confined_to_the_read_only_input_tree() {
         "metadata.isSymbolicLink()",
         "!metadata.isFile()",
         "!metadata.isDirectory()",
-        "path is outside the analyzer input",
+        "Path is outside the immutable input.",
     ] {
         assert!(
-            EXTENSION.contains(required),
+            SIDECAR.contains(required),
             "missing confinement contract: {required}"
         );
     }
@@ -169,26 +192,17 @@ fn native_paths_are_confined_to_the_read_only_input_tree() {
 }
 
 #[test]
-fn native_helpers_are_no_ignore_bounded_and_shell_free() {
-    assert_eq!(EXTENSION.matches("\"--no-ignore\"").count(), 2);
-    assert_eq!(EXTENSION.matches("\"--hidden\"").count(), 2);
-    assert_eq!(EXTENSION.matches("args.push(\"--\"").count(), 1);
-    assert!(EXTENSION.contains("\"--\",\n\t\t\t\t\tpattern,"));
-    assert!(EXTENSION.contains("const MAX_NATIVE_TOOL_OUTPUT_BYTES = 64 * 1024"));
-    assert!(EXTENSION.contains("const MAX_NATIVE_NOTICE_BYTES = 256"));
-    assert!(EXTENSION.contains("const HELPER_TIMEOUT_MILLIS = 10000"));
-    assert!(EXTENSION.contains("child.kill(\"SIGKILL\")"));
-    assert!(EXTENSION.contains("stderrBytes > MAX_HELPER_STDERR_BYTES"));
-    assert!(EXTENSION.contains(
-        "const resultLimitReached = killedForResultLimit || lines.length >= resultLimit"
-    ));
-    assert!(EXTENSION.contains("[Truncated: ${resultLimit} ${limitKind} limit]"));
-    assert!(EXTENSION.contains("[Truncated: ${MAX_NATIVE_TOOL_OUTPUT_BYTES} output byte limit]"));
-    assert!(EXTENSION.contains("[`${limitKind}LimitReached`]"));
-    assert!(EXTENSION.contains("const entryLimitReached = entries.length > limit"));
-    assert!(EXTENSION.contains("\"--max-columns\""));
-    assert!(EXTENSION.contains("\"--max-columns-preview\""));
-    assert!(EXTENSION.contains("const lastCompleteLine = rawText.lastIndexOf(\"\\n\")"));
+fn native_helpers_and_bash_run_only_in_the_networkless_sidecar() {
+    assert_eq!(SIDECAR.matches("\"--no-ignore\"").count(), 2);
+    assert_eq!(SIDECAR.matches("\"--hidden\"").count(), 2);
+    assert!(SIDECAR.contains("const MAX_OUTPUT_BYTES = 64 * 1024"));
+    assert!(SIDECAR.contains("const COMMAND_TIMEOUT_MILLIS = 10_000"));
+    assert!(SIDECAR.contains("\"--noprofile\", \"--norc\", \"-c\""));
+    assert!(SIDECAR.contains("cwd: INPUT_ROOT"));
+    assert!(SIDECAR.contains("cwd = WORK_ROOT"));
+    assert!(EXTENSION.contains("await startToolSidecar()"));
+    assert!(EXTENSION.contains("await stopToolSidecar()"));
+    assert!(EXTENSION.contains("sidecarRequest(tool, params, signal)"));
 }
 
 #[test]
@@ -210,7 +224,7 @@ fn native_outcomes_are_audited_and_only_fatal_failures_latch() {
         "latchIntegrityFailure()",
         "if (integrityFailure) throw integrityFailure",
         "if (error === integrityFailure) throw error",
-        "Pi read-only tool integrity check failed",
+        "Pi sandboxed tool integrity check failed",
         "requireAccepted(result)",
         "result.accepted !== true",
     ] {
@@ -226,9 +240,8 @@ fn native_outcomes_are_audited_and_only_fatal_failures_latch() {
     assert!(EXTENSION
         .contains("`tc_${createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\")}`"));
     assert!(EXTENSION.contains("error instanceof RecoverableNativeToolError"));
-    assert!(EXTENSION.contains("Invalid search arguments. Revise them and retry."));
-    assert!(EXTENSION.contains("Read offset is beyond end of file. Revise it and retry."));
-    assert!(NODE_HARNESS.contains("RecoverableNativeToolError"));
+    assert!(SIDECAR.contains("Command arguments were rejected. Revise them and retry."));
+    assert!(SIDECAR.contains("Read offset is beyond end of file."));
 }
 
 #[test]
@@ -254,27 +267,32 @@ fn manifest_pages_are_cursor_bound_and_walkable() {
     assert!(RUST_PROXY.contains("manifest_page_value("));
     assert!(RUST_PROXY.contains("next_cursor: Option<u64>"));
     assert!(NODE_HARNESS.contains("discontinuous manifest page"));
-    assert!(NODE_HARNESS.contains("sensitive-partial-line"));
     assert!(NODE_HARNESS.contains("getNextManifestCursor(), 3"));
 }
 
 #[test]
 fn executable_node_harness_passes_when_node_is_available() {
-    let output = match Command::new("node")
-        .arg("tests/pi_extension_harness.mjs")
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == ErrorKind::NotFound => return,
-        Err(error) => panic!("could not execute Pi extension harness: {error}"),
-    };
-    assert!(
-        output.status.success(),
-        "Pi extension harness failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for (script, label) in [
+        ("tests/pi_extension_harness.mjs", "Pi extension"),
+        ("tests/pi_tool_sidecar_harness.mjs", "Pi tool sidecar"),
+    ] {
+        let output = match Command::new("node")
+            .arg(script)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == ErrorKind::NotFound => return,
+            Err(error) => panic!("could not execute {label} harness: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "{label} harness failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert!(SIDECAR_HARNESS.contains("persistent"));
 }
 
 #[test]

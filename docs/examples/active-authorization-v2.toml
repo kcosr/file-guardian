@@ -116,10 +116,10 @@ scope = "tree"
 
 [analyzers.pi]
 platform = "linux"
-sandbox = "bubblewrap-v1"
-# Bubblewrap shares the host network so Pi can reach the approved internal
-# model. This value deliberately does not claim network isolation.
-network = "host_internal_model"
+sandbox = "tool-sidecar-bubblewrap-v1"
+# Pi is a normal host process for model transport. Its persistent Bubblewrap
+# tool sidecar is networkless.
+network = "pi_host_sidecar_none"
 runtime_root = "/opt/file-guardian/pi-runtime"
 runtime_manifest = "runtime-manifest.json"
 launcher = "bin/node"
@@ -132,9 +132,10 @@ model = "internal-classification-model"
 thinking = "high"
 instruction_file = "/etc/file-guardian/prompts/publication-review.md"
 trusted_extension = "/usr/libexec/file-guardian/pi-classifier-extension.js"
+tool_sidecar_runner = "/usr/libexec/file-guardian/pi-tool-sidecar-runner.js"
 isolated_agent_dir = "/etc/file-guardian/pi-agent"
 output_schema = "file-guardian-pi-classifier/1"
-tool_grant = "native-readonly-v1"
+tool_grant = "sandboxed-shell-v1"
 
 [[analyzers.pi.credentials]]
 label = "internal-model-primary"

@@ -1,7 +1,10 @@
 use super::sandbox::{
-    compile_sandbox_command, PiSandboxError, PreparedPiRuntime, SandboxCommand, SandboxInvocation,
+    compile_pi_process_command, PiProcessCommand, PiProcessInvocation, PiSandboxError,
+    PreparedPiRuntime,
 };
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::os::fd::{BorrowedFd, RawFd};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -56,7 +59,8 @@ pub(crate) struct PiInvocationSpec<'a> {
     pub provider: &'a str,
     pub model: &'a str,
     pub thinking: &'a str,
-    pub proxy_endpoint_dir: &'a Path,
+    pub proxy_socket_path: &'a Path,
+    pub proxy_directory_fd: std::os::fd::RawFd,
     pub analyzer_input_view: &'a Path,
     pub max_search_results: u64,
     pub proxy_token: &'a str,
@@ -85,7 +89,7 @@ pub(crate) enum PiOutputStream {
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum PiRunError {
     #[error(transparent)]
-    Sandbox(#[from] PiSandboxError),
+    Runtime(#[from] PiSandboxError),
     #[error("Pi process could not be started")]
     Spawn,
     #[error("Pi runtime handshake failed")]
@@ -124,13 +128,14 @@ impl PiRunner {
             return Err(PiRunError::Supervision);
         }
         self.runtime.verify_bubblewrap_version().await?;
-        let command = compile_sandbox_command(
+        let command = compile_pi_process_command(
             &self.runtime,
-            &SandboxInvocation {
+            &PiProcessInvocation {
                 provider: invocation.provider,
                 model: invocation.model,
                 thinking: invocation.thinking,
-                proxy_endpoint_dir: invocation.proxy_endpoint_dir,
+                proxy_socket_path: invocation.proxy_socket_path,
+                proxy_directory_fd: invocation.proxy_directory_fd,
                 analyzer_input_view: invocation.analyzer_input_view,
                 max_search_results: invocation.max_search_results,
                 proxy_token: invocation.proxy_token,
@@ -167,7 +172,7 @@ struct StreamResult {
 }
 
 async fn run_command(
-    plan: SandboxCommand,
+    plan: PiProcessCommand,
     fixed_task: Vec<u8>,
     limits: PiRunLimits,
     mut signals: PiRunSignals,
@@ -179,6 +184,7 @@ async fn run_command(
         .args(&plan.arguments)
         .env_clear()
         .envs(plan.environment.iter().cloned())
+        .current_dir(&plan.current_directory)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -187,11 +193,12 @@ async fn run_command(
     {
         command.process_group(0);
         let child_limits = limits.clone();
+        let inherited_proxy_fd = plan.inherited_proxy_fd;
         // SAFETY: the pre-exec closure only invokes setrlimit and umask syscalls.
         unsafe {
             command
                 .as_std_mut()
-                .pre_exec(move || install_child_limits(&child_limits));
+                .pre_exec(move || install_child_limits(&child_limits, inherited_proxy_fd));
         }
     }
     let mut child = command.spawn().map_err(|_| PiRunError::Spawn)?;
@@ -505,7 +512,7 @@ fn kill_group(raw_pid: u32, signal: rustix::process::Signal) {
 }
 
 #[cfg(unix)]
-fn install_child_limits(limits: &PiRunLimits) -> std::io::Result<()> {
+fn install_child_limits(limits: &PiRunLimits, inherited_proxy_fd: RawFd) -> std::io::Result<()> {
     for (resource, value) in [
         (rustix::process::Resource::As, limits.memory_bytes),
         (rustix::process::Resource::Cpu, limits.cpu_seconds),
@@ -521,6 +528,10 @@ fn install_child_limits(limits: &PiRunLimits) -> std::io::Result<()> {
             },
         )?;
     }
+    // SAFETY: the descriptor is held by the invocation proxy for the complete
+    // child lifetime and is only borrowed across this syscall.
+    let proxy_fd = unsafe { BorrowedFd::borrow_raw(inherited_proxy_fd) };
+    rustix::io::fcntl_setfd(proxy_fd, rustix::io::FdFlags::empty())?;
     rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
     Ok(())
 }
@@ -580,15 +591,19 @@ impl Drop for ProcessGroupGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn fake_command(script: &Path) -> SandboxCommand {
-        SandboxCommand {
+    fn fake_command(script: &Path) -> PiProcessCommand {
+        PiProcessCommand {
             program: script.to_owned(),
             arguments: Vec::new(),
             environment: Vec::new(),
+            current_directory: script.parent().unwrap().to_owned(),
+            inherited_proxy_fd: 0,
         }
     }
 
@@ -655,6 +670,36 @@ mod tests {
                 stderr_bytes: 4
             }
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_directory_descriptor_is_inherited_across_exec() {
+        let directory = tempfile::tempdir().unwrap();
+        let _listener = UnixListener::bind(directory.path().join("proxy.sock")).unwrap();
+        let directory_fd = std::fs::File::open(directory.path()).unwrap();
+        let (_script_dir, path) =
+            script("read _; test -S \"/proc/self/fd/${PROXY_FD}/proxy.sock\" || exit 9");
+        let (signals, ready, _activity) = signals();
+        ready.send(()).unwrap();
+        let plan = PiProcessCommand {
+            program: path.clone(),
+            arguments: Vec::new(),
+            environment: vec![(
+                OsString::from("PROXY_FD"),
+                OsString::from(directory_fd.as_raw_fd().to_string()),
+            )],
+            current_directory: path.parent().unwrap().to_owned(),
+            inherited_proxy_fd: directory_fd.as_raw_fd(),
+        };
+        assert!(run_command(
+            plan,
+            b"classify\n".to_vec(),
+            limits(),
+            signals,
+            never_cancel(),
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]

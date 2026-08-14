@@ -11,6 +11,7 @@ pub const PROTOCOL_VERSION: &str = "file-guardian-pi-proxy/2";
 pub const OUTPUT_SCHEMA_VERSION: &str = "file-guardian-pi-classifier/1";
 
 pub const REQUIRED_TOOLS: &[&str] = &[
+    "bash",
     "read",
     "grep",
     "find",
@@ -164,6 +165,7 @@ pub enum ProxyOperation {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeTool {
+    Bash,
     Read,
     Grep,
     Find,
@@ -831,11 +833,32 @@ mod tests {
         let mut obsolete = begin;
         obsolete["artifact_id"] = json!("a_01");
         assert!(serde_json::from_value::<ProxyRequest>(obsolete).is_err());
+        let bash = json!({
+            "protocol": PROTOCOL_VERSION,
+            "run_token": "opaque",
+            "request_id": 3,
+            "run_id": "run_01",
+            "analyzer_id": "pi-review",
+            "manifest_identity": manifest_identity(),
+            "type": "native_tool_begin",
+            "tool_call_id": "call_02",
+            "tool": "bash",
+            "path": "."
+        });
+        assert!(matches!(
+            serde_json::from_value::<ProxyRequest>(bash)
+                .unwrap()
+                .operation,
+            ProxyOperation::NativeToolBegin {
+                tool: NativeTool::Bash,
+                ..
+            }
+        ));
 
         let manifest = json!({
             "protocol": PROTOCOL_VERSION,
             "run_token": "opaque",
-            "request_id": 3,
+            "request_id": 4,
             "run_id": "run_01",
             "analyzer_id": "pi-review",
             "manifest_identity": manifest_identity(),
@@ -887,6 +910,7 @@ mod tests {
         assert_eq!(
             REQUIRED_TOOLS,
             [
+                "bash",
                 "read",
                 "grep",
                 "find",

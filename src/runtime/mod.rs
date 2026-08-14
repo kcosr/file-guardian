@@ -465,6 +465,7 @@ fn compile_pi_analyzer(
             expected_pi_version: pi.expected_pi_version.clone(),
             instruction_file: pi.instruction_file.clone(),
             trusted_extension: pi.trusted_extension.clone(),
+            tool_sidecar_runner: pi.tool_sidecar_runner.clone(),
             isolated_agent_dir: pi.isolated_agent_dir.clone(),
         },
         instruction: Arc::from(instruction),
@@ -531,7 +532,7 @@ fn compile_pi_analyzer(
         credential_environment: credentials,
         identity_material,
     })
-    .map_err(|_| RuntimeError::Pi("sandboxed Pi runtime preflight failed".to_string()))
+    .map_err(|_| RuntimeError::Pi("Pi runtime or tool-sidecar preflight failed".to_string()))
 }
 
 fn compile_policy_bindings(

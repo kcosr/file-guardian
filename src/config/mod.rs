@@ -832,6 +832,10 @@ impl AnalyzerConfig {
                     pi.trusted_extension.as_path(),
                 ),
                 (
+                    "analyzers.pi.tool_sidecar_runner",
+                    pi.tool_sidecar_runner.as_path(),
+                ),
+                (
                     "analyzers.pi.isolated_agent_dir",
                     pi.isolated_agent_dir.as_path(),
                 ),
@@ -894,6 +898,7 @@ pub struct PiConfig {
     pub thinking: String,
     pub instruction_file: PathBuf,
     pub trusted_extension: PathBuf,
+    pub tool_sidecar_runner: PathBuf,
     pub isolated_agent_dir: PathBuf,
     pub credentials: Vec<PiCredentialEnvConfig>,
     pub output_schema: String,
@@ -910,6 +915,10 @@ impl PiConfig {
             ),
             ("analyzers.pi.instruction_file", &self.instruction_file),
             ("analyzers.pi.trusted_extension", &self.trusted_extension),
+            (
+                "analyzers.pi.tool_sidecar_runner",
+                &self.tool_sidecar_runner,
+            ),
             ("analyzers.pi.isolated_agent_dir", &self.isolated_agent_dir),
         ] {
             validate_absolute(field, path)?;
@@ -957,9 +966,9 @@ impl PiConfig {
                 "Pi analyzer '{id}' requires output_schema = 'file-guardian-pi-classifier/1'"
             ));
         }
-        if self.tool_grant != "native-readonly-v1" {
+        if self.tool_grant != "sandboxed-shell-v1" {
             return invalid(format!(
-                "Pi analyzer '{id}' requires tool_grant = 'native-readonly-v1'"
+                "Pi analyzer '{id}' requires tool_grant = 'sandboxed-shell-v1'"
             ));
         }
         if self.credentials.is_empty() {
@@ -993,16 +1002,16 @@ pub enum PiPlatform {
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PiSandbox {
-    #[serde(rename = "bubblewrap-v1")]
-    BubblewrapV1,
+    #[serde(rename = "tool-sidecar-bubblewrap-v1")]
+    ToolSidecarBubblewrapV1,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PiNetworkMode {
-    /// The sandbox shares the host network solely because Pi must reach the
-    /// configured internal model. It does not claim network isolation.
-    HostInternalModel,
+    /// Pi uses normal host networking for its configured model transport. The
+    /// model-callable Bubblewrap tool sidecar has no network namespace access.
+    PiHostSidecarNone,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -2158,15 +2167,15 @@ path = "/srv/uploads"
     }
 
     #[test]
-    fn native_pi_contract_rejects_legacy_grant_and_search_query_limit() {
+    fn sidecar_pi_contract_rejects_legacy_grant_and_search_query_limit() {
         let old_grant = include_str!("../../docs/examples/active-authorization-v2.toml")
-            .replace("native-readonly-v1", "artifact-readonly-v1");
+            .replace("sandboxed-shell-v1", "native-readonly-v1");
         let config = parse(&old_grant).unwrap();
         assert!(config
             .validate()
             .unwrap_err()
             .to_string()
-            .contains("requires tool_grant = 'native-readonly-v1'"));
+            .contains("requires tool_grant = 'sandboxed-shell-v1'"));
 
         let old_search_limit = include_str!("../../docs/examples/active-authorization-v2.toml")
             .replace(

@@ -22,8 +22,11 @@ root when Node is installed:
 
 ```bash
 node --check src/analyzers/pi/assets/file_guardian_extension.js
+node --check src/analyzers/pi/assets/tool_sidecar_runner.js
 node --check tests/pi_extension_harness.mjs
+node --check tests/pi_tool_sidecar_harness.mjs
 node tests/pi_extension_harness.mjs
+node tests/pi_tool_sidecar_harness.mjs
 ```
 
 The Rust `pi_extension_contract` test invokes the same harness when `node` is
@@ -52,9 +55,12 @@ Pi from audit-only or establish the model as a filesystem security boundary.
 the strict runtime-manifest shape. Its hashes are placeholders, and a real
 manifest lists every regular file in the bundle exactly once except the
 manifest itself. The `executable` flag must match file mode. In addition to the
-shown categories, include every Pi/Node dependency and shared library actually
-needed by the selected platform. The Node ELF interpreter and runtime search
-path must resolve below sandbox `/runtime`; the example is not a ready-to-run
-bundle. `bin/rg` and `bin/fd` are mandatory manifest-pinned helpers used by the
-custom `grep` and `find` tools; they run without a shell, without an inherited
-environment, and with ignore processing disabled.
+shown categories, include every Pi/Node dependency needed by the selected
+platform. The sidecar receives no host library mounts, so its Node, Bash, and
+toolbox executables must be self-contained/static; the example is not a
+ready-to-run bundle. The manifest-pinned toolbox must include the Node launcher,
+noninteractive `bash`, `rg`, `fd`, and the command-line programs documented by
+the active configuration. Pi uses the host network, while every model-directed
+operating-system tool executes through the persistent networkless sidecar with
+an empty inherited environment. Search tools run with ignore processing
+disabled.

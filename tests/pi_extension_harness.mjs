@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { isAbsolute, posix } from "node:path";
 import vm from "node:vm";
 
 const extensionUrl = new URL("../src/analyzers/pi/assets/file_guardian_extension.js", import.meta.url);
@@ -10,12 +11,12 @@ source = source
 	.replace("export default function fileGuardianClassifierExtension", "function fileGuardianClassifierExtension");
 source += `
 globalThis.__fileGuardianTestHooks = {
-  boundedLineOutput,
   consumeManifestPage,
   manifestPageResult,
   normalizedToolCallId,
-  readLineWindow,
+  normalizedInputPath,
   requiredBoundedIntegerEnvironment,
+  sidecarArguments,
   getNextManifestCursor: () => nextManifestCursor,
 };
 `;
@@ -27,6 +28,11 @@ const environment = {
 	FILE_GUARDIAN_PI_MANIFEST_IDENTITY: `sha256:${"4".repeat(64)}`,
 	FILE_GUARDIAN_PI_ANALYZER_ID: "pi-review",
 	FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS: "37",
+	FILE_GUARDIAN_PI_BUBBLEWRAP: "/usr/bin/bwrap",
+	FILE_GUARDIAN_PI_RUNTIME_ROOT: "/opt/file-guardian/pi-runtime",
+	FILE_GUARDIAN_PI_RUNTIME_LAUNCHER: "bin/node",
+	FILE_GUARDIAN_PI_INPUT_VIEW: "/var/lib/file-guardian/view",
+	FILE_GUARDIAN_PI_TOOL_SIDECAR_RUNNER: "/usr/libexec/file-guardian/tool-sidecar-runner.js",
 };
 const Type = new Proxy(
 	{},
@@ -41,6 +47,8 @@ const context = {
 	Type,
 	clearTimeout,
 	console,
+	isAbsolute,
+	posix,
 	process: { env: environment },
 	setTimeout,
 };
@@ -101,19 +109,15 @@ const terminalPage = {
 assert.equal(hooks.consumeManifestPage(terminalPage), terminalPage);
 assert.equal(hooks.getNextManifestCursor(), 3);
 
-assert.equal(hooks.readLineWindow("one\ntwo\nthree", 2, 1), "two");
-assert.throws(
-	() => hooks.readLineWindow("one\ntwo", 3, 1),
-	(error) =>
-		error?.name === "RecoverableNativeToolError" &&
-		/Read offset is beyond end of file/.test(error.message),
-);
-
-const oversizedLine = "sensitive-partial-line".repeat(5000);
-const bounded = hooks.boundedLineOutput(["complete", oversizedLine], "(empty)", false, 10, "entry");
-assert.equal(bounded.resultCount, 1);
-assert.match(bounded.text, /^complete\n\n\[Truncated: 65536 output byte limit\]$/);
-assert.ok(!bounded.text.includes("sensitive-partial-line"));
-assert.ok(Buffer.byteLength(bounded.text, "utf8") <= 64 * 1024);
+assert.equal(hooks.normalizedInputPath("nested/./file.txt"), "nested/file.txt");
+for (const invalid of ["../secret", "/etc/passwd", "~/secret", "@/secret"]) {
+	assert.throws(() => hooks.normalizedInputPath(invalid), /relative to the immutable input/);
+}
+const sidecarArgs = hooks.sidecarArguments();
+assert.ok(sidecarArgs.includes("--unshare-all"));
+assert.ok(!sidecarArgs.includes("--share-net"));
+assert.ok(sidecarArgs.includes("/input"));
+assert.ok(sidecarArgs.includes("/work"));
+assert.ok(sidecarArgs.includes("/policy/tool-sidecar-runner.mjs"));
 
 console.log("Pi extension harness passed");

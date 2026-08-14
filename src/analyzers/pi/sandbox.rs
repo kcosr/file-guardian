@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
+use std::os::fd::RawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -14,9 +15,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-pub(crate) const SANDBOX_PROXY_SOCKET: &str = "/run/file-guardian/proxy.sock";
 pub(crate) const PI_TOOLS: &str =
-    "read,grep,find,ls,manifest_list,prior_observations,submit_classification";
+    "bash,read,grep,find,ls,manifest_list,prior_observations,submit_classification";
 /// Pi's `--mode` controls serialized stdout, independently of the extension
 /// context mode selected by `--print`.
 pub(crate) const PI_CLI_OUTPUT_MODE: &str = "text";
@@ -35,6 +35,7 @@ pub(crate) struct PiRuntimeSpec {
     pub expected_pi_version: String,
     pub instruction_file: PathBuf,
     pub trusted_extension: PathBuf,
+    pub tool_sidecar_runner: PathBuf,
     pub isolated_agent_dir: PathBuf,
 }
 
@@ -100,6 +101,7 @@ impl PreparedPiRuntime {
                 stamp_tree(&spec.runtime_root)?,
                 stamp_file(&spec.instruction_file)?,
                 stamp_file(&spec.trusted_extension)?,
+                stamp_file(&spec.tool_sidecar_runner)?,
             ];
             let identity = runtime_identity(&spec, &stamps);
             Ok(Self {
@@ -173,16 +175,18 @@ impl PreparedPiRuntime {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) struct SandboxCommand {
+pub(crate) struct PiProcessCommand {
     pub program: PathBuf,
     pub arguments: Vec<OsString>,
     pub environment: Vec<(OsString, OsString)>,
+    pub current_directory: PathBuf,
+    pub inherited_proxy_fd: RawFd,
 }
 
-impl std::fmt::Debug for SandboxCommand {
+impl std::fmt::Debug for PiProcessCommand {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("SandboxCommand")
+            .debug_struct("PiProcessCommand")
             .field("program", &self.program)
             .field("arguments", &self.arguments)
             .field(
@@ -193,16 +197,19 @@ impl std::fmt::Debug for SandboxCommand {
                     .map(|(name, _)| name)
                     .collect::<Vec<_>>(),
             )
+            .field("current_directory", &self.current_directory)
+            .field("inherited_proxy_fd", &self.inherited_proxy_fd)
             .finish()
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct SandboxInvocation<'a> {
+pub(crate) struct PiProcessInvocation<'a> {
     pub provider: &'a str,
     pub model: &'a str,
     pub thinking: &'a str,
-    pub proxy_endpoint_dir: &'a Path,
+    pub proxy_socket_path: &'a Path,
+    pub proxy_directory_fd: RawFd,
     pub analyzer_input_view: &'a Path,
     pub max_search_results: u64,
     pub proxy_token: &'a str,
@@ -212,28 +219,37 @@ pub(crate) struct SandboxInvocation<'a> {
     pub credential_environment: &'a [(OsString, OsString)],
 }
 
-pub(crate) fn compile_sandbox_command(
+pub(crate) fn compile_pi_process_command(
     runtime: &PreparedPiRuntime,
-    invocation: &SandboxInvocation<'_>,
-) -> Result<SandboxCommand, PiSandboxError> {
+    invocation: &PiProcessInvocation<'_>,
+) -> Result<PiProcessCommand, PiSandboxError> {
     debug_assert_eq!(PI_RUNTIME_CONTEXT_MODE, "print");
     runtime.revalidate()?;
-    validate_proxy_dir(invocation.proxy_endpoint_dir)?;
+    validate_proxy_socket_path(invocation.proxy_socket_path)?;
     validate_input_view(invocation.analyzer_input_view)?;
     validate_max_search_results(invocation.max_search_results)?;
     let mut environment = vec![
-        (OsString::from("HOME"), OsString::from("/home/pi")),
-        (OsString::from("PATH"), OsString::from("/runtime/bin")),
-        (OsString::from("TMPDIR"), OsString::from("/tmp")),
+        (
+            OsString::from("HOME"),
+            runtime.spec.isolated_agent_dir.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("PATH"),
+            runtime.spec.runtime_root.join("bin").into_os_string(),
+        ),
+        (
+            OsString::from("TMPDIR"),
+            runtime.spec.isolated_agent_dir.as_os_str().to_owned(),
+        ),
         (
             OsString::from("PI_CODING_AGENT_DIR"),
-            OsString::from("/config"),
+            runtime.spec.isolated_agent_dir.as_os_str().to_owned(),
         ),
         (OsString::from("PI_OFFLINE"), OsString::from("1")),
         (OsString::from("PI_TELEMETRY"), OsString::from("0")),
         (
             OsString::from("FILE_GUARDIAN_PI_PROXY_SOCKET"),
-            OsString::from(SANDBOX_PROXY_SOCKET),
+            invocation.proxy_socket_path.as_os_str().to_owned(),
         ),
         (
             OsString::from("FILE_GUARDIAN_PI_RUN_TOKEN"),
@@ -255,6 +271,26 @@ pub(crate) fn compile_sandbox_command(
             OsString::from("FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS"),
             OsString::from(invocation.max_search_results.to_string()),
         ),
+        (
+            OsString::from("FILE_GUARDIAN_PI_BUBBLEWRAP"),
+            runtime.spec.bubblewrap_executable.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("FILE_GUARDIAN_PI_RUNTIME_ROOT"),
+            runtime.spec.runtime_root.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("FILE_GUARDIAN_PI_RUNTIME_LAUNCHER"),
+            runtime.spec.launcher.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("FILE_GUARDIAN_PI_INPUT_VIEW"),
+            invocation.analyzer_input_view.as_os_str().to_owned(),
+        ),
+        (
+            OsString::from("FILE_GUARDIAN_PI_TOOL_SIDECAR_RUNNER"),
+            runtime.spec.tool_sidecar_runner.as_os_str().to_owned(),
+        ),
     ];
     let mut names = environment
         .iter()
@@ -268,93 +304,7 @@ pub(crate) fn compile_sandbox_command(
     environment.sort_by(|left, right| left.0.cmp(&right.0));
 
     let spec = &runtime.spec;
-    let extension_target = Path::new("/policy/file-guardian-extension.js");
-    let mut arguments = os_args(&[
-        "--unshare-all",
-        "--unshare-user",
-        "--share-net",
-        "--disable-userns",
-        "--assert-userns-disabled",
-        "--die-with-parent",
-        "--new-session",
-        "--hostname",
-        "file-guardian-pi",
-        "--cap-drop",
-        "ALL",
-        "--tmpfs",
-        "/",
-        "--dir",
-        "/runtime",
-        "--dir",
-        "/policy",
-        "--dir",
-        "/config",
-        "--dir",
-        "/input",
-        "--dir",
-        "/etc",
-        "--dir",
-        "/etc/ssl",
-        "--dir",
-        "/etc/ssl/certs",
-        "--dir",
-        "/run",
-        "--dir",
-        "/run/file-guardian",
-        "--dir",
-        "/home",
-        "--dir",
-        "/home/pi",
-        "--dir",
-        "/tmp",
-        "--dev",
-        "/dev",
-        "--ro-bind",
-    ]);
-    push_pair(&mut arguments, &spec.runtime_root, Path::new("/runtime"));
-    arguments.push(OsString::from("--ro-bind"));
-    push_pair(&mut arguments, &spec.trusted_extension, extension_target);
-    // Pi's credential/settings stores create lock files even for reads and may
-    // persist an OAuth refresh. This is dedicated agent state, not the user's
-    // ambient Pi home. Every other persistent mount remains read-only, and no
-    // model-callable tool can address /config.
-    arguments.push(OsString::from("--bind"));
-    push_pair(
-        &mut arguments,
-        &spec.isolated_agent_dir,
-        Path::new("/config"),
-    );
-    for (source, target) in [
-        ("etc/resolv.conf", "/etc/resolv.conf"),
-        ("etc/hosts", "/etc/hosts"),
-        ("etc/nsswitch.conf", "/etc/nsswitch.conf"),
-        (
-            "etc/ssl/certs/ca-certificates.crt",
-            "/etc/ssl/certs/ca-certificates.crt",
-        ),
-    ] {
-        arguments.push(OsString::from("--ro-bind"));
-        push_pair(
-            &mut arguments,
-            &spec.runtime_root.join(source),
-            Path::new(target),
-        );
-    }
-    arguments.push(OsString::from("--ro-bind"));
-    push_pair(
-        &mut arguments,
-        invocation.proxy_endpoint_dir,
-        Path::new("/run/file-guardian"),
-    );
-    arguments.push(OsString::from("--ro-bind"));
-    push_pair(
-        &mut arguments,
-        invocation.analyzer_input_view,
-        Path::new("/input"),
-    );
-    arguments.extend(os_args(&["--chdir", "/input", "--"]));
-    arguments.push(sandbox_runtime_path(&spec.launcher)?);
-    arguments.push(sandbox_runtime_path(&spec.pi_entrypoint)?);
+    let mut arguments = vec![spec.runtime_root.join(&spec.pi_entrypoint).into_os_string()];
     arguments.extend(os_args(&[
         "--print",
         "--mode",
@@ -366,7 +316,7 @@ pub(crate) fn compile_sandbox_command(
         "--no-extensions",
         "--extension",
     ]));
-    arguments.push(extension_target.as_os_str().to_owned());
+    arguments.push(spec.trusted_extension.as_os_str().to_owned());
     arguments.extend(os_args(&[
         "--no-skills",
         "--no-prompt-templates",
@@ -380,10 +330,12 @@ pub(crate) fn compile_sandbox_command(
         "--thinking",
         invocation.thinking,
     ]));
-    Ok(SandboxCommand {
-        program: spec.bubblewrap_executable.clone(),
+    Ok(PiProcessCommand {
+        program: spec.runtime_root.join(&spec.launcher),
         arguments,
         environment,
+        current_directory: spec.isolated_agent_dir.clone(),
+        inherited_proxy_fd: invocation.proxy_directory_fd,
     })
 }
 
@@ -394,6 +346,7 @@ fn validate_runtime_spec(spec: &PiRuntimeSpec) -> Result<(), PiSandboxError> {
         &spec.runtime_manifest,
         &spec.instruction_file,
         &spec.trusted_extension,
+        &spec.tool_sidecar_runner,
         &spec.isolated_agent_dir,
     ] {
         if !path.is_absolute() {
@@ -456,45 +409,48 @@ fn verify_runtime_manifest(
     }
     if !declared.get(launcher).is_some_and(|entry| entry.executable)
         || !declared.contains_key(entrypoint)
+        || !declared.contains_key(Path::new("share/misc/magic.mgc"))
         || [
+            "bin/bash",
+            "bin/cat",
+            "bin/head",
+            "bin/tail",
+            "bin/wc",
+            "bin/sort",
+            "bin/cut",
+            "bin/tr",
+            "bin/xargs",
+            "bin/cp",
+            "bin/mkdir",
+            "bin/mv",
+            "bin/rm",
+            "bin/touch",
             "bin/rg",
             "bin/fd",
-            "etc/resolv.conf",
-            "etc/hosts",
-            "etc/nsswitch.conf",
-            "etc/ssl/certs/ca-certificates.crt",
+            "bin/grep",
+            "bin/find",
+            "bin/ls",
+            "bin/sed",
+            "bin/awk",
+            "bin/file",
+            "bin/jq",
+            "bin/tar",
+            "bin/unzip",
         ]
         .iter()
-        .any(|path| !declared.contains_key(Path::new(path)))
-        || !declared
-            .get(Path::new("bin/rg"))
-            .is_some_and(|entry| entry.executable)
-        || !declared
-            .get(Path::new("bin/fd"))
-            .is_some_and(|entry| entry.executable)
+        .any(|path| {
+            !declared
+                .get(Path::new(path))
+                .is_some_and(|entry| entry.executable)
+        })
     {
         return Err(PiSandboxError::InvalidRuntime);
     }
     Ok(())
 }
 
-fn validate_proxy_dir(path: &Path) -> Result<(), PiSandboxError> {
-    if !path.is_absolute() {
-        return Err(PiSandboxError::InvalidRuntime);
-    }
-    let metadata = fs::symlink_metadata(path).map_err(|_| PiSandboxError::InvalidRuntime)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.mode() & 0o077 != 0 {
-        return Err(PiSandboxError::InvalidRuntime);
-    }
-    let entries = fs::read_dir(path).map_err(|_| PiSandboxError::InvalidRuntime)?;
-    let names = entries
-        .map(|entry| {
-            entry
-                .map(|entry| entry.file_name())
-                .map_err(|_| PiSandboxError::InvalidRuntime)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if names != [OsString::from("proxy.sock")] {
+fn validate_proxy_socket_path(path: &Path) -> Result<(), PiSandboxError> {
+    if !path.is_absolute() || path.file_name() != Some(OsStr::new("proxy.sock")) {
         return Err(PiSandboxError::InvalidRuntime);
     }
     Ok(())
@@ -554,6 +510,11 @@ fn validate_environment(
         "FILE_GUARDIAN_PI_RUN_ID",
         "FILE_GUARDIAN_PI_MANIFEST_IDENTITY",
         "FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS",
+        "FILE_GUARDIAN_PI_BUBBLEWRAP",
+        "FILE_GUARDIAN_PI_RUNTIME_ROOT",
+        "FILE_GUARDIAN_PI_RUNTIME_LAUNCHER",
+        "FILE_GUARDIAN_PI_INPUT_VIEW",
+        "FILE_GUARDIAN_PI_TOOL_SIDECAR_RUNNER",
     ];
     if name.is_empty()
         || !name
@@ -773,12 +734,6 @@ fn normalize_relative(path: &Path) -> Result<PathBuf, PiSandboxError> {
     Ok(normalized)
 }
 
-fn sandbox_runtime_path(relative: &Path) -> Result<OsString, PiSandboxError> {
-    Ok(Path::new("/runtime")
-        .join(normalize_relative(relative)?)
-        .into_os_string())
-}
-
 fn hex_digest(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -788,11 +743,6 @@ fn invalid_io(_: io::Error) -> PiSandboxError {
 fn os_args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
-fn push_pair(arguments: &mut Vec<OsString>, source: &Path, target: &Path) {
-    arguments.push(source.as_os_str().to_owned());
-    arguments.push(target.as_os_str().to_owned());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,9 +774,8 @@ mod tests {
                 runtime.join("lib"),
                 runtime.join("lib/pi"),
                 runtime.join("lib/pi/dist"),
-                runtime.join("etc"),
-                runtime.join("etc/ssl"),
-                runtime.join("etc/ssl/certs"),
+                runtime.join("share"),
+                runtime.join("share/misc"),
                 root.path().join("config"),
                 root.path().join("proxy"),
                 root.path().join("input"),
@@ -836,13 +785,33 @@ mod tests {
             }
             let files = [
                 ("bin/node", b"static-node".as_slice(), true),
+                ("bin/bash", b"static-bash", true),
+                ("bin/cat", b"static-cat", true),
+                ("bin/head", b"static-head", true),
+                ("bin/tail", b"static-tail", true),
+                ("bin/wc", b"static-wc", true),
+                ("bin/sort", b"static-sort", true),
+                ("bin/cut", b"static-cut", true),
+                ("bin/tr", b"static-tr", true),
+                ("bin/xargs", b"static-xargs", true),
+                ("bin/cp", b"static-cp", true),
+                ("bin/mkdir", b"static-mkdir", true),
+                ("bin/mv", b"static-mv", true),
+                ("bin/rm", b"static-rm", true),
+                ("bin/touch", b"static-touch", true),
                 ("bin/rg", b"static-ripgrep", true),
                 ("bin/fd", b"static-fd", true),
+                ("bin/grep", b"static-grep", true),
+                ("bin/find", b"static-find", true),
+                ("bin/ls", b"static-ls", true),
+                ("bin/sed", b"static-sed", true),
+                ("bin/awk", b"static-awk", true),
+                ("bin/file", b"static-file", true),
+                ("bin/jq", b"static-jq", true),
+                ("bin/tar", b"static-tar", true),
+                ("bin/unzip", b"static-unzip", true),
                 ("lib/pi/dist/cli.js", b"pi-entrypoint", false),
-                ("etc/resolv.conf", b"nameserver 127.0.0.1\n", false),
-                ("etc/hosts", b"127.0.0.1 localhost\n", false),
-                ("etc/nsswitch.conf", b"hosts: files dns\n", false),
-                ("etc/ssl/certs/ca-certificates.crt", b"test-ca\n", false),
+                ("share/misc/magic.mgc", b"file-magic-database", false),
             ];
             let mut entries = Vec::new();
             for (relative, bytes, executable) in files {
@@ -874,10 +843,12 @@ mod tests {
             let bwrap = root.path().join("bwrap");
             let instruction = root.path().join("instruction.md");
             let extension = root.path().join("extension.js");
+            let sidecar_runner = root.path().join("tool-sidecar-runner.js");
             for (path, bytes, mode) in [
                 (&bwrap, b"fake-bwrap".as_slice(), 0o700),
                 (&instruction, b"trusted instruction", 0o600),
                 (&extension, b"trusted extension", 0o600),
+                (&sidecar_runner, b"trusted sidecar runner", 0o600),
             ] {
                 fs::write(path, bytes).unwrap();
                 fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
@@ -900,6 +871,7 @@ mod tests {
                     expected_pi_version: "0.83.0".into(),
                     instruction_file: instruction,
                     trusted_extension: extension,
+                    tool_sidecar_runner: sidecar_runner,
                     isolated_agent_dir: root.path().join("config"),
                 },
                 proxy,
@@ -933,7 +905,7 @@ mod tests {
     fn command_debug_and_argv_never_contain_secret_environment_values() {
         let secret = "sentinel-provider-secret";
         let token = "sentinel-run-token";
-        let command = SandboxCommand {
+        let command = PiProcessCommand {
             program: PathBuf::from("/usr/bin/bwrap"),
             arguments: os_args(&["--unshare-all", "--", "/runtime/bin/node"]),
             environment: vec![
@@ -943,6 +915,8 @@ mod tests {
                     OsString::from(token),
                 ),
             ],
+            current_directory: PathBuf::from("/private/pi"),
+            inherited_proxy_fd: 7,
         };
         let debug = format!("{command:?}");
         let argv = command
@@ -1036,18 +1010,19 @@ mod tests {
     }
 
     #[test]
-    fn manifest_pinned_bundle_compiles_exact_confinement_command() {
+    fn manifest_pinned_bundle_compiles_normal_pi_with_sidecar_settings() {
         let fixture = Fixture::new();
         let prepared = fixture.prepare();
         prepared.revalidate().unwrap();
         let credentials = [(OsString::from("INTERNAL_API_KEY"), OsString::from("secret"))];
-        let command = compile_sandbox_command(
+        let command = compile_pi_process_command(
             &prepared,
-            &SandboxInvocation {
+            &PiProcessInvocation {
                 provider: "internal",
                 model: "classified-model",
                 thinking: "high",
-                proxy_endpoint_dir: &fixture.proxy,
+                proxy_socket_path: &fixture.proxy.join("proxy.sock"),
+                proxy_directory_fd: 7,
                 analyzer_input_view: &fixture.input,
                 max_search_results: 37,
                 proxy_token: "token",
@@ -1063,19 +1038,19 @@ mod tests {
             .iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        let entrypoint = fixture
+            .spec
+            .runtime_root
+            .join("lib/pi/dist/cli.js")
+            .to_string_lossy()
+            .into_owned();
+        let extension = fixture
+            .spec
+            .trusted_extension
+            .to_string_lossy()
+            .into_owned();
         for required in [
-            "--unshare-all",
-            "--unshare-user",
-            "--share-net",
-            "--disable-userns",
-            "--assert-userns-disabled",
-            "--die-with-parent",
-            "--new-session",
-            "--cap-drop",
-            "--tmpfs",
-            "--dev",
-            "/runtime/bin/node",
-            "/runtime/lib/pi/dist/cli.js",
+            entrypoint.as_str(),
             "--print",
             "--mode",
             PI_CLI_OUTPUT_MODE,
@@ -1083,7 +1058,7 @@ mod tests {
             "--no-builtin-tools",
             PI_TOOLS,
             "--no-extensions",
-            "/policy/file-guardian-extension.js",
+            extension.as_str(),
             "--no-skills",
             "--no-prompt-templates",
             "--no-themes",
@@ -1096,102 +1071,15 @@ mod tests {
             );
         }
         assert!(!args.iter().any(|value| value == "--system-prompt"));
-        assert!(!args
-            .iter()
-            .any(|value| value == "--proc" || value == "/proc"));
-        assert!(args
-            .windows(2)
-            .any(|values| values == ["--chdir", "/input"]));
+        assert!(!args.iter().any(|value| value.starts_with("--unshare")));
+        assert!(!args.iter().any(|value| value == "--ro-bind"));
         assert!(args
             .windows(2)
             .any(|values| values == ["--mode", PI_CLI_OUTPUT_MODE]));
         assert_eq!(PI_RUNTIME_CONTEXT_MODE, "print");
-        assert!(!args
-            .windows(3)
-            .any(|values| values[0] == "--ro-bind" && values[1] == "/"));
-        assert!(!args
-            .iter()
-            .any(|value| value.contains("staging") || value.contains("objects")));
-        for target in [
-            "/runtime",
-            "/policy/file-guardian-extension.js",
-            "/config",
-            "/input",
-            "/run/file-guardian",
-            "/etc/resolv.conf",
-            "/etc/hosts",
-            "/etc/nsswitch.conf",
-            "/etc/ssl/certs/ca-certificates.crt",
-        ] {
-            assert!(
-                args.iter().any(|value| value == target),
-                "missing mount {target}"
-            );
-        }
-        let actual_mounts = args
-            .windows(3)
-            .filter(|values| values[0] == "--ro-bind")
-            .map(|values| (values[1].clone(), values[2].clone()))
-            .collect::<BTreeSet<_>>();
-        assert!(!actual_mounts.iter().any(|(source, _)| {
-            Path::new(source) == fixture._root.path()
-                || Path::new(source) == fixture.input.parent().unwrap()
-        }));
-        let expected_mounts = [
-            (fixture.spec.runtime_root.clone(), PathBuf::from("/runtime")),
-            (
-                fixture.spec.trusted_extension.clone(),
-                PathBuf::from("/policy/file-guardian-extension.js"),
-            ),
-            (
-                fixture.spec.runtime_root.join("etc/resolv.conf"),
-                PathBuf::from("/etc/resolv.conf"),
-            ),
-            (
-                fixture.spec.runtime_root.join("etc/hosts"),
-                PathBuf::from("/etc/hosts"),
-            ),
-            (
-                fixture.spec.runtime_root.join("etc/nsswitch.conf"),
-                PathBuf::from("/etc/nsswitch.conf"),
-            ),
-            (
-                fixture
-                    .spec
-                    .runtime_root
-                    .join("etc/ssl/certs/ca-certificates.crt"),
-                PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
-            ),
-            (fixture.proxy.clone(), PathBuf::from("/run/file-guardian")),
-            (fixture.input.clone(), PathBuf::from("/input")),
-        ]
-        .into_iter()
-        .map(|(source, target)| {
-            (
-                source.to_string_lossy().into_owned(),
-                target.to_string_lossy().into_owned(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-        assert_eq!(actual_mounts, expected_mounts);
-        let writable_mounts = args
-            .windows(3)
-            .filter(|values| values[0] == "--bind")
-            .map(|values| (values[1].clone(), values[2].clone()))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            writable_mounts,
-            [(
-                fixture
-                    .spec
-                    .isolated_agent_dir
-                    .to_string_lossy()
-                    .into_owned(),
-                "/config".to_string(),
-            )]
-            .into_iter()
-            .collect()
-        );
+        assert_eq!(command.program, fixture.spec.runtime_root.join("bin/node"));
+        assert_eq!(command.current_directory, fixture.spec.isolated_agent_dir);
+        assert_eq!(command.inherited_proxy_fd, 7);
         let debug = format!("{command:?}");
         assert!(!args
             .iter()
@@ -1215,6 +1103,11 @@ mod tests {
             "FILE_GUARDIAN_PI_RUN_ID",
             "FILE_GUARDIAN_PI_MANIFEST_IDENTITY",
             "FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS",
+            "FILE_GUARDIAN_PI_BUBBLEWRAP",
+            "FILE_GUARDIAN_PI_RUNTIME_ROOT",
+            "FILE_GUARDIAN_PI_RUNTIME_LAUNCHER",
+            "FILE_GUARDIAN_PI_INPUT_VIEW",
+            "FILE_GUARDIAN_PI_TOOL_SIDECAR_RUNNER",
             "INTERNAL_API_KEY",
         ] {
             assert!(names.contains(name));
@@ -1228,7 +1121,7 @@ mod tests {
                 .iter()
                 .find(|(name, _)| name == "PATH")
                 .map(|(_, value)| value),
-            Some(&OsString::from("/runtime/bin"))
+            Some(&fixture.spec.runtime_root.join("bin").into_os_string())
         );
         assert_eq!(
             command
@@ -1242,13 +1135,14 @@ mod tests {
 
     #[test]
     fn prepared_assets_are_revalidated_and_change_identity() {
-        for choose in 0..2 {
+        for choose in 0..3 {
             let fixture = Fixture::new();
             let prepared = fixture.prepare();
             let old_identity = prepared.identity();
             let path = match choose {
                 0 => &fixture.spec.instruction_file,
                 1 => &fixture.spec.trusted_extension,
+                2 => &fixture.spec.tool_sidecar_runner,
                 _ => unreachable!(),
             };
             fs::write(path, b"mutated asset bytes").unwrap();
@@ -1279,7 +1173,7 @@ mod tests {
         assert!(PreparedPiRuntime::prepare(extra.spec).is_err());
 
         let missing = Fixture::new();
-        fs::remove_file(missing.spec.runtime_root.join("etc/hosts")).unwrap();
+        fs::remove_file(missing.spec.runtime_root.join("bin/bash")).unwrap();
         assert!(PreparedPiRuntime::prepare(missing.spec).is_err());
 
         let writable = Fixture::new();

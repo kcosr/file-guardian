@@ -314,43 +314,37 @@ protocol, task, budget, or read failure into success.
 ### Internal Pi classifier
 
 The internal Pi-based LLM may read sensitive captured content because the
-selected model and transport are approved for it. It remains transaction-scoped
-and read-only. File Guardian invokes an administrator-pinned Pi runtime without
-a shell or discovered user customizations, exposes only the pinned
-File Guardian `read`, `grep`, `find`, `ls`, `manifest_list`,
-`prior_observations`, and `submit_classification` tools, requires strict
-terminal structured output, and validates all classifications against an
-administrator vocabulary.
+selected model and transport are approved for it. It remains transaction-scoped.
+File Guardian invokes an administrator-pinned Pi runtime without discovered
+user customizations, disables Pi built-ins, and exposes only the pinned File
+Guardian `bash`, `read`, `grep`, `find`, `ls`, `manifest_list`,
+`prior_observations`, and `submit_classification` tools. Terminal structured
+output remains strict and vocabulary-bound.
 
-On Linux, Bubblewrap confinement is mandatory and has no unsandboxed fallback.
-The sandbox mounts the administrator-prepared runtime and policy material, but
-neither live staging nor the invocation object store. It mounts a generated,
-immutable, text-only assigned-file view at `/input`. A private per-run Unix
-socket carries authenticated `file-guardian-pi-proxy/2` audit/control records,
-manifest mappings, compact prior observations, and terminal output. The host
-schema-validates requests and enforces tool-call, byte-read, output, view, time,
-and process limits. Unsupported platforms,
+Pi itself is a normal supervised host process so credentials and approved model
+networking stay with Pi. On Linux, model-directed OS execution is confined:
+the trusted extension starts one persistent Bubblewrap sidecar per
+classification. The sidecar has no network, credentials, Pi home, proxy
+capability, host filesystem, or File Guardian workspace. It sees only a
+generated immutable text view at `/input`, a read-only manifest-pinned toolbox,
+and ephemeral writable `/work` and `/tmp`. Unsupported platforms,
 missing or mismatched runtime assets, sandbox startup failure, handshake or
 protocol disagreement, unavailable tools, invalid terminal output, budget
 exhaustion, timeout, abnormal exit, and incomplete coverage all produce exit
 `30`.
 
-The exact grant is closed. `read` and `ls` are bounded Node implementations;
-`grep` and `find` invoke only manifest-pinned `rg` and `fd` directly, without a
-shell or inherited helper environment, and always use `--hidden --no-ignore`.
-All native paths are relative to `/input`, every call has paired authenticated
-begin/end accounting. Each end record has exactly one of `completed`,
+The exact grant is closed. `bash`, `read`, `grep`, `find`, and `ls` all use the
+same persistent sidecar through inherited pipes; Bubblewrap is not restarted
+per call. Bash may read `/input` and write `/work`, including using pinned
+`sed`, `awk`, `file`, `jq`, `tar`, and `unzip`, but cannot change input, reach
+host paths, or open network connections. Every executable call has paired
+authenticated begin/end accounting. Each end record has exactly one of `completed`,
 `recoverable_error`, or `fatal_error`. Invalid model-supplied search patterns
 or arguments produce a sanitized recoverable tool result so the model can
-retry. Path resolution, authentication, accounting, helper process, proxy, and
-other integrity failures are fatal and invalidate the run. Bounded search and
-listing output ends only at complete line boundaries and carries a deterministic
-truncation notice. There is no model-callable bash, general subprocess,
-arbitrary path or `/proc` access, mutation, write/edit, quarantine, deletion,
-credential, or File Guardian control tool. The sandbox keeps network access
-required by Pi's configured model transport. Bubblewrap therefore provides
-filesystem/process confinement, not destination-limited model egress;
-deployments must restrict the shared transport to approved internal endpoints.
+retry. Authentication, accounting, sidecar process, proxy, and other integrity
+failures are fatal and invalidate the run. The sidecar has no `/proc` or
+network, and command descendants are killed after each request. File Guardian
+control tools never execute in the sidecar.
 
 `manifest_list` is cursor-paged and byte-bounded. Each response contains its
 host-wire `cursor`, an `entries` slice, and `next_cursor`. The model-facing tool
@@ -363,10 +357,11 @@ view—including the configured 100,000-file ceiling—is supported across
 multiple bounded responses rather than serialized as one message.
 
 The runtime configuration fixes `platform = "linux"`,
-`sandbox = "bubblewrap-v1"`, `network = "host_internal_model"`, absolute
+`sandbox = "tool-sidecar-bubblewrap-v1"`,
+`network = "pi_host_sidecar_none"`, absolute
 administrator roots and executables, normalized runtime-relative manifest,
 Node launcher and Pi entrypoint paths, expected Bubblewrap and Pi versions,
-provider/model/thinking, the instruction and reviewed extension, the isolated
+provider/model/thinking, the instruction, reviewed extension and sidecar runner, the isolated
 agent-state path and security contract, output schema, tool grant, closed
 vocabulary, and exhaustive nonzero limits. Mutable agent-state contents are
 not hashed into pipeline identity because Pi may update locks, settings, and
@@ -377,33 +372,18 @@ endpoint, and invocation paths are neither config identity nor report material.
 Secret values and the run token must not appear in process arguments or other
 process-list-visible command material.
 
-The manifest-pinned runtime bundle is self-contained, including Node, its
-dynamic loader and shared libraries, the Pi package and dependencies, and the
-CA/resolver material required by the approved model transport. The sandbox
-does not mount host `/lib`, `/usr`, or `/etc`; missing or unmanifested runtime
-assets fail closed.
+The manifest-pinned runtime bundle is self-contained, including a self-contained
+Node executable, Pi and its dependencies, and statically linked Bash, common
+text/core utilities, `rg`, `fd`, `sed`, `awk`, `file`, `jq`, `tar`, and
+`unzip`. Sidecar executables cannot depend on unmounted host libraries. The
+sidecar does not mount host `/lib`, `/usr`, or `/etc`; missing or unmanifested
+assets fail closed. Pi itself uses the host resolver and CA
+configuration for its approved model transport. The fixed environment includes
+`PI_OFFLINE=1` and `PI_TELEMETRY=0`.
 
-A dynamic launcher has a sandbox-visible interpreter and runtime search path
-below `/runtime`; copying an ordinary host Node executable is insufficient.
-The manifest declares bundle-local `etc/resolv.conf`, `etc/hosts`,
-`etc/nsswitch.conf`, and the CA bundle, which are mounted individually at their
-conventional `/etc` paths. The fixed environment includes `PI_OFFLINE=1` and
-`PI_TELEMETRY=0`: approved provider inference remains available through the
-shared network, while incidental discovery and telemetry are disabled.
-
-Production runtime/policy assets are root-owned, not owner-writable, and read
-by a dedicated service UID. The isolated Pi agent-state directory is a narrow
-exception: it is a mode-0700 dedicated copy writable only by that UID because
-Pi creates credential/settings locks and may persist OAuth refreshes. The
-implementation's preflight hashing and revalidation detect ordinary changes,
-but path-based reopening and writable agent state do not eliminate hostile
-same-UID mutation races; administrative ownership is part of the deployment
-trust boundary.
-
-`RLIMIT_NPROC` is a per-real-UID host-wide ceiling on Linux rather than a
-sandbox-local process count. Deploy Pi under a dedicated service UID and leave
-enough headroom for Node threads and concurrently running analyzers; use cgroup
-PID and memory controls when hard per-invocation aggregate limits are required.
+The protected runtime/policy assets and owner-only isolated Pi agent directory
+are part of the invoking user's trust boundary. A dedicated service UID is not
+required by this design.
 
 Every classification code for every profile that selects Pi has exactly one
 classification binding and its directive is `audit`. Wildcard, missing,

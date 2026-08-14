@@ -99,7 +99,16 @@ fn runtime_manifest_example_is_valid_json_with_canonical_placeholder_hashes() {
         .iter()
         .map(|file| file["path"].as_str().expect("string path"))
         .collect::<std::collections::BTreeSet<_>>();
-    for required in ["bin/node", "bin/rg", "bin/fd", "lib/pi/dist/cli.js"] {
+    for required in [
+        "bin/node",
+        "bin/bash",
+        "bin/rg",
+        "bin/fd",
+        "bin/tar",
+        "bin/unzip",
+        "lib/pi/dist/cli.js",
+        "share/misc/magic.mgc",
+    ] {
         assert!(
             paths.contains(required),
             "missing pinned runtime asset {required}"

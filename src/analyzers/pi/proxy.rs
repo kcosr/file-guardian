@@ -108,8 +108,9 @@ pub struct PiProxyOutcome {
 #[derive(Clone)]
 pub struct PiProxyEndpoint {
     endpoint_dir: PathBuf,
-    #[cfg(test)]
     host_socket_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    directory_fd: std::os::fd::RawFd,
     run_token: Arc<str>,
 }
 
@@ -124,15 +125,28 @@ impl std::fmt::Debug for PiProxyEndpoint {
 }
 
 impl PiProxyEndpoint {
-    pub fn endpoint_dir(&self) -> &Path {
+    #[cfg(test)]
+    pub(crate) fn endpoint_dir(&self) -> &Path {
         &self.endpoint_dir
     }
 
     /// Descriptor-short host path. This is never mounted into the sandbox or
     /// included in reports and is valid only while the proxy owns its endpoint.
-    #[cfg(test)]
     pub(crate) fn host_socket_path(&self) -> &Path {
         &self.host_socket_path
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn directory_fd(&self) -> std::os::fd::RawFd {
+        self.directory_fd
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn directory_fd(&self) -> std::os::fd::RawFd {
+        // PreparedPiRuntime rejects the Pi analyzer before launch on non-Linux
+        // platforms. This keeps the shared orchestration type-checkable without
+        // weakening the Linux descriptor-inheritance contract.
+        -1
     }
 
     /// Secret capability passed only through the scrubbed child environment.
@@ -178,8 +192,9 @@ impl PiProxy {
         let (stop_tx, stop_rx) = oneshot::channel();
         let endpoint = PiProxyEndpoint {
             endpoint_dir,
-            #[cfg(test)]
             host_socket_path: socket_path,
+            #[cfg(target_os = "linux")]
+            directory_fd: endpoint_directory.raw_directory_fd(),
             run_token: Arc::clone(&token),
         };
         let server = Server::new(input, token, limits, progress_tx)?;
@@ -498,6 +513,7 @@ impl Server {
                     .resolve_relative_path(&path)
                     .ok_or(PiProxyError::Unauthorized)?;
                 let charged_bytes = match (tool, node) {
+                    (NativeTool::Bash, AnalyzerViewNode::Directory { .. }) if path == "." => 0,
                     (NativeTool::Read, AnalyzerViewNode::File(entry)) => entry.byte_len,
                     (NativeTool::Grep, AnalyzerViewNode::File(entry)) => entry.byte_len,
                     (
@@ -526,7 +542,7 @@ impl Server {
                             .ok_or(PiProxyError::BudgetExceeded)?;
                         self.reserve_read(charged_bytes, self.limits.max_search_bytes_per_call)?;
                     }
-                    NativeTool::Find | NativeTool::Ls => {}
+                    NativeTool::Bash | NativeTool::Find | NativeTool::Ls => {}
                 }
                 self.charge_read(charged_bytes)?;
                 self.outstanding_native_tool = Some(OutstandingNativeTool {
@@ -2068,6 +2084,60 @@ mod tests {
         assert!(matches!(
             proxy.finish().await,
             Err(PiProxyError::ProtocolViolation)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn bash_is_audited_at_the_view_root_without_host_path_access() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    2,
+                    native_begin("bash-1", NativeTool::Bash, "."),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    3,
+                    native_end(
+                        "bash-1",
+                        NativeTool::Bash,
+                        ".",
+                        NativeToolOutcome::Completed,
+                        None,
+                        16,
+                        1,
+                    ),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::MissingTerminalSubmission)
         ));
         fixture.workspace.remove().unwrap();
     }

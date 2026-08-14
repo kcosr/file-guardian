@@ -291,7 +291,9 @@ digest mismatches always fail closed.
 Status: implemented on Linux, audit-only.
 
 The Pi analyzer is authorized to send sensitive staged content to the selected
-internal model. Its capabilities remain read-only and transaction-scoped.
+internal model. Captured input remains read-only and the invocation is
+transaction-scoped; tool-created scratch state is confined to ephemeral
+sidecar `/work`.
 
 File Guardian invokes an absolute executable directly, without a shell or
 discovered user customizations. Pi 0.83 uses `--thinking` (not
@@ -315,11 +317,12 @@ The executable, model, thinking level, administrator-owned instruction,
 structured-output schema, vocabulary, tool grant, selectors, and budgets are
 fixed by configuration and incorporated into pipeline identity.
 
-### Read-only tools
+### Sandboxed tools
 
 Pi's built-ins remain disabled. The pinned File Guardian extension registers
-exactly seven sequential tools:
+exactly eight sequential tools:
 
+- `bash`
 - `read`
 - `grep`
 - `find`
@@ -328,29 +331,28 @@ exactly seven sequential tools:
 - `prior_observations`
 - `submit_classification`
 
-`read`, `grep`, `find`, and `ls` are custom implementations, not ambient Pi
-tools. They accept only normalized relative paths beneath a generated immutable
-text-only view mounted read-only at `/input`. Absolute paths, `..`, NUL, `~`,
-leading `@`, symlinks, special files, and canonicalization escapes fail the
-run. The sandbox exposes no model-callable `bash`, shell, general subprocess,
-write, edit, delete, quarantine, arbitrary host-path, `/proc`, credential, or
-File Guardian control tool.
+`bash`, `read`, `grep`, `find`, and `ls` all execute through one persistent
+Bubblewrap sidecar. The extension starts it once during runtime authentication
+and communicates over inherited stdin/stdout using
+`file-guardian-tool-sidecar/1` JSON lines. The model never sees that protocol.
+The sidecar receives a read-only text view at `/input`, an ephemeral writable
+`/work` that persists across calls, and a manifest-pinned toolbox at `/runtime`.
+It receives no network, `/proc`, provider credential, proxy capability, Pi home,
+host filesystem, or File Guardian workspace.
 
-`read` and `ls` use bounded Node operations. `grep` and `find` execute only the
-manifest-pinned `/runtime/bin/rg` and `/runtime/bin/fd`, directly without a
-shell, with an empty helper environment and explicit `--hidden --no-ignore` so
-ignore files cannot hide assigned content. Native calls run sequentially and
-have closed parameter schemas, a 4,096-character path ceiling, a one-MiB file
-ceiling for `read`, a 64-KiB returned-output ceiling, bounded result counts,
-4-KiB helper diagnostic ceiling, and a ten-second helper deadline. Configured
-global/per-call read, search-scan, search-count, process-output, response, view
-file/entry/byte/depth, and wall-clock limits apply in addition; the extension
-rejects proxy responses larger than two MiB.
+Bash may freely run the pinned shell and utilities inside that boundary,
+including `sed`, `awk`, `file`, `jq`, `tar`, and `unzip`. The wrapper tools keep
+their convenient closed schemas; `grep` and `find` use pinned `rg`/`fd` with
+`--hidden --no-ignore`. Tool calls remain sequential, timed, output-bounded,
+and descendant processes are killed after each command. Bubblewrap is not
+restarted per call.
 
-Every native call is bracketed by authenticated `native_tool_begin` and
-`native_tool_end` records over `file-guardian-pi-proxy/2`. The host validates
-the presentation path against the materialized view, charges the exact file or
-directory operation to configured budgets, and accepts the tool result only
+Every executable call is bracketed by authenticated `native_tool_begin` and
+`native_tool_end` records over `file-guardian-pi-proxy/2`. For the path tools,
+the host validates the presentation path against the materialized view and
+charges the file or directory operation to configured budgets. Bash is charged
+as a tool call and recorded at the immutable view root; its filesystem and
+network boundary is enforced by the sidecar. The host accepts a result only
 when its path, call ID, result count, output bytes, and outcome match. The
 trusted extension hashes provider-specific tool-call IDs into fixed
 protocol-safe correlation IDs before either record is sent; raw provider IDs
@@ -359,9 +361,8 @@ outcomes are a closed set: `completed`, `recoverable_error`, and `fatal_error`.
 An invalid model-supplied search pattern or argument closes the audit record as
 `recoverable_error` with the safe `invalid_arguments` code and returns a
 sanitized retry instruction. Path/confinement, authentication, accounting,
-proxy, helper lifecycle, and other execution-integrity faults are fatal and
-permanently invalidate the run. Search and listing output is truncated only at
-complete line boundaries and includes a deterministic bounded notice.
+proxy, sidecar lifecycle, and other execution-integrity faults are fatal and
+permanently invalidate the run.
 
 `manifest_list` maps presentation paths to immutable artifact IDs through
 byte-bounded cursor pages. The authenticated host-wire request supplies
@@ -407,13 +408,11 @@ Unknown fields, extra prose, unknown IDs, wrong manifest identity, oversized
 output, invalid counts, inability to complete, timeout, process failure, or
 budget exhaustion make a required analyzer incomplete and produce exit `30`.
 
-The Pi process runs in a required OS sandbox. The Linux backend uses Bubblewrap
-and mounts neither live staging nor the invocation object store. Only verified
-UTF-8, NUL-free assigned files within the configured
-`max_read_bytes_per_call` ceiling (at most one MiB) are materialized into the
-read-only `/input` view; the proxy carries audit/control records and safe
-metadata/projections rather than file bytes. There is no unsandboxed fallback,
-and a selected Pi analyzer is unsupported on non-Linux platforms.
+Pi is a normal supervised host process so provider credentials and approved
+model networking remain with the model client. Its built-in tools are disabled.
+The Linux Bubblewrap requirement applies to the persistent tool sidecar, with
+no fallback to host tool execution. Only verified UTF-8, NUL-free assigned files
+within the configured text ceiling are materialized into its read-only `/input`.
 
 Ordinary binary assignments count as complete `not_applicable` coverage and do
 not invoke Pi. When every assignment is binary, Pi completes without emitting a
@@ -424,40 +423,29 @@ Recursive archive inspection is deferred: an archive is currently only an
 ordinary physical file and generally follows the binary rule above.
 
 An administrator prepares and protects the Pi runtime bundle, reviewed
-extension, instruction, and isolated agent-state path/security contract. The
+extension, sidecar runner, instruction, and isolated agent-state path. The
 bundle manifest pins the exact Pi version and every runtime file hash. File
 Guardian executes the normalized runtime-relative Node launcher with the
 normalized Pi CLI entrypoint directly, so it does not depend on a host `/usr/bin/env node`
-shebang. The manifest covers a self-contained Node runtime, dynamic loader and
-shared libraries, Pi package/dependencies, and CA/resolver material required by
-the approved model transport. File Guardian
+shebang. The manifest covers a self-contained Node executable, Pi and
+dependencies, and statically linked Bash, common text/core utilities, `rg`,
+`fd`, `sed`, `awk`, `file`, `jq`, `tar`, and `unzip`. Sidecar executables cannot
+depend on unmounted host libraries. File Guardian
 pins the immutable configured material in pipeline identity, excludes mutable
 agent-state contents that Pi may update, clears ambient
 customization, verifies the Pi/runtime handshake and exact tool grant, and
-supervises the Bubblewrap leader and its process group. Startup, idle and wall-clock deadlines;
+supervises Pi and its descendants. Startup, idle and wall-clock deadlines;
 process, memory and descriptor ceilings; concurrent bounded output draining;
 and terminate-then-kill cleanup prevent a failed child from outliving the
 authorization.
 
-Bubblewrap starts with user, mount, PID, IPC, UTS and cgroup isolation,
-explicitly shares only the host network namespace, disables nested user
-namespaces, drops all capabilities, and builds a temporary root. It mounts only
-the verified bundle at `/runtime`, reviewed extension at
-`/policy/file-guardian-extension.js`, isolated Pi agent state at `/config`, and
-the private socket directory at `/run/file-guardian`; `/home` and `/tmp` are
-temporary, and the process working directory is the read-only `/input` view.
-`/config` is the sole writable persistent mount because
-Pi creates credential/settings lock files and may persist OAuth refreshes. It
-is a dedicated private copy, never the user's ambient Pi home, and no
-model-callable tool can address it. Its entire tree must be current-UID owned
-and owner-only; those properties are revalidated before each launch. Verified bundle-local resolver, hosts,
-name-service, and CA files are mounted at their conventional `/etc` locations.
-The host instruction is supplied through the authenticated proxy, not as an
-argument or host-file mount.
-
-The sandbox does not mount host `/lib`, `/usr`, or `/etc`. A runtime bundle
-that omits its loader, libraries, trust roots, resolver configuration, or any
-declared dependency cannot execute and fails authorization closed.
+The sidecar Bubblewrap starts with user, mount, PID, IPC, UTS, cgroup, and
+network isolation, disables nested user namespaces, drops all capabilities, and
+builds a temporary root. It mounts only `/runtime`, `/input`, and the reviewed
+runner under `/policy`; `/work` and `/tmp` are temporary writable filesystems.
+It does not mount host `/lib`, `/usr`, `/etc`, `/proc`, the Pi agent directory,
+or the proxy endpoint. A runtime bundle that omits a declared sidecar dependency
+cannot execute and fails authorization closed.
 
 The private `file-guardian-pi-proxy/2` authenticates a run and accepts only
 versioned, schema-validated requests with monotonic request identities. It maps
@@ -468,7 +456,7 @@ submission closes access for that run.
 
 The reviewed extension obtains the trusted host instruction through a private
 authenticated bootstrap proxy operation before the agent starts. That
-operation is not model-callable. The exact active model grant remains the seven
+operation is not model-callable. The exact active model grant remains the eight
 tools listed above, including the terminal submission tool. `max_tool_calls`
 charges one unit for each model-tool invocation. A native invocation uses two
 authenticated proxy connections for its begin/end pair; the connection ceiling
@@ -479,12 +467,9 @@ After an authenticated tool, protocol, object-read, output, or budget error,
 the proxy permanently invalidates the run. A later well-formed terminal call
 cannot convert partial or failed analysis into complete coverage.
 
-Bubblewrap confines filesystem and process capabilities, but Pi still needs
-network access to the configured internal model transport. This is a shared
-model-transport network limitation rather than process-level destination
-allowlisting. Deployments must constrain the approved provider through their
-network or model gateway; File Guardian does not claim that the Pi sandbox
-denies every other destination.
+Pi's normal host process retains networking for its configured internal model
+transport. The Bubblewrap tool sidecar has no networking at all; no transparent
+proxy or destination policy is required for this work stream.
 
 Any runtime-bundle mismatch, platform or sandbox failure, handshake/version/
 model/thinking/tool disagreement, proxy or tool error, output overflow, timeout,
@@ -505,7 +490,7 @@ finding.
 | --- | --- |
 | Artifact prompt injection asks for a tool, path, or policy change | Content remains untrusted evidence; the fixed grant and host policy cannot change. A valid audit classification may complete, otherwise exit `30`. |
 | Model returns unknown fields, codes, IDs, counts, manifest identity, or claims coverage it did not receive | Reject the terminal submission, mark Pi coverage incomplete, and exit `30`. Do not echo the rejected payload. |
-| Pi stalls, floods output, crashes, forks, or ignores termination | Apply budgets, send TERM then KILL to the Bubblewrap leader group, drain bounded output, reap the leader, and exit `30`; Bubblewrap's PID namespace and `--die-with-parent` tear down the interior when its leader exits. |
+| Pi or its tool sidecar stalls, floods output, crashes, forks, or ignores termination | Apply deadlines and output caps, terminate the Pi process group, drain bounded output, and reap the leader; Bubblewrap's PID namespace and `--die-with-parent` tear down the sidecar. Exit `30`. |
 | Immutable runtime, extension, or instruction disagrees with its compiled identity, or mutable agent state violates its ownership/permission contract | Refuse execution before trusting model output and exit `30`. |
 | Concurrent runs attempt to reuse a token, socket, request ID, or candidate ID | Per-run authentication and namespace isolation reject the request without exposing either run's content. |
 | Pi reads sensitive immutable content successfully | The approved internal model transport may receive it. Reports, stdout, errors, and routine logs retain only normalized safe codes and counts, never the content, prompt, transcript, tool payload, or transport credential. |
@@ -646,10 +631,10 @@ task completion order; every required failure yields `30`.
 
 ### Phase 3b: Pi classifier
 
-Implemented on Linux: Pi process lifecycle, Bubblewrap confinement, private
-text-only input materialization, the seven custom native/host tools and v2 audit
-proxy, instruction/runtime identity, strict structured output, normalized
-classifications, and audit-only policy bindings.
+Implemented on Linux: normal host Pi model transport, a persistent networkless
+Bubblewrap tool sidecar, private text-only input materialization, eight custom
+tools and the v2 audit proxy, instruction/runtime identity, strict structured
+output, normalized classifications, and audit-only policy bindings.
 
 Gate: the approved internal model classifies a staged tree through its confined
 immutable input view; every required Pi failure yields `30`; audit

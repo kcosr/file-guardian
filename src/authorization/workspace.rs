@@ -240,6 +240,11 @@ impl AnalyzerEndpointDirectory {
         &self.path
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn raw_directory_fd(&self) -> std::os::fd::RawFd {
+        self.directory.as_raw_fd()
+    }
+
     /// Returns a short descriptor-rooted path for Unix-domain socket bind and
     /// host-side connect operations. The descriptor remains owned by this
     /// endpoint for the socket's entire lifetime, while the actual socket entry
