@@ -252,6 +252,16 @@ every native call is bounded and recorded through the authenticated
 `file-guardian-pi-proxy/2` protocol. There is no model-callable bash, general
 subprocess, arbitrary-path or `/proc` reader, write, or edit capability.
 
+`manifest_list` returns byte-bounded pages containing `cursor`,
+`next_cursor`, and `entries`; the model follows pages until `next_cursor` is
+`null`. This supports the configured 100,000-file view without requiring one
+unbounded response. Native tool completion is recorded as `completed`,
+`recoverable_error`, or `fatal_error`. Invalid model-supplied search patterns
+or arguments return a sanitized retryable result. Path confinement,
+authentication, accounting, helper process, and other integrity failures remain
+fatal. Search and listing truncation returns complete lines plus a deterministic
+notice, never a partial record.
+
 Binary assigned files are ordinary `not_applicable` Pi coverage and are omitted
 from `/input`. An all-binary Pi assignment completes without a classification
 and may allow only under the remaining complete policy; it is not positive

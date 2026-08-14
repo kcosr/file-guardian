@@ -1,6 +1,6 @@
 use file_guardian::analyzers::pi::protocol::{
-    ClassificationVocabulary, TerminalSubmission, TerminalValidationContext,
-    TerminalValidationLimits,
+    ClassificationVocabulary, NativeToolOutcome, ProxyOperation, TerminalSubmission,
+    TerminalValidationContext, TerminalValidationLimits,
 };
 use file_guardian::domain::{
     AnalyzerId, ArtifactId, Classification, ClassificationCode, ClassificationScope,
@@ -116,6 +116,32 @@ fn runtime_manifest_example_is_valid_json_with_canonical_placeholder_hashes() {
             .is_some_and(|path| !path.starts_with('/')));
         assert!(file["executable"].is_boolean());
     }
+}
+
+#[test]
+fn proxy_v2_fixture_requires_paged_manifests_and_closed_native_outcomes() {
+    let page_request = serde_json::to_value(ProxyOperation::ManifestList { cursor: 65_536 })
+        .expect("manifest operation serializes");
+    assert_eq!(
+        page_request,
+        serde_json::json!({"type":"manifest_list","cursor":65536})
+    );
+    assert!(serde_json::from_value::<ProxyOperation>(serde_json::json!({
+        "type": "manifest_list"
+    }))
+    .is_err());
+
+    for (outcome, wire) in [
+        (NativeToolOutcome::Completed, "completed"),
+        (NativeToolOutcome::RecoverableError, "recoverable_error"),
+        (NativeToolOutcome::FatalError, "fatal_error"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(outcome).unwrap(),
+            serde_json::json!(wire)
+        );
+    }
+    assert!(serde_json::from_value::<NativeToolOutcome>(serde_json::json!("retry")).is_err());
 }
 
 #[test]

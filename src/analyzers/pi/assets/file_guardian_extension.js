@@ -26,6 +26,7 @@ const DEFAULT_FIND_RESULTS = 1000;
 const DEFAULT_LS_ENTRIES = 500;
 const MAX_HELPER_STDERR_BYTES = 4096;
 const HELPER_TIMEOUT_MILLIS = 10000;
+const MAX_GREP_COLUMNS = 4096;
 const REQUIRED_TOOLS = Object.freeze([
 	"find",
 	"grep",
@@ -188,8 +189,41 @@ function proxyToolResult(result) {
 	return toolResult(JSON.stringify(result));
 }
 
+function manifestPageResult(result, cursor) {
+	if (
+		!hasExactKeys(result, ["schema", "manifest_identity", "cursor", "total_count", "entries", "next_cursor"]) ||
+		result.schema !== "file-guardian-pi-manifest-page/1" ||
+		result.manifest_identity !== manifestIdentity ||
+		result.cursor !== cursor ||
+		!Number.isSafeInteger(result.total_count) ||
+		result.total_count < 0 ||
+		!Array.isArray(result.entries) ||
+		!(result.next_cursor === null || Number.isSafeInteger(result.next_cursor))
+	) {
+		throw new Error("File Guardian proxy returned an invalid manifest page");
+	}
+	const pageEnd = cursor + result.entries.length;
+	if (
+		!Number.isSafeInteger(pageEnd) ||
+		pageEnd > result.total_count ||
+		(result.next_cursor === null
+			? pageEnd !== result.total_count
+			: result.entries.length === 0 || result.next_cursor !== pageEnd)
+	) {
+		throw new Error("File Guardian proxy returned a discontinuous manifest page");
+	}
+	return result;
+}
+
 function latchIntegrityFailure() {
 	integrityFailure ??= new Error("Pi read-only tool integrity check failed");
+}
+
+class RecoverableNativeToolError extends Error {
+	constructor(message) {
+		super(message);
+		this.name = "RecoverableNativeToolError";
+	}
 }
 
 function normalizedToolCallId(value) {
@@ -248,7 +282,16 @@ async function resolveInputPath(rawPath, expectedKind) {
 	return { absolute: canonical, relative: normalizedRelative, metadata };
 }
 
-async function finishNativeTool(toolCallId, tool, path, success, outputBytes, resultCount, signal) {
+async function finishNativeTool(
+	toolCallId,
+	tool,
+	path,
+	outcome,
+	errorCode,
+	outputBytes,
+	resultCount,
+	signal,
+) {
 	try {
 		const result = await proxyRequest(
 			"native_tool_end",
@@ -256,7 +299,8 @@ async function finishNativeTool(toolCallId, tool, path, success, outputBytes, re
 				tool_call_id: toolCallId,
 				tool,
 				path,
-				success,
+				outcome,
+				error_code: errorCode,
 				output_bytes: outputBytes,
 				result_count: resultCount,
 			},
@@ -299,11 +343,43 @@ async function executeNativeTool(toolCallIdValue, tool, relativePath, signal, op
 		) {
 			throw new Error("native tool returned an invalid bounded result");
 		}
-		await finishNativeTool(toolCallId, tool, relativePath, true, outputBytes, result.resultCount, signal);
+		await finishNativeTool(
+			toolCallId,
+			tool,
+			relativePath,
+			"completed",
+			null,
+			outputBytes,
+			result.resultCount,
+			signal,
+		);
 		return toolResult(result.text, result.details);
-	} catch {
+	} catch (error) {
+		if (error instanceof RecoverableNativeToolError) {
+			await finishNativeTool(
+				toolCallId,
+				tool,
+				relativePath,
+				"recoverable_error",
+				"invalid_arguments",
+				0,
+				0,
+				signal,
+			);
+			return toolResult(error.message, { recoverable: true, errorCode: "invalid_arguments" });
+		}
+		if (error === integrityFailure) throw error;
 		try {
-			await finishNativeTool(toolCallId, tool, relativePath, false, 0, 0, signal);
+			await finishNativeTool(
+				toolCallId,
+				tool,
+				relativePath,
+				"fatal_error",
+				"execution_failed",
+				0,
+				0,
+				signal,
+			);
 		} finally {
 			latchIntegrityFailure();
 		}
@@ -319,13 +395,53 @@ function truncateUtf8(value, maximumBytes) {
 	return { text: bytes.subarray(0, end).toString("utf8"), truncated: true };
 }
 
-function runHelper(program, argumentsList, signal, acceptedExitCodes, resultLimit, limitKind) {
+function boundedLineOutput(lines, emptyText, logicalLimitReached, logicalLimit, logicalKind) {
+	const maximumDataBytes = MAX_NATIVE_TOOL_OUTPUT_BYTES - MAX_NATIVE_NOTICE_BYTES;
+	const accepted = [];
+	let acceptedBytes = 0;
+	let outputByteLimitReached = false;
+	for (const line of lines) {
+		const separatorBytes = accepted.length === 0 ? 0 : 1;
+		const lineBytes = Buffer.byteLength(line, "utf8");
+		if (acceptedBytes + separatorBytes + lineBytes > maximumDataBytes) {
+			outputByteLimitReached = true;
+			break;
+		}
+		accepted.push(line);
+		acceptedBytes += separatorBytes + lineBytes;
+	}
+	const notice = outputByteLimitReached
+		? `\n\n[Truncated: ${MAX_NATIVE_TOOL_OUTPUT_BYTES} output byte limit]`
+		: logicalLimitReached
+			? `\n\n[Truncated: ${logicalLimit} ${logicalKind} limit]`
+			: "";
+	return {
+		text: `${accepted.join("\n") || emptyText}${notice}`,
+		resultCount: accepted.length,
+		details: outputByteLimitReached
+			? { outputByteLimitReached: MAX_NATIVE_TOOL_OUTPUT_BYTES }
+			: logicalLimitReached
+				? { [`${logicalKind}LimitReached`]: logicalLimit }
+				: {},
+	};
+}
+
+function runHelper(
+	program,
+	argumentsList,
+	signal,
+	acceptedExitCodes,
+	recoverableExitCodes,
+	resultLimit,
+	limitKind,
+) {
 	return new Promise((resolvePromise, reject) => {
 		let settled = false;
 		let stdout = Buffer.alloc(0);
 		let stderrBytes = 0;
-		let resultCount = 0;
-		let killedForLimit = false;
+		let completeLineCount = 0;
+		let killedForResultLimit = false;
+		let killedForOutputLimit = false;
 		const child = spawn(program, argumentsList, {
 			cwd: INPUT_ROOT,
 			env: {},
@@ -359,16 +475,19 @@ function runHelper(program, argumentsList, signal, acceptedExitCodes, resultLimi
 		signal?.addEventListener("abort", abort, { once: true });
 		child.once("error", () => fail("helper failed to start"));
 		child.stdout.on("data", (chunk) => {
-			if (settled) return;
+			if (settled || killedForResultLimit || killedForOutputLimit) return;
 			const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-			if (stdout.length + bytes.length > MAX_NATIVE_TOOL_OUTPUT_BYTES - MAX_NATIVE_NOTICE_BYTES) {
-				fail("helper output exceeded its limit");
-				return;
-			}
-			stdout = Buffer.concat([stdout, bytes]);
-			resultCount += bytes.reduce((count, byte) => count + (byte === 0x0a ? 1 : 0), 0);
-			if (resultCount >= resultLimit) {
-				killedForLimit = true;
+			const maximumDataBytes = MAX_NATIVE_TOOL_OUTPUT_BYTES - MAX_NATIVE_NOTICE_BYTES;
+			const remaining = maximumDataBytes - stdout.length;
+			stdout = Buffer.concat([stdout, bytes.subarray(0, Math.max(remaining, 0))]);
+			completeLineCount += bytes
+				.subarray(0, Math.max(remaining, 0))
+				.reduce((count, byte) => count + (byte === 0x0a ? 1 : 0), 0);
+			if (bytes.length > remaining) {
+				killedForOutputLimit = true;
+				kill();
+			} else if (completeLineCount >= resultLimit) {
+				killedForResultLimit = true;
 				kill();
 			}
 		});
@@ -378,19 +497,37 @@ function runHelper(program, argumentsList, signal, acceptedExitCodes, resultLimi
 		});
 		child.once("close", (code) => {
 			if (settled) return;
-			if (!killedForLimit && !acceptedExitCodes.has(code)) {
+			if (!killedForResultLimit && !killedForOutputLimit && recoverableExitCodes.has(code)) {
+				finish(reject, new RecoverableNativeToolError("Invalid search arguments. Revise them and retry."));
+				return;
+			}
+			if (!killedForResultLimit && !killedForOutputLimit && !acceptedExitCodes.has(code)) {
 				fail("helper exited unsuccessfully");
 				return;
 			}
-			if (stdout.length > 0 && stdout[stdout.length - 1] !== 0x0a) resultCount++;
-			const rawText = stdout.toString("utf8").replace(/\r\n/g, "\n").replace(/\n$/, "");
-			const lines = rawText === "" ? [] : rawText.split("\n").slice(0, resultLimit);
-			const limitReached = killedForLimit || resultCount >= resultLimit;
-			const notice = limitReached ? `\n\n[Truncated: ${resultLimit} ${limitKind} limit]` : "";
+			let rawText = stdout.toString("utf8").replace(/\r\n/g, "\n");
+			if (killedForOutputLimit) {
+				const lastCompleteLine = rawText.lastIndexOf("\n");
+				rawText = lastCompleteLine < 0 ? "" : rawText.slice(0, lastCompleteLine);
+			}
+			const lines = (rawText === "" ? [] : rawText.replace(/\n$/, "").split("\n")).slice(
+				0,
+				resultLimit,
+			);
+			const resultLimitReached = killedForResultLimit || lines.length >= resultLimit;
+			const notice = killedForOutputLimit
+				? `\n\n[Truncated: ${MAX_NATIVE_TOOL_OUTPUT_BYTES} output byte limit]`
+				: resultLimitReached
+					? `\n\n[Truncated: ${resultLimit} ${limitKind} limit]`
+					: "";
 			finish(resolvePromise, {
 				text: `${lines.join("\n") || "No results found"}${notice}`,
-				resultCount: Math.min(resultCount, resultLimit),
-				details: limitReached ? { [`${limitKind}LimitReached`]: resultLimit } : {},
+				resultCount: lines.length,
+				details: killedForOutputLimit
+					? { outputByteLimitReached: MAX_NATIVE_TOOL_OUTPUT_BYTES }
+					: resultLimitReached
+						? { [`${limitKind}LimitReached`]: resultLimit }
+						: {},
 			});
 		});
 	});
@@ -515,7 +652,16 @@ export default function fileGuardianClassifierExtension(pi) {
 				throw integrityFailure;
 			}
 			return executeNativeTool(toolCallId, "grep", resolvedPath.relative, signal, async () => {
-				const args = ["--line-number", "--with-filename", "--color=never", "--hidden", "--no-ignore"];
+				const args = [
+					"--line-number",
+					"--with-filename",
+					"--color=never",
+					"--hidden",
+					"--no-ignore",
+					"--max-columns",
+					String(MAX_GREP_COLUMNS),
+					"--max-columns-preview",
+				];
 				if (params.ignoreCase) args.push("--ignore-case");
 				if (params.literal) args.push("--fixed-strings");
 				if (params.glob) args.push("--glob", params.glob);
@@ -526,6 +672,7 @@ export default function fileGuardianClassifierExtension(pi) {
 					args,
 					signal,
 					new Set([0, 1]),
+					new Set([2]),
 					params.limit ?? Math.min(DEFAULT_GREP_MATCHES, maxSearchResults),
 					"match",
 				);
@@ -563,7 +710,7 @@ export default function fileGuardianClassifierExtension(pi) {
 					pattern,
 					resolvedPath.relative,
 				];
-				return runHelper(FD, args, signal, new Set([0]), limit, "result");
+				return runHelper(FD, args, signal, new Set([0]), new Set([1, 2]), limit, "result");
 			});
 		},
 	});
@@ -593,43 +740,37 @@ export default function fileGuardianClassifierExtension(pi) {
 					if (!entry.isFile() && !entry.isDirectory()) throw new Error("unsupported analyzer input entry");
 					return `${entry.name}${entry.isDirectory() ? "/" : ""}`;
 				});
-				const entryLimitReached = entries.length >= limit;
-				const notice = entryLimitReached ? `\n\n[Truncated: ${limit} entries limit]` : "";
-				const output = truncateUtf8(
-					`${selected.join("\n") || "(empty directory)"}${notice}`,
-					MAX_NATIVE_TOOL_OUTPUT_BYTES,
-				);
-				if (output.truncated) throw new Error("directory listing exceeded output limit");
-				return {
-					text: output.text,
-					resultCount: selected.length,
-					details: { entryLimitReached },
-				};
+				const entryLimitReached = entries.length > limit;
+				return boundedLineOutput(selected, "(empty directory)", entryLimitReached, limit, "entry");
 			});
 		},
 	});
 
-	for (const definition of [
-		{
-			name: "manifest_list",
-			label: "List assigned artifacts",
-			description: "List presentation paths and immutable artifact IDs assigned to this classification run.",
+	pi.registerTool({
+		name: "manifest_list",
+		label: "List assigned artifacts",
+		description:
+			"List one bounded page of presentation paths and immutable artifact IDs. Start with cursor 0 and continue with next_cursor until it is null.",
+		parameters: strictObject({
+			cursor: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER })),
+		}),
+		executionMode: "sequential",
+		async execute(_toolCallId, { cursor = 0 }, signal) {
+			const page = await proxyRequest("manifest_list", { cursor }, signal);
+			return proxyToolResult(manifestPageResult(page, cursor));
 		},
-		{
-			name: "prior_observations",
-			label: "Read prior observations",
-			description: "Read bounded normalized prior observations; file contents and matched values are never included.",
+	});
+
+	pi.registerTool({
+		name: "prior_observations",
+		label: "Read prior observations",
+		description: "Read bounded normalized prior observations; file contents and matched values are never included.",
+		parameters: strictObject({}),
+		executionMode: "sequential",
+		async execute(_toolCallId, params, signal) {
+			return proxyToolResult(await proxyRequest("prior_observations", params, signal));
 		},
-	]) {
-		pi.registerTool({
-			...definition,
-			parameters: strictObject({}),
-			executionMode: "sequential",
-			async execute(_toolCallId, params, signal) {
-				return proxyToolResult(await proxyRequest(definition.name, params, signal));
-			},
-		});
-	}
+	});
 
 	pi.registerTool({
 		name: "submit_classification",

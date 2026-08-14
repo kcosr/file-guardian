@@ -344,10 +344,23 @@ Every native call is bracketed by authenticated `native_tool_begin` and
 `native_tool_end` records over `file-guardian-pi-proxy/2`. The host validates
 the presentation path against the materialized view, charges the exact file or
 directory operation to configured budgets, and accepts the tool result only
-when its path, call ID, result count, output bytes, and success state match. Any
-validation, helper, accounting, or proxy error permanently invalidates the run.
+when its path, call ID, result count, output bytes, and outcome match. End
+outcomes are a closed set: `completed`, `recoverable_error`, and `fatal_error`.
+An invalid model-supplied search pattern or argument closes the audit record as
+`recoverable_error` with the safe `invalid_arguments` code and returns a
+sanitized retry instruction. Path/confinement, authentication, accounting,
+proxy, helper lifecycle, and other execution-integrity faults are fatal and
+permanently invalidate the run. Search and listing output is truncated only at
+complete line boundaries and includes a deterministic bounded notice.
 
-`manifest_list` maps presentation paths to immutable artifact IDs.
+`manifest_list` maps presentation paths to immutable artifact IDs through
+byte-bounded cursor pages. A request supplies `cursor`; the response returns
+that cursor, an `entries` slice, and `next_cursor`. The extension begins at zero
+and continues until `next_cursor` is `null`, validating monotonic progress and
+the fixed manifest identity on every page. Preflight rejects even one entry
+that cannot fit, but aggregate metadata is deliberately not constrained to one
+response. The configured 100,000-file view quota is therefore supported through
+bounded pages.
 `prior_observations` returns only the compact, canonically ordered normalized
 projection selected for the stage: analyzer/rule/artifact identities,
 categories, severities, validated locations, classification codes/confidence,

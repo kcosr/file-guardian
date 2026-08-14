@@ -21,6 +21,11 @@ operations. `grep` and `find` invoke only the manifest-pinned
 `/runtime/bin/rg` and `/runtime/bin/fd` executables, without a shell or inherited
 credentials, and always use `--hidden --no-ignore`. All parameters, output,
 result counts, helper diagnostics, and execution time are bounded.
+Search and listing output is truncated only at complete line boundaries with a
+deterministic notice; ripgrep also caps and previews overlong columns. Invalid
+model-supplied search expressions close their audit record as a recoverable
+`invalid_arguments` outcome and return a sanitized retry instruction. Path,
+proxy, accounting, helper lifecycle, and other integrity failures remain fatal.
 
 The launcher supplies the validated non-secret
 `FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS` value. The extension requires a canonical
@@ -35,7 +40,8 @@ prevents terminal submission. The helpers run sequentially, preserving the
 proxy protocol's monotonically increasing request order.
 
 `manifest_list` supplies the authoritative presentation-path to immutable
-artifact-ID mapping. `prior_observations` returns only bounded normalized
+artifact-ID mapping in bounded cursor pages. Callers begin at cursor `0` and
+follow `next_cursor` until it is `null`. `prior_observations` returns only bounded normalized
 observations; it never supplies file contents, matched values, snippets, or raw
 scanner output. `submit_classification` remains artifact-ID based and terminates
 the agent only after the host validates and accepts the structured payload.

@@ -7,6 +7,7 @@ const RUST_PROTOCOL: &str = include_str!("../src/analyzers/pi/protocol.rs");
 const RUST_PROXY: &str = include_str!("../src/analyzers/pi/proxy.rs");
 const RUST_RUNNER: &str = include_str!("../src/analyzers/pi/runner.rs");
 const RUST_SANDBOX: &str = include_str!("../src/analyzers/pi/sandbox.rs");
+const NODE_HARNESS: &str = include_str!("pi_extension_harness.mjs");
 
 const EXPECTED_TOOLS: [&str; 7] = [
     "find",
@@ -30,9 +31,8 @@ fn trusted_extension_registers_only_the_closed_tool_grant() {
     assert_eq!(registered, expected);
     assert_eq!(
         EXTENSION.matches("executionMode: \"sequential\"").count(),
-        6
+        7
     );
-    assert!(EXTENSION.contains("for (const definition of ["));
     assert!(EXTENSION.contains("terminate: true"));
     assert!(EXTENSION.contains("await proxyRequest(\"submit_classification\""));
     assert!(EXTENSION.contains("terminalState = \"accepted\""));
@@ -177,10 +177,16 @@ fn native_helpers_are_no_ignore_bounded_and_shell_free() {
     assert!(EXTENSION.contains("const HELPER_TIMEOUT_MILLIS = 10000"));
     assert!(EXTENSION.contains("child.kill(\"SIGKILL\")"));
     assert!(EXTENSION.contains("stderrBytes > MAX_HELPER_STDERR_BYTES"));
-    assert!(EXTENSION.contains("const limitReached = killedForLimit || resultCount >= resultLimit"));
+    assert!(EXTENSION.contains(
+        "const resultLimitReached = killedForResultLimit || lines.length >= resultLimit"
+    ));
     assert!(EXTENSION.contains("[Truncated: ${resultLimit} ${limitKind} limit]"));
+    assert!(EXTENSION.contains("[Truncated: ${MAX_NATIVE_TOOL_OUTPUT_BYTES} output byte limit]"));
     assert!(EXTENSION.contains("[`${limitKind}LimitReached`]"));
-    assert!(EXTENSION.contains("const entryLimitReached = entries.length >= limit"));
+    assert!(EXTENSION.contains("const entryLimitReached = entries.length > limit"));
+    assert!(EXTENSION.contains("\"--max-columns\""));
+    assert!(EXTENSION.contains("\"--max-columns-preview\""));
+    assert!(EXTENSION.contains("const lastCompleteLine = rawText.lastIndexOf(\"\\n\")"));
 }
 
 #[test]
@@ -192,9 +198,16 @@ fn every_native_call_is_audited_and_failure_invalidates_submission() {
         "path,",
         "output_bytes: outputBytes",
         "result_count: resultCount",
-        "success,",
+        "outcome,",
+        "error_code: errorCode",
+        "\"completed\"",
+        "\"recoverable_error\"",
+        "\"fatal_error\"",
+        "\"invalid_arguments\"",
+        "\"execution_failed\"",
         "latchIntegrityFailure()",
         "if (integrityFailure) throw integrityFailure",
+        "if (error === integrityFailure) throw error",
         "Pi read-only tool integrity check failed",
         "requireAccepted(result)",
         "result.accepted !== true",
@@ -206,6 +219,31 @@ fn every_native_call_is_audited_and_failure_invalidates_submission() {
     }
 
     assert!(EXTENSION.contains("/^[A-Za-z0-9_.:-]{1,128}$/"));
+    assert!(EXTENSION.contains("error instanceof RecoverableNativeToolError"));
+    assert!(EXTENSION.contains("Invalid search arguments. Revise them and retry."));
+}
+
+#[test]
+fn manifest_pages_are_cursor_bound_and_walkable() {
+    for required in [
+        "file-guardian-pi-manifest-page/1",
+        "cursor: Type.Optional(Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }))",
+        "async execute(_toolCallId, { cursor = 0 }, signal)",
+        "proxyRequest(\"manifest_list\", { cursor }, signal)",
+        "result.next_cursor === null",
+        "result.next_cursor !== pageEnd",
+        "Start with cursor 0 and continue with next_cursor until it is null.",
+    ] {
+        assert!(
+            EXTENSION.contains(required),
+            "missing manifest pagination contract: {required}"
+        );
+    }
+    assert!(RUST_PROTOCOL.contains("ManifestList {\n        cursor: u64,\n    }"));
+    assert!(RUST_PROXY.contains("manifest_page_value("));
+    assert!(RUST_PROXY.contains("next_cursor: Option<u64>"));
+    assert!(NODE_HARNESS.contains("discontinuous manifest page"));
+    assert!(NODE_HARNESS.contains("sensitive-partial-line"));
 }
 
 #[test]

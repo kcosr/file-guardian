@@ -328,13 +328,25 @@ The exact grant is closed. `read` and `ls` are bounded Node implementations;
 `grep` and `find` invoke only manifest-pinned `rg` and `fd` directly, without a
 shell or inherited helper environment, and always use `--hidden --no-ignore`.
 All native paths are relative to `/input`, every call has paired authenticated
-begin/end accounting, and any native validation/execution/accounting failure
-invalidates the run. There is no model-callable bash, general subprocess,
+begin/end accounting. Each end record has exactly one of `completed`,
+`recoverable_error`, or `fatal_error`. Invalid model-supplied search patterns
+or arguments produce a sanitized recoverable tool result so the model can
+retry. Path resolution, authentication, accounting, helper process, proxy, and
+other integrity failures are fatal and invalidate the run. Bounded search and
+listing output ends only at complete line boundaries and carries a deterministic
+truncation notice. There is no model-callable bash, general subprocess,
 arbitrary path or `/proc` access, mutation, write/edit, quarantine, deletion,
 credential, or File Guardian control tool. The sandbox keeps network access
 required by Pi's configured model transport. Bubblewrap therefore provides
 filesystem/process confinement, not destination-limited model egress;
 deployments must restrict the shared transport to approved internal endpoints.
+
+`manifest_list` is cursor-paged and byte-bounded. Each response contains its
+`cursor`, an `entries` slice, and `next_cursor`; callers continue until
+`next_cursor` is `null`. A single manifest entry that cannot fit is a preflight
+failure, while a large valid view—including the configured 100,000-file
+ceiling—is supported across multiple bounded responses rather than serialized
+as one message.
 
 The runtime configuration fixes `platform = "linux"`,
 `sandbox = "bubblewrap-v1"`, `network = "host_internal_model"`, absolute

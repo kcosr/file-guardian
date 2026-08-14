@@ -1,9 +1,12 @@
 use super::protocol::{
-    ClassificationVocabulary, NativeTool, ProxyError as WireError, ProxyErrorCode, ProxyOperation,
-    ProxyRequest, ProxyResponse, TerminalValidationContext, TerminalValidationLimits,
-    ValidatedSubmission, PROTOCOL_VERSION, REQUIRED_TOOLS,
+    ClassificationVocabulary, NativeTool, NativeToolErrorCode, NativeToolOutcome,
+    ProxyError as WireError, ProxyErrorCode, ProxyOperation, ProxyRequest, ProxyResponse,
+    TerminalValidationContext, TerminalValidationLimits, ValidatedSubmission, PROTOCOL_VERSION,
+    REQUIRED_TOOLS,
 };
-use crate::authorization::{AnalyzerView, AnalyzerViewNode, InvocationWorkspace, WorkspaceError};
+use crate::authorization::{
+    AnalyzerView, AnalyzerViewEntry, AnalyzerViewNode, InvocationWorkspace, WorkspaceError,
+};
 use crate::domain::{
     AnalyzerId, ArtifactId, ArtifactManifest, CandidateId, ClassificationScope, InspectionPhase,
     RunId,
@@ -471,10 +474,13 @@ impl Server {
                     json!({"instruction": self.input.instruction.as_ref()}),
                 ))
             }
-            ProxyOperation::ManifestList {} => {
+            ProxyOperation::ManifestList { cursor } => {
                 self.require_ready()?;
                 self.charge_tool_call()?;
-                Ok(OperationResult::Continue(manifest_list_value(&self.input)?))
+                Ok(OperationResult::Continue(manifest_page_value(
+                    &self.input,
+                    cursor,
+                )?))
             }
             ProxyOperation::NativeToolBegin {
                 tool_call_id,
@@ -533,7 +539,8 @@ impl Server {
                 tool_call_id,
                 tool,
                 path,
-                success,
+                outcome,
+                error_code,
                 output_bytes,
                 result_count,
             } => {
@@ -548,17 +555,25 @@ impl Server {
                 {
                     return Err(PiProxyError::ProtocolViolation);
                 }
-                if !success {
-                    if output_bytes != 0 || result_count != 0 {
-                        return Err(PiProxyError::ProtocolViolation);
+                match (outcome, error_code) {
+                    (NativeToolOutcome::Completed, None) => {
+                        if output_bytes > NATIVE_TOOL_MAX_OUTPUT_BYTES as u64
+                            || result_count > self.limits.max_search_matches
+                            || (tool == NativeTool::Read && result_count != 1)
+                        {
+                            return Err(PiProxyError::BudgetExceeded);
+                        }
                     }
-                    return Err(PiProxyError::NativeToolFailed);
-                }
-                if output_bytes > NATIVE_TOOL_MAX_OUTPUT_BYTES as u64
-                    || result_count > self.limits.max_search_matches
-                    || (tool == NativeTool::Read && result_count != 1)
-                {
-                    return Err(PiProxyError::BudgetExceeded);
+                    (
+                        NativeToolOutcome::RecoverableError,
+                        Some(NativeToolErrorCode::InvalidArguments),
+                    ) if output_bytes == 0 && result_count == 0 => {}
+                    (NativeToolOutcome::FatalError, Some(NativeToolErrorCode::ExecutionFailed))
+                        if output_bytes == 0 && result_count == 0 =>
+                    {
+                        return Err(PiProxyError::NativeToolFailed);
+                    }
+                    _ => return Err(PiProxyError::ProtocolViolation),
                 }
                 Ok(OperationResult::Continue(json!({"accepted": true})))
             }
@@ -679,28 +694,139 @@ fn validate_input(input: &PiProxyInput) -> Result<(), PiProxyError> {
     {
         return Err(PiProxyError::InvalidAssignment);
     }
-    let manifest_list = manifest_list_value(input)?;
-    if !response_fits(manifest_list, input.limits.max_response_bytes)? {
-        return Err(PiProxyError::ManifestResponseTooLarge);
+    validate_manifest_entry_pages(input)?;
+    Ok(())
+}
+
+const MANIFEST_PAGE_SCHEMA: &str = "file-guardian-pi-manifest-page/1";
+
+#[derive(Serialize)]
+struct ManifestPage<'a> {
+    schema: &'static str,
+    manifest_identity: crate::domain::Digest,
+    cursor: u64,
+    total_count: u64,
+    entries: &'a [AnalyzerViewEntry],
+    next_cursor: Option<u64>,
+}
+
+fn validate_manifest_entry_pages(input: &PiProxyInput) -> Result<(), PiProxyError> {
+    let entries = input.view.entries();
+    let total_count = u64::try_from(entries.len()).map_err(|_| PiProxyError::Internal)?;
+    if entries.is_empty() {
+        let page = manifest_page_payload(input, 0, entries, None, total_count)?;
+        if !response_fits(page, input.limits.max_response_bytes)? {
+            return Err(PiProxyError::ManifestEntryResponseTooLarge);
+        }
+        return Ok(());
+    }
+
+    // Validate only the per-entry progress invariant. Aggregate manifest
+    // metadata may be arbitrarily larger than one response and is paged.
+    for (index, entry) in entries.iter().enumerate() {
+        let cursor = u64::try_from(index).map_err(|_| PiProxyError::Internal)?;
+        let next_cursor = (index + 1 < entries.len())
+            .then(|| u64::try_from(index + 1).map_err(|_| PiProxyError::Internal))
+            .transpose()?;
+        let page = manifest_page_payload(
+            input,
+            cursor,
+            std::slice::from_ref(entry),
+            next_cursor,
+            total_count,
+        )?;
+        if !response_fits(page, input.limits.max_response_bytes)? {
+            return Err(PiProxyError::ManifestEntryResponseTooLarge);
+        }
     }
     Ok(())
 }
 
-fn manifest_list_value(input: &PiProxyInput) -> Result<Value, PiProxyError> {
-    to_value(input.view.entries())
+fn manifest_page_value(input: &PiProxyInput, cursor: u64) -> Result<Value, PiProxyError> {
+    let entries = input.view.entries();
+    let total_count = u64::try_from(entries.len()).map_err(|_| PiProxyError::Internal)?;
+    let start = usize::try_from(cursor).map_err(|_| PiProxyError::InvalidRequest)?;
+    if entries.is_empty() {
+        if cursor != 0 {
+            return Err(PiProxyError::InvalidRequest);
+        }
+        return manifest_page_payload(input, cursor, entries, None, total_count);
+    }
+    if start >= entries.len() {
+        return Err(PiProxyError::InvalidRequest);
+    }
+
+    let base = manifest_page_payload(input, cursor, &[], Some(u64::MAX), total_count)?;
+    let mut wire_size = response_wire_size(base)?;
+    let mut end = start;
+    while let Some(entry) = entries.get(end) {
+        let entry_size = serde_json::to_vec(entry)
+            .map_err(|_| PiProxyError::Internal)?
+            .len();
+        let separator = usize::from(end > start);
+        let next_size = wire_size
+            .checked_add(separator)
+            .and_then(|size| size.checked_add(entry_size))
+            .ok_or(PiProxyError::ResponseTooLarge)?;
+        if next_size > input.limits.max_response_bytes {
+            break;
+        }
+        wire_size = next_size;
+        end += 1;
+    }
+    if end == start {
+        // Conservative maximum-width cursor framing can leave less room than
+        // this exact page needs. Preflight guarantees the single-entry page.
+        end = start.checked_add(1).ok_or(PiProxyError::Internal)?;
+    }
+    let next_cursor = (end < entries.len())
+        .then(|| u64::try_from(end).map_err(|_| PiProxyError::Internal))
+        .transpose()?;
+    let page = manifest_page_payload(
+        input,
+        cursor,
+        &entries[start..end],
+        next_cursor,
+        total_count,
+    )?;
+    if !response_fits(page.clone(), input.limits.max_response_bytes)? {
+        return Err(PiProxyError::Internal);
+    }
+    Ok(page)
 }
 
-fn response_fits(result: Value, max_response_bytes: usize) -> Result<bool, PiProxyError> {
+fn manifest_page_payload(
+    input: &PiProxyInput,
+    cursor: u64,
+    entries: &[AnalyzerViewEntry],
+    next_cursor: Option<u64>,
+    total_count: u64,
+) -> Result<Value, PiProxyError> {
+    to_value(ManifestPage {
+        schema: MANIFEST_PAGE_SCHEMA,
+        manifest_identity: input.manifest.identity,
+        cursor,
+        total_count,
+        entries,
+        next_cursor,
+    })
+}
+
+fn response_wire_size(result: Value) -> Result<usize, PiProxyError> {
     let response = ProxyResponse::Ok {
         protocol: PROTOCOL_VERSION.to_owned(),
         request_id: u64::MAX,
         result,
     };
-    Ok(serde_json::to_vec(&response)
+    serde_json::to_vec(&response)
         .map_err(|_| PiProxyError::Internal)?
         .len()
         .checked_add(1)
-        .is_some_and(|size| size <= max_response_bytes))
+        .ok_or(PiProxyError::ResponseTooLarge)
+}
+
+fn response_fits(result: Value, max_response_bytes: usize) -> Result<bool, PiProxyError> {
+    Ok(response_wire_size(result)? <= max_response_bytes)
 }
 
 async fn read_request(
@@ -815,8 +941,8 @@ pub enum PiProxyError {
     InvalidInstruction,
     #[error("Pi proxy assignment does not match the immutable manifest")]
     InvalidAssignment,
-    #[error("Pi proxy assignment metadata exceeds the configured response limit")]
-    ManifestResponseTooLarge,
+    #[error("one Pi manifest entry cannot fit in a bounded page response")]
+    ManifestEntryResponseTooLarge,
     #[error("could not obtain a private Pi proxy capability")]
     Entropy(#[source] std::io::Error),
     #[error("could not create the private Pi proxy endpoint")]
@@ -913,6 +1039,16 @@ mod tests {
         analyzer_id: AnalyzerId,
     }
 
+    struct PagedFixture {
+        _temporary: TempDir,
+        workspace: InvocationWorkspace,
+        manifest: Arc<ArtifactManifest>,
+        assignments: Vec<ArtifactAssignment>,
+        expected_view_paths: Vec<String>,
+        run_id: RunId,
+        analyzer_id: AnalyzerId,
+    }
+
     fn fixture(bytes: &[u8]) -> Fixture {
         fixture_with_paths(bytes, 0, "artifact.bin")
     }
@@ -975,6 +1111,72 @@ mod tests {
                 candidate_id: CandidateId::from_suffix("proxy-test").unwrap(),
                 artifact_id,
             },
+            run_id,
+            analyzer_id: AnalyzerId::new("pi-classifier").unwrap(),
+        }
+    }
+
+    fn paged_fixture(file_count: usize) -> PagedFixture {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("workspaces");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let run_id = RunId::from_suffix("proxy-paged-test").unwrap();
+        let workspace = InvocationWorkspace::create(&root, &run_id).unwrap();
+        let stored = workspace.objects().store(&mut &b"x"[..], 1).unwrap();
+
+        let mut subjects = Vec::with_capacity(file_count);
+        let mut artifacts = Vec::with_capacity(file_count);
+        let mut assignments = Vec::with_capacity(file_count);
+        let mut expected_view_paths = Vec::with_capacity(file_count);
+        for index in 0..file_count {
+            // Each manifest row is comfortably smaller than a page, while the
+            // repeated logical and presentation paths make aggregate metadata
+            // exceed the extension's response ceiling.
+            let logical_name = format!("file-{index:05}-{}", "x".repeat(239));
+            let logical_path =
+                LogicalPath::new(vec![PathSegment::utf8(&logical_name).unwrap()]).unwrap();
+            let subject_id = SubjectId::from_suffix(format!("paged-{index:05}")).unwrap();
+            let artifact_id = ArtifactId::from_suffix(format!("paged-{index:05}")).unwrap();
+            let source_identity = SourceIdentity {
+                device: 1,
+                inode: index as u64 + 1,
+                file_type: SourceFileType::RegularFile,
+                byte_len: 1,
+                link_count: 1,
+                modified: None,
+                changed: None,
+                content_digest: stored.digest,
+            };
+            subjects.push(PhysicalSubject {
+                id: subject_id.clone(),
+                relative_path: logical_path.clone(),
+                source_identity,
+                object_id: stored.id.clone(),
+                byte_len: 1,
+            });
+            artifacts.push(Artifact {
+                id: artifact_id.clone(),
+                subject_id,
+                object_id: stored.id.clone(),
+                kind: ArtifactKind::PhysicalFile,
+                byte_len: 1,
+                content_digest: stored.digest,
+                provenance: Provenance::Physical { logical_path },
+            });
+            assignments.push(ArtifactAssignment {
+                candidate_id: CandidateId::from_suffix(format!("paged-{index:05}")).unwrap(),
+                artifact_id,
+            });
+            expected_view_paths.push(logical_name);
+        }
+        let manifest = Arc::new(ArtifactManifest::new(subjects, artifacts).unwrap());
+        PagedFixture {
+            _temporary: temporary,
+            workspace,
+            manifest,
+            assignments,
+            expected_view_paths,
             run_id,
             analyzer_id: AnalyzerId::new("pi-classifier").unwrap(),
         }
@@ -1052,6 +1254,64 @@ mod tests {
         }
     }
 
+    fn paged_input(fixture: &PagedFixture) -> PiProxyInput {
+        let code = ClassificationCode::new("allowed").unwrap();
+        let reason = ReasonCode::new("reviewed").unwrap();
+        let count = fixture.assignments.len();
+        let count_u64 = u64::try_from(count).unwrap();
+        let quota = crate::authorization::AnalyzerViewQuota {
+            max_files: count_u64,
+            max_entries: count_u64,
+            max_total_bytes: count_u64,
+            max_depth: 1,
+        };
+        let mut proxy_limits = limits();
+        proxy_limits.max_response_bytes = 64 * 1024;
+        proxy_limits.max_tool_calls = 128;
+        PiProxyInput {
+            run_id: fixture.run_id.clone(),
+            analyzer_id: fixture.analyzer_id.clone(),
+            manifest: Arc::clone(&fixture.manifest),
+            assignments: fixture.assignments.clone(),
+            view: Arc::new(
+                AnalyzerViewBuilder::new(
+                    &fixture.workspace,
+                    &fixture.manifest,
+                    &fixture.assignments,
+                    AnalyzerViewLimits {
+                        per_view: quota,
+                        invocation: quota,
+                    },
+                )
+                .materialize("proxy-paged-input")
+                .unwrap(),
+            ),
+            prior_observations: Arc::new(
+                PriorObservationProjection::build(
+                    PriorObservationMode::None,
+                    &[],
+                    ProjectionLimits::new(8, 1024).unwrap(),
+                )
+                .unwrap(),
+            ),
+            instruction: Arc::from("Classify only under the supplied policy."),
+            expected_runtime: ExpectedPiRuntime {
+                pi_version: "0.83.0".to_owned(),
+                provider: "internal".to_owned(),
+                model: "classifier".to_owned(),
+                thinking: "high".to_owned(),
+                mode: super::super::sandbox::PI_RUNTIME_CONTEXT_MODE.to_owned(),
+            },
+            vocabulary: Arc::new(
+                ClassificationVocabulary::new([code], [ConfiguredConfidence::High], [reason])
+                    .unwrap(),
+            ),
+            terminal_limits: TerminalValidationLimits::new(count, count, 8).unwrap(),
+            phase: InspectionPhase::Initial,
+            limits: proxy_limits,
+        }
+    }
+
     fn request(proxy: &PiProxy, request_id: u64, operation: ProxyOperation) -> ProxyRequest {
         ProxyRequest {
             protocol: PROTOCOL_VERSION.to_owned(),
@@ -1101,6 +1361,23 @@ mod tests {
         let mut request = request(proxy, request_id, operation);
         request.manifest_identity = fixture.manifest.identity;
         request
+    }
+
+    fn paged_request(
+        proxy: &PiProxy,
+        fixture: &PagedFixture,
+        request_id: u64,
+        operation: ProxyOperation,
+    ) -> ProxyRequest {
+        ProxyRequest {
+            protocol: PROTOCOL_VERSION.to_owned(),
+            run_token: proxy.endpoint().run_token().to_owned(),
+            request_id,
+            run_id: fixture.run_id.clone(),
+            analyzer_id: fixture.analyzer_id.clone(),
+            manifest_identity: fixture.manifest.identity,
+            operation,
+        }
     }
 
     fn socket(proxy: &PiProxy) -> PathBuf {
@@ -1155,7 +1432,8 @@ mod tests {
         tool_call_id: &str,
         tool: NativeTool,
         path: &str,
-        success: bool,
+        outcome: NativeToolOutcome,
+        error_code: Option<NativeToolErrorCode>,
         output_bytes: u64,
         result_count: u64,
     ) -> ProxyOperation {
@@ -1163,7 +1441,8 @@ mod tests {
             tool_call_id: tool_call_id.to_owned(),
             tool,
             path: path.to_owned(),
-            success,
+            outcome,
+            error_code,
             output_bytes,
             result_count,
         }
@@ -1260,7 +1539,15 @@ mod tests {
                     &proxy,
                     &fixture,
                     4,
-                    native_end("grep-1", NativeTool::Grep, "artifact.bin", true, 4, 2),
+                    native_end(
+                        "grep-1",
+                        NativeTool::Grep,
+                        "artifact.bin",
+                        NativeToolOutcome::Completed,
+                        None,
+                        4,
+                        2,
+                    ),
                 ),
             )
             .await,
@@ -1307,20 +1594,141 @@ mod tests {
         ));
         let response = exchange(
             &socket,
-            &bound_request(&proxy, &fixture, 2, ProxyOperation::ManifestList {}),
+            &bound_request(
+                &proxy,
+                &fixture,
+                2,
+                ProxyOperation::ManifestList { cursor: 0 },
+            ),
         )
         .await;
         let ProxyResponse::Ok { result, .. } = response else {
             panic!("manifest list must succeed");
         };
-        assert_eq!(result.as_array().unwrap().len(), 1);
-        assert_eq!(result[0]["view_path"], "artifact.bin");
+        assert_eq!(result["schema"], MANIFEST_PAGE_SCHEMA);
+        assert_eq!(
+            result["manifest_identity"],
+            fixture.manifest.identity.to_string()
+        );
+        assert_eq!(result["cursor"], 0);
+        assert_eq!(result["total_count"], 1);
+        assert_eq!(result["next_cursor"], Value::Null);
+        assert_eq!(result["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(result["entries"][0]["view_path"], "artifact.bin");
         let encoded = serde_json::to_string(&result).unwrap();
         assert!(!encoded.contains("private-content"));
         assert!(!encoded.contains("object_id"));
         assert!(matches!(
             proxy.finish().await,
             Err(PiProxyError::MissingTerminalSubmission)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn multi_megabyte_manifest_metadata_is_paged_in_canonical_order_exactly_once() {
+        let fixture = paged_fixture(3_500);
+        let input = paged_input(&fixture);
+        assert!(
+            serde_json::to_vec(input.view.entries()).unwrap().len() > EXTENSION_MAX_RESPONSE_BYTES,
+            "fixture must exceed the former whole-manifest response ceiling"
+        );
+        let max_response_bytes = input.limits.max_response_bytes;
+        let proxy = PiProxy::start(&fixture.workspace, input).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &paged_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+
+        let mut request_id = 2;
+        let mut cursor = 0_u64;
+        let mut observed = Vec::new();
+        loop {
+            let response = exchange(
+                &socket,
+                &paged_request(
+                    &proxy,
+                    &fixture,
+                    request_id,
+                    ProxyOperation::ManifestList { cursor },
+                ),
+            )
+            .await;
+            assert!(
+                serde_json::to_vec(&response).unwrap().len() < max_response_bytes,
+                "every encoded page response must respect the configured ceiling"
+            );
+            let ProxyResponse::Ok { result, .. } = response else {
+                panic!("manifest page must succeed");
+            };
+            assert_eq!(result["schema"], MANIFEST_PAGE_SCHEMA);
+            assert_eq!(
+                result["manifest_identity"],
+                json!(fixture.manifest.identity)
+            );
+            assert_eq!(result["cursor"], cursor);
+            assert_eq!(result["total_count"], fixture.assignments.len());
+            let entries = result["entries"].as_array().unwrap();
+            assert!(!entries.is_empty());
+            observed.extend(
+                entries
+                    .iter()
+                    .map(|entry| entry["view_path"].as_str().unwrap().to_owned()),
+            );
+            request_id += 1;
+            let Some(next_cursor) = result["next_cursor"].as_u64() else {
+                break;
+            };
+            assert_eq!(next_cursor, observed.len() as u64);
+            cursor = next_cursor;
+        }
+        assert_eq!(observed, fixture.expected_view_paths);
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::MissingTerminalSubmission)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn out_of_range_manifest_cursor_is_fatal() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    2,
+                    ProxyOperation::ManifestList { cursor: 1 },
+                ),
+            )
+            .await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::InvalidRequest
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::InvalidRequest)
         ));
         fixture.workspace.remove().unwrap();
     }
@@ -1387,14 +1795,17 @@ mod tests {
     }
 
     #[test]
-    fn oversized_manifest_list_is_rejected_before_endpoint_creation() {
+    fn manifest_entry_that_cannot_fit_one_page_is_rejected_before_endpoint_creation() {
         let sentinel = format!("private-name-{}", "x".repeat(6_000));
         let fixture = fixture_with_paths(b"content", 0, &sentinel);
         let error = match PiProxy::start(&fixture.workspace, input(&fixture)) {
             Ok(_) => panic!("oversized manifest response must fail before launch"),
             Err(error) => error,
         };
-        assert!(matches!(&error, PiProxyError::ManifestResponseTooLarge));
+        assert!(matches!(
+            &error,
+            PiProxyError::ManifestEntryResponseTooLarge
+        ));
         let diagnostic = format!("{error:?}");
         assert!(!diagnostic.contains("private-name"));
         fixture.workspace.remove().unwrap();
@@ -1558,7 +1969,15 @@ mod tests {
             &proxy,
             &fixture,
             3,
-            native_end("read-1", NativeTool::Read, "other.txt", true, 7, 1),
+            native_end(
+                "read-1",
+                NativeTool::Read,
+                "other.txt",
+                NativeToolOutcome::Completed,
+                None,
+                7,
+                1,
+            ),
         );
         assert!(matches!(
             exchange(&socket, &mismatched).await,
@@ -1613,7 +2032,8 @@ mod tests {
                         "read-1",
                         NativeTool::Read,
                         "artifact.bin",
-                        true,
+                        NativeToolOutcome::Completed,
+                        None,
                         NATIVE_TOOL_MAX_OUTPUT_BYTES as u64 + 1,
                         1,
                     ),
@@ -1667,7 +2087,15 @@ mod tests {
                     &proxy,
                     &fixture,
                     3,
-                    native_end("grep-1", NativeTool::Grep, ".", false, 0, 0),
+                    native_end(
+                        "grep-1",
+                        NativeTool::Grep,
+                        ".",
+                        NativeToolOutcome::FatalError,
+                        Some(NativeToolErrorCode::ExecutionFailed),
+                        0,
+                        0,
+                    ),
                 ),
             )
             .await,
@@ -1682,6 +2110,124 @@ mod tests {
         assert!(matches!(
             proxy.finish().await,
             Err(PiProxyError::NativeToolFailed)
+        ));
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_native_arguments_are_recoverable_and_terminal_remains_possible() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    2,
+                    native_begin("grep-1", NativeTool::Grep, "."),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    3,
+                    native_end(
+                        "grep-1",
+                        NativeTool::Grep,
+                        ".",
+                        NativeToolOutcome::RecoverableError,
+                        Some(NativeToolErrorCode::InvalidArguments),
+                        0,
+                        0,
+                    ),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 4, terminal(&fixture, 1)),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(proxy.finish().await.is_ok());
+        fixture.workspace.remove().unwrap();
+    }
+
+    #[tokio::test]
+    async fn inconsistent_native_outcome_is_a_protocol_failure() {
+        let fixture = fixture(b"content");
+        let proxy = PiProxy::start(&fixture.workspace, input(&fixture)).unwrap();
+        let socket = socket(&proxy);
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(&proxy, &fixture, 1, runtime_ready())
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    2,
+                    native_begin("read-1", NativeTool::Read, "artifact.bin"),
+                ),
+            )
+            .await,
+            ProxyResponse::Ok { .. }
+        ));
+        assert!(matches!(
+            exchange(
+                &socket,
+                &bound_request(
+                    &proxy,
+                    &fixture,
+                    3,
+                    native_end(
+                        "read-1",
+                        NativeTool::Read,
+                        "artifact.bin",
+                        NativeToolOutcome::Completed,
+                        Some(NativeToolErrorCode::InvalidArguments),
+                        0,
+                        1,
+                    ),
+                ),
+            )
+            .await,
+            ProxyResponse::Error {
+                error: WireError {
+                    code: ProxyErrorCode::ProtocolViolation
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            proxy.finish().await,
+            Err(PiProxyError::ProtocolViolation)
         ));
         fixture.workspace.remove().unwrap();
     }

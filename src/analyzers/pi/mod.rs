@@ -758,7 +758,8 @@ mod tests {
                     bound(&invocation, 1, runtime_ready()),
                 )
                 .await;
-                let mut unauthorized = bound(&invocation, 2, json!({"type":"manifest_list"}));
+                let mut unauthorized =
+                    bound(&invocation, 2, json!({"type":"manifest_list","cursor":0}));
                 unauthorized["run_token"] = json!("wrong-token");
                 let response = exchange(&invocation.socket_path, unauthorized).await;
                 assert_eq!(response["status"], "error");
@@ -809,12 +810,26 @@ mod tests {
                 );
                 let manifest_list = exchange(
                     &invocation.socket_path,
-                    bound(&invocation, 3, json!({"type":"manifest_list"})),
+                    bound(&invocation, 3, json!({"type":"manifest_list","cursor":0})),
                 )
                 .await;
                 assert_eq!(manifest_list["status"], "ok");
-                assert_eq!(manifest_list["result"].as_array().unwrap().len(), 1);
-                let view_path = manifest_list["result"][0]["view_path"]
+                assert_eq!(
+                    manifest_list["result"]["schema"],
+                    "file-guardian-pi-manifest-page/1"
+                );
+                assert_eq!(
+                    manifest_list["result"]["manifest_identity"],
+                    invocation.manifest_identity.to_string()
+                );
+                assert_eq!(manifest_list["result"]["cursor"], 0);
+                assert_eq!(manifest_list["result"]["total_count"], 1);
+                assert!(manifest_list["result"]["next_cursor"].is_null());
+                assert_eq!(
+                    manifest_list["result"]["entries"].as_array().unwrap().len(),
+                    1
+                );
+                let view_path = manifest_list["result"]["entries"][0]["view_path"]
                     .as_str()
                     .unwrap()
                     .to_owned();
@@ -849,7 +864,8 @@ mod tests {
                                 "tool_call_id":"read-1",
                                 "tool":"read",
                                 "path":view_path,
-                                "success":true,
+                                "outcome":"completed",
+                                "error_code":null,
                                 "output_bytes":bytes.len(),
                                 "result_count":1,
                             })

@@ -55,13 +55,15 @@ impl<'de> Deserialize<'de> for ProxyRequest {
                 "model_in_catalog",
                 "active_tools",
             ],
-            "instruction" | "manifest_list" | "prior_observations" => &[],
+            "instruction" | "prior_observations" => &[],
+            "manifest_list" => &["cursor"],
             "native_tool_begin" => &["tool_call_id", "tool", "path"],
             "native_tool_end" => &[
                 "tool_call_id",
                 "tool",
                 "path",
-                "success",
+                "outcome",
+                "error_code",
                 "output_bytes",
                 "result_count",
             ],
@@ -136,7 +138,9 @@ pub enum ProxyOperation {
         active_tools: Vec<String>,
     },
     Instruction {},
-    ManifestList {},
+    ManifestList {
+        cursor: u64,
+    },
     NativeToolBegin {
         tool_call_id: String,
         tool: NativeTool,
@@ -146,7 +150,8 @@ pub enum ProxyOperation {
         tool_call_id: String,
         tool: NativeTool,
         path: String,
-        success: bool,
+        outcome: NativeToolOutcome,
+        error_code: Option<NativeToolErrorCode>,
         output_bytes: u64,
         result_count: u64,
     },
@@ -163,6 +168,21 @@ pub enum NativeTool {
     Grep,
     Find,
     Ls,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolOutcome {
+    Completed,
+    RecoverableError,
+    FatalError,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeToolErrorCode {
+    InvalidArguments,
+    ExecutionFailed,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -811,6 +831,59 @@ mod tests {
         let mut obsolete = begin;
         obsolete["artifact_id"] = json!("a_01");
         assert!(serde_json::from_value::<ProxyRequest>(obsolete).is_err());
+
+        let manifest = json!({
+            "protocol": PROTOCOL_VERSION,
+            "run_token": "opaque",
+            "request_id": 3,
+            "run_id": "run_01",
+            "analyzer_id": "pi-review",
+            "manifest_identity": manifest_identity(),
+            "type": "manifest_list",
+            "cursor": 0
+        });
+        assert!(matches!(
+            serde_json::from_value::<ProxyRequest>(manifest.clone())
+                .unwrap()
+                .operation,
+            ProxyOperation::ManifestList { cursor: 0 }
+        ));
+        let mut missing_cursor = manifest.clone();
+        missing_cursor.as_object_mut().unwrap().remove("cursor");
+        assert!(serde_json::from_value::<ProxyRequest>(missing_cursor).is_err());
+        let mut negative_cursor = manifest;
+        negative_cursor["cursor"] = json!(-1);
+        assert!(serde_json::from_value::<ProxyRequest>(negative_cursor).is_err());
+
+        let end = json!({
+            "protocol": PROTOCOL_VERSION,
+            "run_token": "opaque",
+            "request_id": 4,
+            "run_id": "run_01",
+            "analyzer_id": "pi-review",
+            "manifest_identity": manifest_identity(),
+            "type": "native_tool_end",
+            "tool_call_id": "call_01",
+            "tool": "read",
+            "path": "src/lib.rs",
+            "outcome": "recoverable_error",
+            "error_code": "invalid_arguments",
+            "output_bytes": 0,
+            "result_count": 0
+        });
+        assert!(matches!(
+            serde_json::from_value::<ProxyRequest>(end.clone())
+                .unwrap()
+                .operation,
+            ProxyOperation::NativeToolEnd {
+                outcome: NativeToolOutcome::RecoverableError,
+                error_code: Some(NativeToolErrorCode::InvalidArguments),
+                ..
+            }
+        ));
+        let mut obsolete_success = end;
+        obsolete_success["success"] = json!(false);
+        assert!(serde_json::from_value::<ProxyRequest>(obsolete_success).is_err());
         assert_eq!(
             REQUIRED_TOOLS,
             [
