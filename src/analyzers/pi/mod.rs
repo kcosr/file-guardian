@@ -555,7 +555,6 @@ mod tests {
                 memory_bytes: 64 * 1024 * 1024,
                 cpu_seconds: 1,
                 open_files: 32,
-                processes: 4,
                 stdout_bytes: 1024,
                 stderr_bytes: 1024,
             },

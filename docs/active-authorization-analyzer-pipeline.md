@@ -435,9 +435,16 @@ pins the immutable configured material in pipeline identity, excludes mutable
 agent-state contents that Pi may update, clears ambient
 customization, verifies the Pi/runtime handshake and exact tool grant, and
 supervises Pi and its descendants. Startup, idle and wall-clock deadlines;
-process, memory and descriptor ceilings; concurrent bounded output draining;
+memory and descriptor ceilings; concurrent bounded output draining;
 and terminate-then-kill cleanup prevent a failed child from outliving the
 authorization.
+
+The runner intentionally does not set `RLIMIT_NPROC`. On Linux that resource is
+charged across the invoking real UID rather than the Pi process tree, so a
+configured value would vary with unrelated workstation activity instead of
+enforcing an invocation-local boundary. The PID namespace and supervised
+process-group lifecycle guarantee sidecar teardown; an external cgroup is the
+separate mechanism for deployments that require a hard PID quota.
 
 The sidecar Bubblewrap starts with user, mount, PID, IPC, UTS, cgroup, and
 network isolation, disables nested user namespaces, drops all capabilities, and

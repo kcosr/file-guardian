@@ -26,7 +26,6 @@ pub(crate) struct PiRunLimits {
     pub memory_bytes: u64,
     pub cpu_seconds: u64,
     pub open_files: u64,
-    pub processes: u64,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
 }
@@ -40,7 +39,6 @@ impl PiRunLimits {
             && self.memory_bytes > 0
             && self.cpu_seconds > 0
             && self.open_files > 0
-            && self.processes > 0
             && self.stdout_bytes > 0
             && self.stderr_bytes > 0
             && self.startup_timeout <= self.wall_timeout
@@ -517,7 +515,6 @@ fn install_child_limits(limits: &PiRunLimits, inherited_proxy_fd: RawFd) -> std:
         (rustix::process::Resource::As, limits.memory_bytes),
         (rustix::process::Resource::Cpu, limits.cpu_seconds),
         (rustix::process::Resource::Nofile, limits.open_files),
-        (rustix::process::Resource::Nproc, limits.processes),
         (rustix::process::Resource::Core, 0),
     ] {
         rustix::process::setrlimit(
@@ -528,6 +525,9 @@ fn install_child_limits(limits: &PiRunLimits, inherited_proxy_fd: RawFd) -> std:
             },
         )?;
     }
+    // RLIMIT_NPROC is deliberately not lowered. Linux accounts it across all
+    // processes and threads owned by the real UID, not this invocation, so it
+    // cannot provide a deterministic per-Pi or per-sidecar isolation limit.
     // SAFETY: the descriptor is held by the invocation proxy for the complete
     // child lifetime and is only borrowed across this syscall.
     let proxy_fd = unsafe { BorrowedFd::borrow_raw(inherited_proxy_fd) };
@@ -616,7 +616,6 @@ mod tests {
             memory_bytes: 256 * 1024 * 1024,
             cpu_seconds: 2,
             open_files: 64,
-            processes: 4096,
             stdout_bytes: 64,
             stderr_bytes: 64,
         }

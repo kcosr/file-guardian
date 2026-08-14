@@ -385,6 +385,12 @@ The protected runtime/policy assets and owner-only isolated Pi agent directory
 are part of the invoking user's trust boundary. A dedicated service UID is not
 required by this design.
 
+File Guardian does not lower `RLIMIT_NPROC` or expose `max_processes` for Pi.
+Linux accounts that limit across every process and thread owned by the invoking
+real UID, so it cannot be a deterministic per-invocation control. The sidecar
+PID namespace and supervised lifecycle guarantee teardown, but they are not a
+hard PID quota; deployments that require one provide an external cgroup limit.
+
 Every classification code for every profile that selects Pi has exactly one
 classification binding and its directive is `audit`. Wildcard, missing,
 ambiguous, or non-audit Pi bindings are invalid configuration. Audit-only means

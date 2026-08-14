@@ -273,6 +273,10 @@ content, matches, snippets, prompts, transcripts, or raw scanner output.
 Bubblewrap must be present at the configured absolute path and match its pinned
 version. File Guardian does not fall back to host tool execution. Pi's approved
 model transport uses ordinary host networking; its tool sidecar is networkless.
+The Pi runner deliberately does not lower `RLIMIT_NPROC`: Linux measures it
+against all processes and threads owned by the invoking user rather than this
+classification. Use an external cgroup when a hard per-invocation PID quota is
+required.
 
 ## Daemon jobs
 

@@ -525,7 +525,6 @@ fn compile_pi_analyzer(
             memory_bytes: required("memory_bytes", limits.memory_bytes)?,
             cpu_seconds: required("cpu_time_secs", limits.cpu_time_secs)?,
             open_files: required("max_open_files", limits.max_open_files)?,
-            processes: required("max_processes", limits.max_processes)?,
             stdout_bytes: required("max_stdout_bytes", limits.max_stdout_bytes)?,
             stderr_bytes: required("max_stderr_bytes", limits.max_stderr_bytes)?,
         },

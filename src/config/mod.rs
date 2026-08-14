@@ -1205,7 +1205,6 @@ pub struct AnalyzerLimits {
     pub memory_bytes: Option<u64>,
     pub cpu_time_secs: Option<u64>,
     pub max_open_files: Option<u64>,
-    pub max_processes: Option<u64>,
     pub max_stdout_bytes: Option<u64>,
     pub max_stderr_bytes: Option<u64>,
     pub max_output_bytes: Option<u64>,
@@ -1232,7 +1231,6 @@ impl AnalyzerLimits {
             self.memory_bytes,
             self.cpu_time_secs,
             self.max_open_files,
-            self.max_processes,
             self.max_stdout_bytes,
             self.max_stderr_bytes,
             self.max_output_bytes,
@@ -1266,7 +1264,6 @@ impl AnalyzerLimits {
             ("memory_bytes", self.memory_bytes),
             ("cpu_time_secs", self.cpu_time_secs),
             ("max_open_files", self.max_open_files),
-            ("max_processes", self.max_processes),
             ("max_stdout_bytes", self.max_stdout_bytes),
             ("max_stderr_bytes", self.max_stderr_bytes),
             ("max_output_bytes", self.max_output_bytes),
@@ -1348,7 +1345,6 @@ impl AnalyzerLimits {
             ("memory_bytes", self.memory_bytes),
             ("cpu_time_secs", self.cpu_time_secs),
             ("max_open_files", self.max_open_files),
-            ("max_processes", self.max_processes),
             ("max_stdout_bytes", self.max_stdout_bytes),
             ("max_stderr_bytes", self.max_stderr_bytes),
             ("max_output_bytes", self.max_output_bytes),
@@ -2167,7 +2163,7 @@ path = "/srv/uploads"
     }
 
     #[test]
-    fn sidecar_pi_contract_rejects_legacy_grant_and_search_query_limit() {
+    fn sidecar_pi_contract_rejects_obsolete_grant_and_limits() {
         let old_grant = include_str!("../../docs/examples/active-authorization-v2.toml")
             .replace("sandboxed-shell-v1", "native-readonly-v1");
         let config = parse(&old_grant).unwrap();
@@ -2183,6 +2179,13 @@ path = "/srv/uploads"
                 "max_search_calls = 100\nmax_search_query_bytes = 4096",
             );
         assert!(parse(&old_search_limit).is_err());
+
+        let host_wide_process_limit =
+            include_str!("../../docs/examples/active-authorization-v2.toml").replace(
+                "max_open_files = 64",
+                "max_open_files = 64\nmax_processes = 4096",
+            );
+        assert!(parse(&host_wide_process_limit).is_err());
     }
 
     #[test]
