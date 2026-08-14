@@ -1,9 +1,8 @@
 schema_version = "2"
 
 # This is a schema-complete forward configuration example. The strict parser
-# accepts and validates every field below. Some pipeline execution and analyzer
-# kinds are introduced by later implementation phases and therefore are not
-# selectable by the current evaluate-only runtime yet.
+# accepts and validates every field below. The external-tool analyzers remain
+# fail-closed placeholders until the deterministic delegate phase lands.
 
 [authorization]
 default_profile = "publication"
@@ -116,8 +115,18 @@ required = true
 scope = "tree"
 
 [analyzers.pi]
-executable = "/usr/local/bin/pi"
-expected_version = "0.83.0"
+platform = "linux"
+sandbox = "bubblewrap-v1"
+# Bubblewrap shares the host network so Pi can reach the approved internal
+# model. This value deliberately does not claim network isolation.
+network = "host_internal_model"
+runtime_root = "/opt/file-guardian/pi-runtime"
+runtime_manifest = "runtime-manifest.json"
+launcher = "bin/node"
+pi_entrypoint = "lib/pi/dist/cli.js"
+bubblewrap_executable = "/usr/bin/bwrap"
+expected_bubblewrap_version = "0.11.1"
+expected_pi_version = "0.83.0"
 provider = "internal-provider"
 model = "internal-classification-model"
 thinking = "high"
@@ -126,7 +135,11 @@ trusted_extension = "/usr/libexec/file-guardian/pi-classifier-extension.js"
 isolated_agent_dir = "/etc/file-guardian/pi-agent"
 output_schema = "file-guardian-pi-classifier/1"
 tool_grant = "artifact-readonly-v1"
-sandbox = "bubblewrap-v1"
+
+[[analyzers.pi.credentials]]
+label = "internal-model-primary"
+source_env = "FILE_GUARDIAN_PI_CREDENTIAL_PRIMARY"
+target_env = "INTERNAL_PROVIDER_API_KEY"
 
 [analyzers.vocabulary]
 classifications = ["public", "internal", "restricted", "uncertain"]
@@ -144,10 +157,24 @@ exclude = ["**/vendor/**"]
 artifact_kinds = ["physical_file", "archive_member"]
 
 [analyzers.limits]
+startup_timeout_secs = 20
+idle_timeout_secs = 30
 wall_timeout_secs = 180
+termination_grace_secs = 5
+memory_bytes = 1073741824
+cpu_time_secs = 120
+max_open_files = 64
+max_processes = 32
+max_stdout_bytes = 1048576
+max_stderr_bytes = 1048576
+max_output_bytes = 2097152
+max_findings = 1000
 max_tool_calls = 1000
 max_bytes_read = 268435456
-max_output_bytes = 1048576
+max_read_bytes_per_call = 1048576
+max_search_calls = 100
+max_search_query_bytes = 4096
+max_search_results = 1000
 
 [[policy_bindings]]
 id = "builtin-deny"

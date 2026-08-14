@@ -5,8 +5,11 @@ use rustix::process::geteuid;
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
@@ -17,11 +20,13 @@ const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
 /// Private state for one authorization invocation.
 pub struct InvocationWorkspace {
     run_path: PathBuf,
+    cleanup_armed: bool,
     _run_dir: OwnedFd,
     root_identity: FilesystemIdentity,
     run_identity: FilesystemIdentity,
     layout_identities: Vec<FilesystemIdentity>,
-    objects: ObjectStore,
+    analyzer_views_dir: OwnedFd,
+    objects: Arc<ObjectStore>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,19 +75,24 @@ impl InvocationWorkspace {
             }
             let object_dir = fs::openat(&run_dir, "objects", DIRECTORY_FLAGS, Mode::empty())
                 .map_err(WorkspaceError::OpenLayout)?;
+            let analyzer_views_dir =
+                fs::openat(&run_dir, "analyzer-views", DIRECTORY_FLAGS, Mode::empty())
+                    .map_err(WorkspaceError::OpenLayout)?;
             let tmp_dir = fs::openat(&run_dir, "tmp", DIRECTORY_FLAGS, Mode::empty())
                 .map_err(WorkspaceError::OpenLayout)?;
             Ok(Self {
                 run_path: run_path.clone(),
+                cleanup_armed: true,
                 _run_dir: run_dir,
                 root_identity,
                 run_identity,
                 layout_identities,
-                objects: ObjectStore {
+                analyzer_views_dir,
+                objects: Arc::new(ObjectStore {
                     object_dir,
                     tmp_dir,
                     next_temp: AtomicU64::new(0),
-                },
+                }),
             })
         })();
 
@@ -97,6 +107,45 @@ impl InvocationWorkspace {
         &self.objects
     }
 
+    pub(crate) fn objects_arc(&self) -> Arc<ObjectStore> {
+        Arc::clone(&self.objects)
+    }
+
+    /// Creates an invocation-scoped private directory for one analyzer endpoint.
+    ///
+    /// `name` is deliberately restricted to an opaque, host-generated suffix;
+    /// analyzer configuration and untrusted protocol fields never become paths.
+    pub(crate) fn create_analyzer_endpoint(
+        &self,
+        name: &str,
+    ) -> Result<AnalyzerEndpointDirectory, WorkspaceError> {
+        if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(WorkspaceError::InvalidEndpointName);
+        }
+        fs::mkdirat(&self.analyzer_views_dir, name, Mode::from_raw_mode(0o700))
+            .map_err(WorkspaceError::CreateAnalyzerEndpoint)?;
+        let directory = fs::openat(
+            &self.analyzer_views_dir,
+            name,
+            DIRECTORY_FLAGS,
+            Mode::empty(),
+        )
+        .map_err(WorkspaceError::OpenAnalyzerEndpoint)?;
+        let stat = fs::fstat(&directory).map_err(WorkspaceError::InspectAnalyzerEndpoint)?;
+        if stat.st_uid != geteuid().as_raw() || stat.st_mode & 0o077 != 0 {
+            return Err(WorkspaceError::InsecureAnalyzerEndpoint);
+        }
+        Ok(AnalyzerEndpointDirectory {
+            path: self.run_path.join("analyzer-views").join(name),
+            directory,
+        })
+    }
+
     pub(super) fn contains_identity(&self, identity: FilesystemIdentity) -> bool {
         identity == self.root_identity
             || identity == self.run_identity
@@ -104,10 +153,68 @@ impl InvocationWorkspace {
     }
 
     /// Deletes this invocation's private state. Secure erasure is not claimed.
-    pub fn remove(self) -> Result<(), WorkspaceError> {
+    pub fn remove(mut self) -> Result<(), WorkspaceError> {
         let path = self.run_path.clone();
+        std::fs::remove_dir_all(path).map_err(WorkspaceError::RemoveRun)?;
+        self.cleanup_armed = false;
+        Ok(())
+    }
+}
+
+impl Drop for InvocationWorkspace {
+    fn drop(&mut self) {
+        if self.cleanup_armed {
+            let _ = std::fs::remove_dir_all(&self.run_path);
+        }
+    }
+}
+
+/// An invocation-scoped directory containing exactly one analyzer IPC socket.
+pub(crate) struct AnalyzerEndpointDirectory {
+    path: PathBuf,
+    directory: OwnedFd,
+}
+
+impl AnalyzerEndpointDirectory {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns a short descriptor-rooted path for Unix-domain socket bind and
+    /// host-side connect operations. The descriptor remains owned by this
+    /// endpoint for the socket's entire lifetime, while the actual socket entry
+    /// is created inside the private endpoint directory.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn socket_path(&self, name: &str) -> Result<PathBuf, WorkspaceError> {
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(WorkspaceError::InvalidEndpointName);
+        }
+        Ok(PathBuf::from(format!(
+            "/proc/self/fd/{}/{}",
+            self.directory.as_raw_fd(),
+            name
+        )))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn socket_path(&self, _name: &str) -> Result<PathBuf, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedAnalyzerEndpointPlatform)
+    }
+
+    pub(crate) fn remove_socket(&self, name: &str) -> Result<(), WorkspaceError> {
+        fs::unlinkat(&self.directory, name, AtFlags::empty())
+            .map_err(WorkspaceError::RemoveAnalyzerSocket)
+    }
+
+    pub(crate) fn remove(self) -> Result<(), WorkspaceError> {
+        let path = self.path.clone();
         drop(self);
-        std::fs::remove_dir_all(path).map_err(WorkspaceError::RemoveRun)
+        std::fs::remove_dir(path).map_err(WorkspaceError::RemoveAnalyzerEndpoint)
     }
 }
 
@@ -269,6 +376,22 @@ pub enum WorkspaceError {
     OpenLayout(rustix::io::Errno),
     #[error("could not inspect invocation workspace layout: {0}")]
     InspectLayout(rustix::io::Errno),
+    #[error("invalid analyzer endpoint identifier")]
+    InvalidEndpointName,
+    #[error("descriptor-rooted analyzer endpoints are unsupported on this platform")]
+    UnsupportedAnalyzerEndpointPlatform,
+    #[error("could not create private analyzer endpoint: {0}")]
+    CreateAnalyzerEndpoint(rustix::io::Errno),
+    #[error("could not open private analyzer endpoint: {0}")]
+    OpenAnalyzerEndpoint(rustix::io::Errno),
+    #[error("could not inspect private analyzer endpoint: {0}")]
+    InspectAnalyzerEndpoint(rustix::io::Errno),
+    #[error("private analyzer endpoint has insecure permissions or ownership")]
+    InsecureAnalyzerEndpoint,
+    #[error("could not remove private analyzer socket: {0}")]
+    RemoveAnalyzerSocket(rustix::io::Errno),
+    #[error("could not remove private analyzer endpoint: {0}")]
+    RemoveAnalyzerEndpoint(io::Error),
     #[error("could not remove invocation workspace: {0}")]
     RemoveRun(io::Error),
     #[error("could not create temporary object: {0}")]
@@ -326,5 +449,39 @@ mod tests {
             InvocationWorkspace::create(&root, &run_id),
             Err(WorkspaceError::CreateRun(_))
         ));
+    }
+
+    #[test]
+    fn object_store_handle_does_not_prevent_workspace_removal() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("workspaces");
+        stdfs::create_dir(&root).unwrap();
+        stdfs::set_permissions(&root, stdfs::Permissions::from_mode(0o700)).unwrap();
+        let run_id = RunId::from_suffix("object-handle-cleanup").unwrap();
+        let workspace = InvocationWorkspace::create(&root, &run_id).unwrap();
+        let objects = workspace.objects_arc();
+
+        workspace.remove().unwrap();
+
+        assert!(!root.join(run_id.as_str()).exists());
+        assert!(objects
+            .open(&ObjectId::from_suffix("missing").unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn dropping_workspace_removes_private_run_tree() {
+        let temporary = TempDir::new().unwrap();
+        let root = temporary.path().join("workspaces");
+        stdfs::create_dir(&root).unwrap();
+        stdfs::set_permissions(&root, stdfs::Permissions::from_mode(0o700)).unwrap();
+        let run_id = RunId::from_suffix("drop-cleanup").unwrap();
+        let run_path = root.join(run_id.as_str());
+        let workspace = InvocationWorkspace::create(&root, &run_id).unwrap();
+        assert!(run_path.exists());
+
+        drop(workspace);
+
+        assert!(!run_path.exists());
     }
 }

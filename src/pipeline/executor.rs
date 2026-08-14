@@ -1,12 +1,13 @@
 use super::{
-    AnalyzerImplementation, CompiledAnalyzer, CompiledPipeline, PriorObservationProjection,
-    StageExecution, UnsupportedAnalyzerKind,
+    AnalyzerImplementation, ArtifactAssignment, CompiledAnalyzer, CompiledPipeline,
+    PriorObservationProjection, StageExecution, UnsupportedAnalyzerKind,
 };
 use crate::authorization::InvocationWorkspace;
 use crate::domain::{
     AnalyzerCoverage, AnalyzerId, ArtifactId, ArtifactManifest, CoverageStatus, InspectionIssue,
     InspectionPhase, IssueCode, NormalizedObservation, SanitizedMessage,
 };
+use futures_util::future::join_all;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -20,6 +21,26 @@ pub(super) struct TestAnalyzer {
 impl std::fmt::Debug for TestAnalyzer {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("TestAnalyzer(..)")
+    }
+}
+
+#[cfg(test)]
+impl TestAnalyzer {
+    pub(super) fn blocking(
+        started: Arc<std::sync::Barrier>,
+        release: Arc<std::sync::Barrier>,
+    ) -> Self {
+        Self {
+            run: Arc::new(move |_| {
+                started.wait();
+                release.wait();
+                TestAnalyzerOutput {
+                    observations: Vec::new(),
+                    issues: Vec::new(),
+                    complete: true,
+                }
+            }),
+        }
     }
 }
 
@@ -57,7 +78,7 @@ pub struct PipelineResult {
 #[derive(Clone, Debug)]
 struct PreparedAnalyzer {
     analyzer: CompiledAnalyzer,
-    assignment: Vec<ArtifactId>,
+    assignment: Vec<ArtifactAssignment>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,20 +194,14 @@ fn prepare(
         analyzer
             .eligibility
             .assign(&analyzer.id, manifest)
-            .map(|selection| {
-                selection
-                    .assignments
-                    .into_iter()
-                    .map(|assignment| assignment.artifact_id)
-                    .collect()
-            })
+            .map(|selection| selection.assignments)
             .map_err(|_| ())
     })
 }
 
 fn prepare_with(
     pipeline: &CompiledPipeline,
-    mut assign: impl FnMut(&CompiledAnalyzer) -> Result<Vec<ArtifactId>, ()>,
+    mut assign: impl FnMut(&CompiledAnalyzer) -> Result<Vec<ArtifactAssignment>, ()>,
 ) -> Result<Vec<Vec<PreparedAnalyzer>>, PreparationFailure> {
     let mut prepared = Vec::with_capacity(pipeline.stages.len());
     let mut coverage = Vec::new();
@@ -243,44 +258,27 @@ async fn execute_stage(
     };
     let mut results = Vec::with_capacity(analyzers.len());
     for batch in analyzers.chunks(concurrency) {
-        let mut handles = Vec::with_capacity(batch.len());
+        let mut futures = Vec::with_capacity(batch.len());
         for prepared in batch {
             let prepared = prepared.clone();
             let manifest = Arc::clone(&manifest);
             let workspace = Arc::clone(&workspace);
             let projection = Arc::clone(&projection);
-            handles.push((
-                prepared.analyzer.id.clone(),
-                tokio::task::spawn_blocking(move || {
-                    execute_analyzer(prepared, manifest, workspace, projection)
-                }),
-            ));
+            futures.push((prepared.analyzer.id.clone(), async move {
+                execute_analyzer(prepared, manifest, workspace, projection).await
+            }));
         }
 
         let mut batch_failed = false;
-        for (analyzer_id, handle) in handles {
-            match handle.await {
-                Ok(result) => {
-                    batch_failed |= !result.coverage.is_complete() || !result.issues.is_empty();
-                    results.push(Some(result));
-                }
-                Err(_) => {
-                    batch_failed = true;
-                    let assigned = analyzers
-                        .iter()
-                        .find(|item| item.analyzer.id == analyzer_id)
-                        .map_or(0, |item| item.assignment.len() as u64);
-                    results.push(Some(AnalyzerResult {
-                        observations: Vec::new(),
-                        issues: vec![issue(
-                            IssueCode::RequiredAnalyzerProcessFailure,
-                            Some(analyzer_id.clone()),
-                            "required analyzer task failed",
-                        )],
-                        coverage: incomplete_coverage(analyzer_id, assigned),
-                    }));
-                }
-            }
+        let batch_results = join_all(
+            futures
+                .into_iter()
+                .map(|(analyzer_id, future)| async move { (analyzer_id, future.await) }),
+        )
+        .await;
+        for (_analyzer_id, result) in batch_results {
+            batch_failed |= !result.coverage.is_complete() || !result.issues.is_empty();
+            results.push(Some(result));
         }
         if batch_failed {
             break;
@@ -289,7 +287,7 @@ async fn execute_stage(
     results
 }
 
-fn execute_analyzer(
+async fn execute_analyzer(
     prepared: PreparedAnalyzer,
     manifest: Arc<ArtifactManifest>,
     workspace: Arc<InvocationWorkspace>,
@@ -297,29 +295,85 @@ fn execute_analyzer(
 ) -> AnalyzerResult {
     let assigned = prepared.assignment.len() as u64;
     let analyzer_id = prepared.analyzer.id.clone();
-    let assignment = prepared.assignment.clone();
+    let assignment = prepared
+        .assignment
+        .iter()
+        .map(|assignment| assignment.artifact_id.clone())
+        .collect::<Vec<_>>();
     let result = match prepared.analyzer.implementation {
-        AnalyzerImplementation::Builtin(analyzer) => match analyzer.analyze(
-            InspectionPhase::Initial,
-            &manifest,
-            &prepared.assignment,
-            workspace.objects(),
-        ) {
-            Ok(result) => AnalyzerResult {
-                observations: result.observations,
-                issues: result.issues,
-                coverage: result.coverage,
-            },
-            Err(_) => AnalyzerResult {
-                observations: Vec::new(),
-                issues: vec![issue(
-                    IssueCode::InvalidAnalyzerOutput,
-                    Some(prepared.analyzer.id.clone()),
-                    "built-in analyzer rejected its assigned candidates",
-                )],
-                coverage: incomplete_coverage(prepared.analyzer.id, assigned),
-            },
-        },
+        AnalyzerImplementation::Builtin(analyzer) => {
+            let analyzer_id = prepared.analyzer.id.clone();
+            let analyzer_assignment = assignment.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                analyzer.analyze(
+                    InspectionPhase::Initial,
+                    &manifest,
+                    &analyzer_assignment,
+                    workspace.objects(),
+                )
+            })
+            .await;
+            match result {
+                Ok(Ok(result)) => AnalyzerResult {
+                    observations: result.observations,
+                    issues: result.issues,
+                    coverage: result.coverage,
+                },
+                Ok(Err(_)) => AnalyzerResult {
+                    observations: Vec::new(),
+                    issues: vec![issue(
+                        IssueCode::InvalidAnalyzerOutput,
+                        Some(analyzer_id.clone()),
+                        "built-in analyzer rejected its assigned candidates",
+                    )],
+                    coverage: incomplete_coverage(analyzer_id.clone(), assigned),
+                },
+                Err(_) => AnalyzerResult {
+                    observations: Vec::new(),
+                    issues: vec![issue(
+                        IssueCode::RequiredAnalyzerProcessFailure,
+                        Some(analyzer_id.clone()),
+                        "built-in analyzer task did not complete",
+                    )],
+                    coverage: incomplete_coverage(analyzer_id.clone(), assigned),
+                },
+            }
+        }
+        AnalyzerImplementation::Pi(analyzer) => {
+            match analyzer
+                .analyze(
+                    Arc::clone(&manifest),
+                    prepared.assignment.clone(),
+                    Arc::clone(&workspace),
+                    Arc::clone(&_projection),
+                )
+                .await
+            {
+                Ok(observations) => AnalyzerResult {
+                    observations,
+                    issues: Vec::new(),
+                    coverage: AnalyzerCoverage::new(
+                        analyzer_id.clone(),
+                        InspectionPhase::Initial,
+                        assigned,
+                        assigned,
+                        assigned,
+                        0,
+                        CoverageStatus::Complete,
+                    )
+                    .expect("complete Pi coverage is valid"),
+                },
+                Err(error) => AnalyzerResult {
+                    observations: Vec::new(),
+                    issues: vec![issue(
+                        pi_issue_code(&error),
+                        Some(analyzer_id.clone()),
+                        pi_issue_message(&error),
+                    )],
+                    coverage: incomplete_coverage(analyzer_id.clone(), assigned),
+                },
+            }
+        }
         AnalyzerImplementation::Unsupported { kind } => AnalyzerResult {
             observations: Vec::new(),
             issues: vec![issue(
@@ -329,19 +383,34 @@ fn execute_analyzer(
                     UnsupportedAnalyzerKind::External => {
                         "selected external analyzer is not implemented"
                     }
-                    UnsupportedAnalyzerKind::Pi => "selected Pi analyzer is not implemented",
+                    #[cfg(test)]
+                    UnsupportedAnalyzerKind::Pi => "selected Pi test analyzer is unsupported",
                 },
             )],
             coverage: incomplete_coverage(prepared.analyzer.id, assigned),
         },
         #[cfg(test)]
         AnalyzerImplementation::Test(test) => {
-            let output = (test.run)(TestAnalyzerInput {
+            let input = TestAnalyzerInput {
                 analyzer_id: prepared.analyzer.id.clone(),
                 assigned,
-                assignment: prepared.assignment.clone(),
+                assignment: assignment.clone(),
                 prior_count: _projection.observations().len(),
-            });
+            };
+            let output = match tokio::task::spawn_blocking(move || (test.run)(input)).await {
+                Ok(output) => output,
+                Err(_) => {
+                    return AnalyzerResult {
+                        observations: Vec::new(),
+                        issues: vec![issue(
+                            IssueCode::RequiredAnalyzerProcessFailure,
+                            Some(analyzer_id.clone()),
+                            "test analyzer task did not complete",
+                        )],
+                        coverage: incomplete_coverage(analyzer_id, assigned),
+                    };
+                }
+            };
             let coverage = if output.complete {
                 AnalyzerCoverage::new(
                     prepared.analyzer.id,
@@ -487,6 +556,46 @@ fn issue(
         subject_id: None,
         artifact_id: None,
         message: SanitizedMessage::new(message).expect("static pipeline diagnostic is safe"),
+    }
+}
+
+fn pi_issue_code(error: &crate::analyzers::pi::PiClassifierError) -> IssueCode {
+    use crate::analyzers::pi::proxy::PiProxyError;
+    use crate::analyzers::pi::runner::{PiRunError, PiTimeoutKind};
+    match error {
+        crate::analyzers::pi::PiClassifierError::Runner(PiRunError::Timeout(
+            PiTimeoutKind::Startup | PiTimeoutKind::Idle | PiTimeoutKind::Wall,
+        )) => IssueCode::RequiredAnalyzerTimeout,
+        crate::analyzers::pi::PiClassifierError::Runner(PiRunError::OutputLimit(_)) => {
+            IssueCode::RequiredAnalyzerBudgetExceeded
+        }
+        crate::analyzers::pi::PiClassifierError::Proxy(
+            PiProxyError::BudgetExceeded
+            | PiProxyError::FrameTooLarge
+            | PiProxyError::ResponseTooLarge,
+        ) => IssueCode::RequiredAnalyzerBudgetExceeded,
+        crate::analyzers::pi::PiClassifierError::Proxy(PiProxyError::FrameReadTimeout) => {
+            IssueCode::RequiredAnalyzerTimeout
+        }
+        crate::analyzers::pi::PiClassifierError::Proxy(_) => {
+            IssueCode::RequiredAnalyzerProtocolFailure
+        }
+        crate::analyzers::pi::PiClassifierError::Runner(_) => {
+            IssueCode::RequiredAnalyzerProcessFailure
+        }
+    }
+}
+
+fn pi_issue_message(error: &crate::analyzers::pi::PiClassifierError) -> &'static str {
+    match pi_issue_code(error) {
+        IssueCode::RequiredAnalyzerTimeout => "required Pi analyzer exceeded a time budget",
+        IssueCode::RequiredAnalyzerBudgetExceeded => {
+            "required Pi analyzer exceeded an output budget"
+        }
+        IssueCode::RequiredAnalyzerProtocolFailure => {
+            "required Pi analyzer violated its authenticated protocol"
+        }
+        _ => "required sandboxed Pi analyzer process failed",
     }
 }
 
@@ -760,13 +869,7 @@ mod tests {
             analyzer
                 .eligibility
                 .assign(&analyzer.id, &fixture.manifest)
-                .map(|selection| {
-                    selection
-                        .assignments
-                        .into_iter()
-                        .map(|assignment| assignment.artifact_id)
-                        .collect()
-                })
+                .map(|selection| selection.assignments)
                 .map_err(|_| ())
         })
         .unwrap_err();

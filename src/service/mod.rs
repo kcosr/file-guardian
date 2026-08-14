@@ -703,6 +703,40 @@ content_regex = "SECRET"
     }
 
     #[tokio::test]
+    async fn cancelling_authorization_removes_workspace_after_analyzer_releases() {
+        let fixture = Fixture::new();
+        fs::write(fixture.input.join("safe.txt"), "safe").unwrap();
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let request = fixture.request(
+            "cancel-cleanup",
+            "blocking",
+            AnalyzerImplementation::blocking_test(Arc::clone(&started), Arc::clone(&release)),
+        );
+        let run_path = fixture.workspace_root.join("run_cancel-cleanup");
+        let authorization = tokio::spawn(AuthorizationService::authorize(request));
+        let started_wait = Arc::clone(&started);
+        tokio::task::spawn_blocking(move || started_wait.wait())
+            .await
+            .unwrap();
+        assert!(run_path.exists());
+
+        authorization.abort();
+        let release_wait = Arc::clone(&release);
+        tokio::task::spawn_blocking(move || release_wait.wait())
+            .await
+            .unwrap();
+        let _ = authorization.await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while run_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled authorization workspace must be removed");
+    }
+
+    #[tokio::test]
     async fn matching_observation_is_denied_without_modifying_input() {
         let fixture = Fixture::new();
         let target = fixture.input.join("secret.txt");

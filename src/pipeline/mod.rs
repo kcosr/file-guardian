@@ -12,7 +12,7 @@ pub use prior_observations::{
     PriorObservationMode, PriorObservationProjection, ProjectionError, ProjectionLimits,
 };
 
-use crate::analyzers::BuiltinRulesAnalyzer;
+use crate::analyzers::{BuiltinRulesAnalyzer, PiClassifierAnalyzer};
 use crate::domain::{AnalyzerId, IdentifierError};
 use std::collections::BTreeSet;
 use std::fmt;
@@ -20,6 +20,7 @@ use std::fmt;
 #[derive(Clone, Debug)]
 pub enum AnalyzerImplementation {
     Builtin(BuiltinRulesAnalyzer),
+    Pi(Box<PiClassifierAnalyzer>),
     /// A selected analyzer which has no secure implementation in this build.
     Unsupported {
         kind: UnsupportedAnalyzerKind,
@@ -29,9 +30,20 @@ pub enum AnalyzerImplementation {
     Test(executor::TestAnalyzer),
 }
 
+#[cfg(test)]
+impl AnalyzerImplementation {
+    pub(crate) fn blocking_test(
+        started: std::sync::Arc<std::sync::Barrier>,
+        release: std::sync::Arc<std::sync::Barrier>,
+    ) -> Self {
+        Self::Test(executor::TestAnalyzer::blocking(started, release))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedAnalyzerKind {
     External,
+    #[cfg(test)]
     Pi,
 }
 

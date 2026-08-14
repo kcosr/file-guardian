@@ -90,16 +90,30 @@ async fn authorize_with_config(
     run_id: RunId,
 ) -> Result<AuthorizationReport, (RunId, String)> {
     let started = Instant::now();
-    let compiled = compile_invocation(
-        config,
-        args.profile.as_deref(),
-        args.action_mode.map(|mode| match mode {
-            ActionMode::Evaluate => ConfigActionMode::Evaluate,
-            ActionMode::Apply => ConfigActionMode::Apply,
-        }),
-        run_id.clone(),
-        args.path.clone(),
-    )
+    let config = config.clone();
+    let profile = args.profile.clone();
+    let action_mode = args.action_mode;
+    let input = args.path.clone();
+    let compile_run_id = run_id.clone();
+    let compiled = tokio::task::spawn_blocking(move || {
+        compile_invocation(
+            &config,
+            profile.as_deref(),
+            action_mode.map(|mode| match mode {
+                ActionMode::Evaluate => ConfigActionMode::Evaluate,
+                ActionMode::Apply => ConfigActionMode::Apply,
+            }),
+            compile_run_id,
+            input,
+        )
+    })
+    .await
+    .map_err(|_| {
+        (
+            run_id.clone(),
+            "authorization compilation task failed".to_string(),
+        )
+    })?
     .map_err(|error| (run_id.clone(), error.to_string()))?;
     let result = AuthorizationService::authorize(compiled.request).await;
     report_from_result(

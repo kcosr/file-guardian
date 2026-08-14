@@ -7,7 +7,9 @@ can also run configured policy scans as explicit daemon jobs.
 
 The current implementation is evaluate-only: it inspects an immutable private
 copy through a compiled, ordered analyzer pipeline, applies built-in filename
-and content rules, and never modifies the caller-owned staging tree.
+and content rules, can obtain audit-only semantic classifications from an
+approved internal model through Pi on Linux, and never modifies the
+caller-owned staging tree.
 
 > File Guardian is a policy gate, not a filesystem access-control boundary. The
 > caller must prevent every other writer from changing a staging tree while it
@@ -25,6 +27,9 @@ and content rules, and never modifies the caller-owned staging tree.
 - Per-analyzer, byte-safe include/exclude selectors over immutable logical
   paths, with explicit eligible/assigned/completed/excluded coverage.
 - Bounded projections of prior normalized observations for later stages.
+- Linux Pi classification through a required Bubblewrap sandbox, a private
+  bounded artifact proxy, strict terminal structured output, and a closed
+  administrator vocabulary.
 - Strict schema-v2 configuration and action-free TOML rule files.
 - Policy bindings that resolve findings independently of rule detection.
 - Exactly one compact JSON report on stdout for a recognized authorization
@@ -32,11 +37,13 @@ and content rules, and never modifies the caller-owned staging tree.
 - Explicit asynchronous `policy_scan` daemon jobs with configured targets and
   schedules, using the same pipeline engine as one-shot authorization.
 
-Pi classifier and external-tool definitions are parse-ready but are not yet
-executable; selecting either kind fails the authorization closed with exit
-`30`. Deterministic password and secret scanner delegates, delete/quarantine
-actions, recursive archive inspection, and exact fingerprint indexes remain
-planned. See [Roadmap](#roadmap).
+Pi classification is intentionally audit-only: every configured classification
+maps to `audit` and cannot suppress deterministic findings or change the final
+decision. External-tool definitions are parse-ready but are not yet executable;
+selecting one fails authorization closed with exit `30`. Deterministic password
+and secret scanner delegates, delete/quarantine actions, recursive archive
+inspection, and exact fingerprint indexes remain planned. See
+[Roadmap](#roadmap).
 
 ## Install
 
@@ -155,11 +162,11 @@ Exceeding either limit is incomplete required analysis and therefore exit
 `30`.
 
 The shipped [sample configuration](config/config.toml) is the source of truth
-for an executable built-in pipeline. A broader schema-v2 example is in
+for the default executable built-in pipeline. A broader schema-v2 example is in
 [docs/examples/active-authorization-v2.toml](docs/examples/active-authorization-v2.toml).
-Pi and external-tool definitions in that example parse and validate, but a
-selected unsupported analyzer is never skipped: its run is incomplete and the
-authorization returns exit `30`.
+It documents Pi's Linux runtime and audit-only bindings. External-tool
+definitions parse and validate, but a selected unsupported analyzer is never
+skipped: its run is incomplete and authorization returns exit `30`.
 
 Rules are strict TOML documents. They describe detection only: rule IDs,
 filename globs, and content regexes. Rules do not contain actions. Policy
@@ -171,6 +178,65 @@ Built-in content inspection fails closed by default when an assigned file is
 invalid UTF-8 or larger than its configured content ceiling. A configuration
 may explicitly make either case inapplicable; object read failures and digest
 or length disagreement are always errors.
+
+### Pi runtime deployment
+
+Pi is an optional Linux analyzer for an internal model that is approved to
+receive sensitive staged content. Its configuration pins `platform = "linux"`,
+`sandbox = "bubblewrap-v1"`, `network = "host_internal_model"`, the Bubblewrap
+and Pi versions, provider, model, thinking level, closed vocabulary and complete
+resource limits. It also identifies an administrator-owned `runtime_root`, a
+relative runtime manifest, Node `launcher`, and `pi_entrypoint` within that
+root, the reviewed File Guardian extension and instruction, and an isolated
+agent directory. See the complete
+[schema-v2 example](docs/examples/active-authorization-v2.toml).
+
+Prepare those files outside the authorization workspace, owned and writable
+only by the administrator. Configure credentials as explicit mappings from the
+dedicated `FILE_GUARDIAN_PI_CREDENTIAL_*` parent namespace to narrowly accepted
+provider credential variables. Values are loaded only at execution, are not
+configuration or pipeline identity material, and must never appear in a report
+or diagnostic. Ambient Pi extensions, skills, prompts, themes, sessions, tools,
+shell access, and inherited environment customization are disabled.
+
+The runtime manifest pins the exact Pi version and hashes of all bundle files.
+The configured launcher and Pi entrypoint are normalized paths within that
+bundle; File Guardian invokes the pinned Node launcher with the pinned Pi CLI
+entrypoint directly, without depending on a host `/usr/bin/env node` shebang.
+The bundle is self-contained: it includes the launcher, dynamic loader and
+shared libraries, Pi package and dependencies, and CA/resolver material needed
+by the approved model transport. Inside Bubblewrap the verified runtime,
+reviewed extension, isolated configuration, and private proxy endpoint are the
+only persistent mounts; the instruction is delivered by the authenticated host
+proxy and live staging/object storage is never mounted.
+
+The sandbox does not mount the host `/lib`, `/usr`, or `/etc`. A missing or
+unmanifested runtime, loader, library, trust, or resolver asset therefore fails
+closed instead of being discovered from the host.
+
+For a dynamically linked launcher, the ELF interpreter and runtime search paths
+must be patched to sandbox-visible locations below `/runtime`; merely copying a
+normal host Node executable and its libraries is insufficient. The runtime
+manifest must also include bundle-local `etc/resolv.conf`, `etc/hosts`,
+`etc/nsswitch.conf`, and the configured CA bundle. The runner mounts those
+verified files at their conventional `/etc` locations. Pi starts with
+`PI_OFFLINE=1` and `PI_TELEMETRY=0`; model inference still uses the explicitly
+configured provider transport, while incidental discovery and telemetry are
+disabled. The illustrative
+[runtime manifest](docs/examples/pi-classifier/runtime-manifest.example.json)
+shows the strict file-entry shape but uses placeholder hashes.
+
+For production, make the bundle, extension, instruction, and isolated
+configuration root-owned and not owner-writable, then run File Guardian under a
+dedicated service UID. Preflight hashing and revalidation detect ordinary
+changes, but the current path-based reopen permits service-UID-owned assets and
+does not defend against hostile concurrent mutation by that same UID.
+
+Bubblewrap must be present at the configured absolute path and match its pinned
+version. File Guardian does not fall back to launching Pi directly. Because the
+sandbox shares networking for the model call, restrict the service account or
+approved model gateway at the deployment layer; `bubblewrap-v1` does not by
+itself limit endpoint destinations.
 
 ## Daemon jobs
 
@@ -220,6 +286,13 @@ sudo systemctl enable --now file-guardian
 - Capture rejects symlinks, hardlinks, special files, cross-filesystem
   traversal, unstable metadata, and unsafe input/workspace overlap.
 - All analyzers read captured immutable objects, never live staging paths.
+- A Pi process sees neither live staging nor File Guardian's object store. Its
+  only content access is a private per-run Unix-socket protocol over opaque
+  assigned IDs, with host-enforced call and byte budgets.
+- Pi confinement requires Linux and Bubblewrap; there is no unsandboxed or
+  non-Linux fallback. The sandbox retains network access for the configured
+  model transport, so deployment networking must restrict that shared
+  transport to approved internal endpoints.
 - Reports contain artifact-relative paths and safe reason codes, not matched
   secrets, raw content, prompts, native scanner output, absolute staging or
   workspace paths, credentials, or environment values.
@@ -233,7 +306,8 @@ Implementation proceeds in this order:
 1. Contract, immutable inspection, and read-only one-shot authorization.
 2. Compiled ordered pipelines, bounded parallelism, artifact selectors, prior
    observation projections, and shared one-shot/daemon execution.
-3. Internal, read-only Pi LLM classification, initially audit-only.
+3. Internal, read-only Pi LLM classification, audit-only (implemented on
+   Linux).
 4. Sandboxed deterministic password and secret scanner delegates.
 5. Centralized, journaled delete and invocation-scoped quarantine with complete
    post-action verification; this introduces exit `10`.

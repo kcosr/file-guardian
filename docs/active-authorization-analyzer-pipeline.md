@@ -14,13 +14,13 @@ invokes File Guardian, and publishes that exact tree only when the process exit
 status and the JSON report both say it is allowed.
 
 The implemented foundation includes the contract, immutable inspection,
-read-only authorization, and the generic Phase 3 pipeline engine: compiled
-ordered stages, bounded parallelism, immutable artifact selection, bounded
-prior-observation projections, and shared one-shot/daemon execution. The
-internal Pi-based LLM classifier is the next milestone, followed by
-deterministic password and secret scanners. Safe actions, archives, and
-fingerprint indexes follow without changing the core pipeline or report
-meanings.
+read-only authorization, the generic Phase 3 pipeline engine, and the Linux Pi
+classifier: compiled ordered stages, bounded parallelism, immutable artifact
+selection, bounded prior-observation projections, shared one-shot/daemon
+execution, and audit-only semantic classification through a confined internal
+model client. Deterministic password and secret scanners follow. Safe actions,
+archives, and fingerprint indexes remain later phases without changing the
+core pipeline or report meanings.
 
 ## Caller contract
 
@@ -243,10 +243,10 @@ every analyzer row to be complete. Excluded artifacts never also increment
 `completed`.
 
 Pi and external-tool analyzer definitions are accepted by the strict parser so
-the end-state configuration has one shape, but their runners are not yet
-implemented. If either kind is selected, the analyzer produces incomplete
-coverage and a typed process failure, and the authorization returns exit `30`.
-Unsupported analyzers are never silently skipped.
+the end-state configuration has one shape. Pi has a Linux Bubblewrap runner;
+external tools do not yet have a runner. A selected unsupported analyzer
+produces incomplete coverage and a typed process failure, and authorization
+returns exit `30`. Unsupported analyzers are never silently skipped.
 
 ## Built-in rules
 
@@ -265,7 +265,7 @@ and manifest length or digest mismatches are always incomplete coverage.
 
 ## Internal Pi classifier
 
-Status: specified and parse-ready; execution is not implemented yet.
+Status: implemented on Linux, audit-only.
 
 The Pi analyzer is authorized to send sensitive staged content to the selected
 internal model. Its capabilities remain read-only and transaction-scoped.
@@ -331,12 +331,72 @@ Unknown fields, extra prose, unknown IDs, wrong manifest identity, oversized
 output, invalid counts, inability to complete, timeout, process failure, or
 budget exhaustion make a required analyzer incomplete and produce exit `30`.
 
-The Pi process runs in a required OS sandbox. The initial Linux backend uses
-Bubblewrap and mounts neither live staging nor the invocation object store;
-artifact bytes are available only through a bounded File Guardian-owned Unix
-socket proxy. There is no unsandboxed fallback. The sandbox keeps only the
-network access needed for the configured internal model transport and exposes
-an isolated administrator-owned Pi configuration.
+The Pi process runs in a required OS sandbox. The Linux backend uses Bubblewrap
+and mounts neither live staging nor the invocation object store; artifact bytes
+are available only through a bounded File Guardian-owned Unix socket proxy in
+a private per-run endpoint directory. There is no unsandboxed fallback, and a
+selected Pi analyzer is unsupported on non-Linux platforms.
+
+An administrator prepares and protects the Pi runtime bundle, reviewed
+extension, instruction, and isolated agent configuration. The bundle manifest
+pins the exact Pi version and every runtime file hash. File Guardian executes
+the normalized runtime-relative Node launcher with the normalized Pi CLI
+entrypoint directly, so it does not depend on a host `/usr/bin/env node`
+shebang. The manifest covers a self-contained Node runtime, dynamic loader and
+shared libraries, Pi package/dependencies, and CA/resolver material required by
+the approved model transport. File Guardian
+pins the configured material in pipeline identity, clears ambient
+customization, verifies the Pi/runtime handshake and exact tool grant, and
+supervises the complete process group. Startup, idle and wall-clock deadlines;
+process, memory and descriptor ceilings; concurrent bounded output draining;
+and terminate-then-kill cleanup prevent a failed child from outliving the
+authorization.
+
+Bubblewrap starts with user, mount, PID, IPC, UTS and cgroup isolation,
+explicitly shares only the host network namespace, disables nested user
+namespaces, drops all capabilities, and builds a temporary root. It mounts only
+the verified bundle at `/runtime`, reviewed extension at
+`/policy/file-guardian-extension.js`, isolated Pi configuration at `/config`,
+and the private socket directory at `/run/file-guardian`; `/work`, `/home`, and
+`/tmp` are temporary. Verified bundle-local resolver, hosts, name-service, and
+CA files are mounted at their conventional `/etc` locations. The host
+instruction is supplied through the authenticated proxy, not as an argument or
+host-file mount.
+
+The sandbox does not mount host `/lib`, `/usr`, or `/etc`. A runtime bundle
+that omits its loader, libraries, trust roots, resolver configuration, or any
+declared dependency cannot execute and fails authorization closed.
+
+The private proxy authenticates a run and accepts only versioned,
+schema-validated requests with monotonic request identities. It maps opaque
+candidate and artifact IDs to immutable objects and enforces configured tool
+calls, returned bytes, search matches, prior-observation size, and terminal
+output limits. It never accepts host paths. A terminal submission closes
+content access for that run.
+
+The reviewed extension obtains the trusted host instruction through a private
+authenticated bootstrap proxy operation before the agent starts. That
+operation is not model-callable. The exact active model grant remains the seven
+tools listed above, including the terminal submission tool. `max_tool_calls`
+counts those model-callable operations; the runtime-ready and instruction
+bootstrap connections are separate mandatory protocol operations.
+
+After an authenticated tool, protocol, object-read, output, or budget error,
+the proxy permanently invalidates the run. A later well-formed terminal call
+cannot convert partial or failed analysis into complete coverage.
+
+Bubblewrap confines filesystem and process capabilities, but Pi still needs
+network access to the configured internal model transport. This is a shared
+model-transport network limitation rather than process-level destination
+allowlisting. Deployments must constrain the approved provider through their
+network or model gateway; File Guardian does not claim that the Pi sandbox
+denies every other destination.
+
+Any runtime-bundle mismatch, platform or sandbox failure, handshake/version/
+model/thinking/tool disagreement, proxy or tool error, output overflow, timeout,
+budget exhaustion, abnormal process exit, missing terminal call, duplicate
+terminal call, unknown field/code/ID, manifest mismatch, or incomplete coverage
+is a typed required-analyzer failure and yields exit `30`.
 
 Prompt injection remains a classification-quality risk even with capability
 confinement. Rollout begins in audit mode: every accepted classification maps
@@ -344,6 +404,24 @@ to `audit`. Enforcement requires a frozen prompt/model/vocabulary, a reviewed
 labeled evaluation, acceptance thresholds, and explicit operator approval. A
 model's `public` classification never removes or suppresses a deterministic
 finding.
+
+### Pi acceptance and privacy matrix
+
+| Case | Required behavior |
+| --- | --- |
+| Artifact prompt injection asks for a tool, path, or policy change | Content remains untrusted evidence; the fixed grant and host policy cannot change. A valid audit classification may complete, otherwise exit `30`. |
+| Model returns unknown fields, codes, IDs, counts, manifest identity, or claims coverage it did not receive | Reject the terminal submission, mark Pi coverage incomplete, and exit `30`. Do not echo the rejected payload. |
+| Pi stalls, floods output, crashes, forks, or ignores termination | Apply budgets, terminate the complete process group, drain bounded output, reap it, and exit `30`. |
+| Runtime, extension, instruction, or isolated configuration disagrees with its compiled identity | Refuse execution before trusting model output and exit `30`. |
+| Concurrent runs attempt to reuse a token, socket, request ID, or candidate ID | Per-run authentication and namespace isolation reject the request without exposing either run's content. |
+| Pi reads sensitive immutable content successfully | The approved internal model transport may receive it. Reports, stdout, errors, and routine logs retain only normalized safe codes and counts, never the content, prompt, transcript, tool payload, or transport credential. |
+
+Default tests use a fake runtime and synthetic content and run offline. A live
+Pi acceptance test is operator opt-in, must name the approved provider/model,
+and should use synthetic sensitive fixtures unless the operator intentionally
+supplies a protected fixture. Passing a live test validates integration and the
+labeled scenario only; it does not make probabilistic classification a security
+boundary.
 
 ## Deterministic external analyzers
 
@@ -424,10 +502,10 @@ a workspace is created.
 
 The strict mature example is
 [`examples/active-authorization-v2.toml`](examples/active-authorization-v2.toml).
-The generic pipeline, selectors, and projections in it are implemented. Pi and
-external-tool definitions parse and validate, but selecting either unsupported
-runner fails execution closed with exit `30`; fields are never reinterpreted or
-aliased.
+The generic pipeline, selectors, projections, and Linux Pi runner are
+implemented. Pi must be configured audit-only. External-tool definitions parse
+and validate, but selecting that unsupported runner fails execution closed with
+exit `30`; fields are never reinterpreted or aliased.
 
 Pipeline identity covers ordered stages, execution and prior-observation
 settings, selected analyzer configurations, selectors, limits, and compiled
@@ -474,10 +552,9 @@ task completion order; every required failure yields `30`.
 
 ### Phase 3b: Pi classifier
 
-Add Pi process lifecycle, read-only artifact tools, instruction identity,
-strict structured output, normalized classifications, and policy bindings.
-Start audit-only and enable enforcement only after documented acceptance
-criteria.
+Implemented on Linux: Pi process lifecycle, Bubblewrap confinement, private
+read-only artifact tools, instruction/runtime identity, strict structured
+output, normalized classifications, and audit-only policy bindings.
 
 Gate: the approved internal model classifies a staged tree through read-only
 artifact capabilities; every required Pi failure yields `30`; audit

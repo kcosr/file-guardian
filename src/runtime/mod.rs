@@ -5,23 +5,32 @@
 //! and performs no policy decisions of its own.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
+use crate::analyzers::pi::protocol::{ClassificationVocabulary, TerminalValidationLimits};
+use crate::analyzers::pi::proxy::{ExpectedPiRuntime, PiProxyLimits};
+use crate::analyzers::pi::runner::PiRunLimits;
+use crate::analyzers::pi::sandbox::PiRuntimeSpec;
+use crate::analyzers::pi::{PiClassifierAnalyzer, PiClassifierSpec};
 use crate::analyzers::{
     BuiltinAnalyzerLimits, BuiltinContentApplicability, BuiltinRulesAnalyzer,
     UnsupportedContentPolicy,
 };
 use crate::authorization::SnapshotInputKind;
 use crate::config::{
-    ActionMode as ConfigActionMode, AnalyzerKind, ApplicabilityPolicy, ArtifactKindConfig, Config,
-    PriorObservations, StageExecution as ConfigStageExecution, UnboundObservation,
+    ActionMode as ConfigActionMode, AnalyzerKind, ApplicabilityPolicy, ArtifactKindConfig,
+    ClassifierScope, Config, PriorObservations, StageExecution as ConfigStageExecution,
+    UnboundObservation,
 };
 use crate::domain::{
-    AnalyzerId, ArtifactKind, ArtifactManifest, ClassificationCode, InspectionIssue,
-    InspectionPhase, IssueCode, LogicalPath, PhaseCoverage, PhaseCoverageStatus, Provenance,
-    RuleId, RunCoverage, RunId, SanitizedMessage,
+    AnalyzerId, ArtifactKind, ArtifactManifest, ClassificationCode, ConfiguredConfidence,
+    InspectionIssue, InspectionPhase, IssueCode, LogicalPath, PhaseCoverage, PhaseCoverageStatus,
+    Provenance, ReasonCode, RuleId, RunCoverage, RunId, SanitizedMessage,
 };
 use crate::pipeline::{
     AnalyzerImplementation, CompiledAnalyzer, CompiledPipeline, CompiledStage, EligibilitySelector,
@@ -55,6 +64,8 @@ pub enum RuntimeError {
     Rules(#[from] crate::rules::RulesError),
     #[error("built-in analyzer could not be compiled: {0}")]
     Builtin(#[from] crate::analyzers::BuiltinAnalyzerError),
+    #[error("Pi analyzer could not be compiled: {0}")]
+    Pi(String),
     #[error("authorization identity could not be serialized: {0}")]
     Identity(#[from] serde_json::Error),
 }
@@ -85,6 +96,7 @@ pub fn compile_invocation(
     let mut known_rules = Vec::new();
     let mut compiled_rule_material = Vec::new();
     let mut selected_analyzers = Vec::new();
+    let mut pi_identity_material = Vec::new();
     for stage in &selection.pipeline.stages {
         let mut analyzers = Vec::with_capacity(stage.analyzers.len());
         for id in &stage.analyzers {
@@ -138,9 +150,26 @@ pub fn compile_invocation(
                 AnalyzerKind::ExternalTool { .. } => AnalyzerImplementation::Unsupported {
                     kind: UnsupportedAnalyzerKind::External,
                 },
-                AnalyzerKind::PiClassifier { .. } => AnalyzerImplementation::Unsupported {
-                    kind: UnsupportedAnalyzerKind::Pi,
-                },
+                AnalyzerKind::PiClassifier {
+                    scope,
+                    pi,
+                    vocabulary,
+                } => {
+                    if *scope != ClassifierScope::Tree {
+                        return Err(RuntimeError::Configuration(format!(
+                            "Pi analyzer '{id}' uses an unsupported classifier scope"
+                        )));
+                    }
+                    let analyzer = compile_pi_analyzer(
+                        analyzer_id.clone(),
+                        run_id.clone(),
+                        pi,
+                        vocabulary,
+                        &config_analyzer.limits,
+                    )?;
+                    pi_identity_material.push((id.clone(), analyzer.identity()));
+                    AnalyzerImplementation::Pi(Box::new(analyzer))
+                }
             };
             let eligibility = EligibilitySelector::compile(
                 &config_analyzer.selection.include,
@@ -217,6 +246,7 @@ pub fn compile_invocation(
         selection.pipeline,
         &selected_analyzers,
         &compiled_rule_material,
+        &pi_identity_material,
     ))?);
     let policy = PolicySummary {
         profile_id: ReportIdentifier::new(selection.profile.id.clone())
@@ -251,6 +281,189 @@ fn applicability(value: ApplicabilityPolicy) -> UnsupportedContentPolicy {
         ApplicabilityPolicy::Fail => UnsupportedContentPolicy::Fail,
         ApplicabilityPolicy::Exclude => UnsupportedContentPolicy::Exclude,
     }
+}
+
+fn compile_pi_analyzer(
+    id: AnalyzerId,
+    run_id: RunId,
+    pi: &crate::config::PiConfig,
+    vocabulary: &crate::config::VocabularyConfig,
+    limits: &crate::config::AnalyzerLimits,
+) -> Result<PiClassifierAnalyzer, RuntimeError> {
+    let required = |name: &str, value: Option<u64>| {
+        value.ok_or_else(|| {
+            RuntimeError::Configuration(format!(
+                "Pi analyzer '{}' requires limit {name}",
+                id.as_str()
+            ))
+        })
+    };
+    let checked_usize = |name: &str, value: u64| {
+        usize::try_from(value).map_err(|_| {
+            RuntimeError::Configuration(format!(
+                "Pi analyzer '{}' {name} exceeds this platform",
+                id.as_str()
+            ))
+        })
+    };
+    let max_output = required("max_output_bytes", limits.max_output_bytes)?;
+    let instruction_file = File::open(&pi.instruction_file)
+        .map_err(|_| RuntimeError::Pi("trusted instruction could not be read".to_string()))?;
+    let mut instruction_bytes = Vec::new();
+    instruction_file
+        .take(max_output.saturating_add(1))
+        .read_to_end(&mut instruction_bytes)
+        .map_err(|_| RuntimeError::Pi("trusted instruction could not be read".to_string()))?;
+    if instruction_bytes.len() as u64 > max_output {
+        return Err(RuntimeError::Pi(
+            "trusted instruction exceeds its configured limit".to_string(),
+        ));
+    }
+    let instruction = String::from_utf8(instruction_bytes)
+        .map_err(|_| RuntimeError::Pi("trusted instruction is not UTF-8".to_string()))?;
+    if instruction.is_empty() {
+        return Err(RuntimeError::Pi("trusted instruction is empty".to_string()));
+    }
+    let confidences = vocabulary
+        .confidences
+        .iter()
+        .map(|value| match value.as_str() {
+            "low" => Ok(ConfiguredConfidence::Low),
+            "medium" => Ok(ConfiguredConfidence::Medium),
+            "high" => Ok(ConfiguredConfidence::High),
+            _ => Err(RuntimeError::Configuration(format!(
+                "Pi analyzer '{}' contains an unsupported confidence",
+                id.as_str()
+            ))),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let vocabulary = ClassificationVocabulary::new(
+        vocabulary
+            .classifications
+            .iter()
+            .cloned()
+            .map(ClassificationCode::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
+        confidences,
+        vocabulary
+            .reason_codes
+            .iter()
+            .cloned()
+            .map(ReasonCode::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
+    )
+    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+
+    let max_findings = required("max_findings", limits.max_findings)?;
+    let wall = required("wall_timeout_secs", limits.wall_timeout_secs)?;
+    let credentials = pi
+        .credentials
+        .iter()
+        .map(|credential| {
+            let value = std::env::var_os(&credential.source_env).ok_or_else(|| {
+                RuntimeError::Configuration(format!(
+                    "Pi analyzer '{}' required credential '{}' is unavailable",
+                    id.as_str(),
+                    credential.label
+                ))
+            })?;
+            Ok((OsString::from(&credential.target_env), value))
+        })
+        .collect::<Result<Vec<_>, RuntimeError>>()?;
+    let runtime_manifest = pi.runtime_root.join(&pi.runtime_manifest);
+    let identity_material = serde_json::to_vec(&(
+        "file-guardian-compiled-pi/1",
+        id.as_str(),
+        &pi.provider,
+        &pi.model,
+        &pi.thinking,
+        &pi.output_schema,
+        &pi.tool_grant,
+        limits,
+        &pi.expected_pi_version,
+    ))?;
+    PiClassifierAnalyzer::compile(PiClassifierSpec {
+        id: id.clone(),
+        run_id,
+        runtime: PiRuntimeSpec {
+            bubblewrap_executable: pi.bubblewrap_executable.clone(),
+            expected_bubblewrap_version: pi.expected_bubblewrap_version.clone(),
+            runtime_root: pi.runtime_root.clone(),
+            runtime_manifest,
+            launcher: pi.launcher.clone(),
+            pi_entrypoint: pi.pi_entrypoint.clone(),
+            expected_pi_version: pi.expected_pi_version.clone(),
+            instruction_file: pi.instruction_file.clone(),
+            trusted_extension: pi.trusted_extension.clone(),
+            isolated_agent_dir: pi.isolated_agent_dir.clone(),
+        },
+        instruction: Arc::from(instruction),
+        vocabulary,
+        expected_runtime: ExpectedPiRuntime {
+            pi_version: pi.expected_pi_version.clone(),
+            provider: pi.provider.clone(),
+            model: pi.model.clone(),
+            thinking: pi.thinking.clone(),
+            mode: "print".to_string(),
+        },
+        terminal_limits: TerminalValidationLimits::new(
+            checked_usize("max_findings", max_findings)?,
+            checked_usize("max_findings", max_findings)?,
+            checked_usize("max_findings", max_findings)?,
+        )
+        .map_err(|error| RuntimeError::Configuration(error.to_string()))?,
+        proxy_limits: PiProxyLimits {
+            max_frame_bytes: checked_usize("max_output_bytes", max_output)?,
+            max_response_bytes: checked_usize("max_output_bytes", max_output)?,
+            max_terminal_bytes: checked_usize("max_output_bytes", max_output)?,
+            max_tool_calls: required("max_tool_calls", limits.max_tool_calls)?,
+            max_bytes_read: required("max_bytes_read", limits.max_bytes_read)?,
+            max_read_bytes_per_call: required(
+                "max_read_bytes_per_call",
+                limits.max_read_bytes_per_call,
+            )?,
+            max_search_pattern_bytes: checked_usize(
+                "max_search_query_bytes",
+                required("max_search_query_bytes", limits.max_search_query_bytes)?,
+            )?,
+            max_search_matches: required("max_search_results", limits.max_search_results)?,
+            max_search_bytes_per_call: required(
+                "max_read_bytes_per_call",
+                limits.max_read_bytes_per_call,
+            )?,
+            max_search_calls: required("max_search_calls", limits.max_search_calls)?,
+            frame_read_timeout: Duration::from_secs(required(
+                "idle_timeout_secs",
+                limits.idle_timeout_secs,
+            )?),
+        },
+        run_limits: PiRunLimits {
+            startup_timeout: Duration::from_secs(required(
+                "startup_timeout_secs",
+                limits.startup_timeout_secs,
+            )?),
+            idle_timeout: Duration::from_secs(required(
+                "idle_timeout_secs",
+                limits.idle_timeout_secs,
+            )?),
+            wall_timeout: Duration::from_secs(wall),
+            termination_grace: Duration::from_secs(required(
+                "termination_grace_secs",
+                limits.termination_grace_secs,
+            )?),
+            memory_bytes: required("memory_bytes", limits.memory_bytes)?,
+            cpu_seconds: required("cpu_time_secs", limits.cpu_time_secs)?,
+            open_files: required("max_open_files", limits.max_open_files)?,
+            processes: required("max_processes", limits.max_processes)?,
+            stdout_bytes: required("max_stdout_bytes", limits.max_stdout_bytes)?,
+            stderr_bytes: required("max_stderr_bytes", limits.max_stderr_bytes)?,
+        },
+        credential_environment: credentials,
+        identity_material,
+    })
+    .map_err(|_| RuntimeError::Pi("sandboxed Pi runtime preflight failed".to_string()))
 }
 
 fn compile_policy_bindings(

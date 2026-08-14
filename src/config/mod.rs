@@ -225,13 +225,19 @@ impl Config {
 
         for analyzer in &self.analyzers {
             analyzer.validate()?;
-            for path in analyzer.administrator_paths() {
+            let administrator_paths = analyzer.administrator_paths();
+            for (_, path) in &administrator_paths {
                 validate_disjoint(
                     "authorization.workspace.root",
                     &self.authorization.workspace.root,
                     "analyzer administrator path",
                     path,
                 )?;
+            }
+            for (index, (left_name, left)) in administrator_paths.iter().enumerate() {
+                for (right_name, right) in administrator_paths.iter().skip(index + 1) {
+                    validate_disjoint(left_name, left, right_name, right)?;
+                }
             }
         }
         for binding in &self.policy_bindings {
@@ -274,6 +280,7 @@ impl Config {
             }
         }
         validate_binding_ambiguity(&self.policy_bindings)?;
+        self.validate_pi_audit_bindings(&profiles, &pipelines, &analyzers)?;
         for job in &self.daemon.jobs {
             job.validate(&profiles)?;
         }
@@ -288,6 +295,47 @@ impl Config {
         }
         LoggingSettings::from_config(&self.logging)
             .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        Ok(())
+    }
+
+    fn validate_pi_audit_bindings(
+        &self,
+        profiles: &BTreeMap<&str, usize>,
+        pipelines: &BTreeMap<&str, usize>,
+        analyzers: &BTreeMap<&str, usize>,
+    ) -> Result<(), ConfigError> {
+        for profile_name in profiles.keys() {
+            let profile = &self.authorization.profiles[profiles[profile_name]];
+            let pipeline = &self.pipelines[pipelines[profile.pipeline.as_str()]];
+            for analyzer_name in pipeline.stages.iter().flat_map(|stage| &stage.analyzers) {
+                let analyzer = &self.analyzers[analyzers[analyzer_name.as_str()]];
+                let AnalyzerKind::PiClassifier { vocabulary, .. } = &analyzer.kind else {
+                    continue;
+                };
+                for classification in &vocabulary.classifications {
+                    let binding = self.policy_bindings.iter().find(|binding| {
+                        binding.profile == profile.id
+                            && binding.analyzer == analyzer.id
+                            && binding.classification.as_ref() == Some(classification)
+                    });
+                    match binding {
+                        None => {
+                            return invalid(format!(
+                                "profile '{}' must bind Pi analyzer '{}' classification '{}' explicitly to audit",
+                                profile.id, analyzer.id, classification
+                            ));
+                        }
+                        Some(binding) if binding.directive != PolicyDirective::Audit => {
+                            return invalid(format!(
+                                "policy binding '{}' for Pi analyzer '{}' must use directive = 'audit'",
+                                binding.id, analyzer.id
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -625,6 +673,7 @@ impl AnalyzerConfig {
             AnalyzerKind::PiClassifier { pi, vocabulary, .. } => {
                 pi.validate(&self.id)?;
                 vocabulary.validate(&self.id)?;
+                self.limits.validate_complete_pi(&self.id)?;
             }
             AnalyzerKind::ExternalTool {
                 adapter,
@@ -644,18 +693,34 @@ impl AnalyzerConfig {
         Ok(())
     }
 
-    fn administrator_paths(&self) -> Vec<&Path> {
+    fn administrator_paths(&self) -> Vec<(&'static str, &Path)> {
         match &self.kind {
-            AnalyzerKind::BuiltinRules { rule_files, .. } => {
-                rule_files.iter().map(PathBuf::as_path).collect()
-            }
+            AnalyzerKind::BuiltinRules { rule_files, .. } => rule_files
+                .iter()
+                .map(|path| ("analyzers.rule_files", path.as_path()))
+                .collect(),
             AnalyzerKind::PiClassifier { pi, .. } => vec![
-                pi.executable.as_path(),
-                pi.instruction_file.as_path(),
-                pi.trusted_extension.as_path(),
-                pi.isolated_agent_dir.as_path(),
+                ("analyzers.pi.runtime_root", pi.runtime_root.as_path()),
+                (
+                    "analyzers.pi.bubblewrap_executable",
+                    pi.bubblewrap_executable.as_path(),
+                ),
+                (
+                    "analyzers.pi.instruction_file",
+                    pi.instruction_file.as_path(),
+                ),
+                (
+                    "analyzers.pi.trusted_extension",
+                    pi.trusted_extension.as_path(),
+                ),
+                (
+                    "analyzers.pi.isolated_agent_dir",
+                    pi.isolated_agent_dir.as_path(),
+                ),
             ],
-            AnalyzerKind::ExternalTool { adapter, .. } => vec![adapter.as_path()],
+            AnalyzerKind::ExternalTool { adapter, .. } => {
+                vec![("analyzers.adapter", adapter.as_path())]
+            }
         }
     }
 }
@@ -697,51 +762,211 @@ pub enum ApplicabilityPolicy {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PiConfig {
-    pub executable: PathBuf,
-    pub expected_version: String,
+    pub platform: PiPlatform,
+    pub sandbox: PiSandbox,
+    pub network: PiNetworkMode,
+    pub runtime_root: PathBuf,
+    pub runtime_manifest: PathBuf,
+    pub launcher: PathBuf,
+    pub pi_entrypoint: PathBuf,
+    pub bubblewrap_executable: PathBuf,
+    pub expected_bubblewrap_version: String,
+    pub expected_pi_version: String,
     pub provider: String,
     pub model: String,
     pub thinking: String,
     pub instruction_file: PathBuf,
     pub trusted_extension: PathBuf,
     pub isolated_agent_dir: PathBuf,
+    pub credentials: Vec<PiCredentialEnvConfig>,
     pub output_schema: String,
     pub tool_grant: String,
-    pub sandbox: String,
 }
 
 impl PiConfig {
     fn validate(&self, id: &str) -> Result<(), ConfigError> {
         for (field, path) in [
-            ("executable", &self.executable),
-            ("instruction_file", &self.instruction_file),
-            ("trusted_extension", &self.trusted_extension),
-            ("isolated_agent_dir", &self.isolated_agent_dir),
+            ("analyzers.pi.runtime_root", &self.runtime_root),
+            (
+                "analyzers.pi.bubblewrap_executable",
+                &self.bubblewrap_executable,
+            ),
+            ("analyzers.pi.instruction_file", &self.instruction_file),
+            ("analyzers.pi.trusted_extension", &self.trusted_extension),
+            ("analyzers.pi.isolated_agent_dir", &self.isolated_agent_dir),
         ] {
             validate_absolute(field, path)?;
         }
-        for value in [
-            &self.expected_version,
-            &self.provider,
-            &self.model,
-            &self.thinking,
-            &self.output_schema,
-            &self.tool_grant,
-            &self.sandbox,
+        for (field, path) in [
+            ("runtime_manifest", &self.runtime_manifest),
+            ("launcher", &self.launcher),
+            ("pi_entrypoint", &self.pi_entrypoint),
         ] {
-            if value.trim().is_empty() {
+            validate_relative(field, path).map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "Pi analyzer '{id}' {field} must be a normalized relative path inside runtime_root"
+                ))
+            })?;
+        }
+        if self.runtime_manifest == self.launcher
+            || self.runtime_manifest == self.pi_entrypoint
+            || self.launcher == self.pi_entrypoint
+        {
+            return invalid(format!(
+                "Pi analyzer '{id}' runtime_manifest, launcher, and pi_entrypoint must be distinct"
+            ));
+        }
+        for (field, value) in [
+            (
+                "expected_bubblewrap_version",
+                &self.expected_bubblewrap_version,
+            ),
+            ("expected_pi_version", &self.expected_pi_version),
+            ("provider", &self.provider),
+            ("model", &self.model),
+        ] {
+            validate_bounded_text(id, field, value)?;
+        }
+        if !matches!(
+            self.thinking.as_str(),
+            "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            return invalid(format!(
+                "Pi analyzer '{id}' thinking must be one of off, minimal, low, medium, high, xhigh, or max"
+            ));
+        }
+        if self.output_schema != "file-guardian-pi-classifier/1" {
+            return invalid(format!(
+                "Pi analyzer '{id}' requires output_schema = 'file-guardian-pi-classifier/1'"
+            ));
+        }
+        if self.tool_grant != "artifact-readonly-v1" {
+            return invalid(format!(
+                "Pi analyzer '{id}' requires tool_grant = 'artifact-readonly-v1'"
+            ));
+        }
+        if self.credentials.is_empty() {
+            return invalid(format!(
+                "Pi analyzer '{id}' credentials must contain at least one explicit credential mapping"
+            ));
+        }
+        let mut labels = BTreeSet::new();
+        let mut sources = BTreeSet::new();
+        let mut targets = BTreeSet::new();
+        for credential in &self.credentials {
+            credential.validate(id)?;
+            if !labels.insert(&credential.label)
+                || !sources.insert(&credential.source_env)
+                || !targets.insert(&credential.target_env)
+            {
                 return invalid(format!(
-                    "Pi analyzer '{id}' contains an empty required field"
+                    "Pi analyzer '{id}' credential labels, source_env values, and target_env values must each be unique"
                 ));
             }
         }
-        if self.sandbox != "bubblewrap-v1" {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiPlatform {
+    Linux,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+pub enum PiSandbox {
+    #[serde(rename = "bubblewrap-v1")]
+    BubblewrapV1,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PiNetworkMode {
+    /// The sandbox shares the host network solely because Pi must reach the
+    /// configured internal model. It does not claim network isolation.
+    HostInternalModel,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PiCredentialEnvConfig {
+    /// Non-secret identifier used in diagnostics and identity material.
+    pub label: String,
+    /// Dedicated parent-process variable from which the secret is read.
+    pub source_env: String,
+    /// Credential variable exposed inside the otherwise cleared environment.
+    pub target_env: String,
+}
+
+impl PiCredentialEnvConfig {
+    fn validate(&self, id: &str) -> Result<(), ConfigError> {
+        validate_id("analyzers.pi.credentials.label", &self.label)?;
+        if !is_environment_name(&self.source_env)
+            || !self.source_env.starts_with("FILE_GUARDIAN_PI_CREDENTIAL_")
+            || self.source_env == "FILE_GUARDIAN_PI_CREDENTIAL_"
+        {
             return invalid(format!(
-                "Pi analyzer '{id}' requires the bubblewrap-v1 sandbox"
+                "Pi analyzer '{id}' credential source_env must use the dedicated FILE_GUARDIAN_PI_CREDENTIAL_* namespace"
+            ));
+        }
+        if !is_safe_credential_target(&self.target_env) {
+            return invalid(format!(
+                "Pi analyzer '{id}' credential target_env '{}' is not an explicit credential variable",
+                self.target_env
             ));
         }
         Ok(())
     }
+}
+
+fn is_environment_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn is_safe_credential_target(value: &str) -> bool {
+    const FORBIDDEN: &[&str] = &[
+        "PATH",
+        "HOME",
+        "NODE_PATH",
+        "NODE_OPTIONS",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "AZURE_CLIENT_SECRET",
+    ];
+    is_environment_name(value)
+        && !FORBIDDEN.contains(&value)
+        && !value.starts_with("PI_")
+        && (value.ends_with("_API_KEY") || value.ends_with("_AUTH_TOKEN"))
+}
+
+fn validate_bounded_text(id: &str, field: &str, value: &str) -> Result<(), ConfigError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return invalid(format!(
+            "Pi analyzer '{id}' {field} must contain 1 to 256 non-control characters without surrounding whitespace"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -764,6 +989,11 @@ impl VocabularyConfig {
                     "Pi analyzer '{id}' vocabulary.{name} must not be empty"
                 ));
             }
+            if values.len() > 256 {
+                return invalid(format!(
+                    "Pi analyzer '{id}' vocabulary.{name} must contain at most 256 values"
+                ));
+            }
             let mut seen = BTreeSet::new();
             for value in values {
                 validate_id("vocabulary value", value)?;
@@ -773,6 +1003,15 @@ impl VocabularyConfig {
                     ));
                 }
             }
+        }
+        if self
+            .confidences
+            .iter()
+            .any(|value| !matches!(value.as_str(), "low" | "medium" | "high"))
+        {
+            return invalid(format!(
+                "Pi analyzer '{id}' vocabulary.confidences may contain only low, medium, and high"
+            ));
         }
         Ok(())
     }
@@ -833,23 +1072,47 @@ pub enum ArtifactKindConfig {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AnalyzerLimits {
+    pub startup_timeout_secs: Option<u64>,
+    pub idle_timeout_secs: Option<u64>,
     pub wall_timeout_secs: Option<u64>,
+    pub termination_grace_secs: Option<u64>,
     pub memory_bytes: Option<u64>,
+    pub cpu_time_secs: Option<u64>,
+    pub max_open_files: Option<u64>,
+    pub max_processes: Option<u64>,
+    pub max_stdout_bytes: Option<u64>,
+    pub max_stderr_bytes: Option<u64>,
     pub max_output_bytes: Option<u64>,
     pub max_findings: Option<u64>,
     pub max_tool_calls: Option<u64>,
     pub max_bytes_read: Option<u64>,
+    pub max_read_bytes_per_call: Option<u64>,
+    pub max_search_calls: Option<u64>,
+    pub max_search_query_bytes: Option<u64>,
+    pub max_search_results: Option<u64>,
 }
 
 impl AnalyzerLimits {
     fn validate(&self, id: &str) -> Result<(), ConfigError> {
         if [
+            self.startup_timeout_secs,
+            self.idle_timeout_secs,
             self.wall_timeout_secs,
+            self.termination_grace_secs,
             self.memory_bytes,
+            self.cpu_time_secs,
+            self.max_open_files,
+            self.max_processes,
+            self.max_stdout_bytes,
+            self.max_stderr_bytes,
             self.max_output_bytes,
             self.max_findings,
             self.max_tool_calls,
             self.max_bytes_read,
+            self.max_read_bytes_per_call,
+            self.max_search_calls,
+            self.max_search_query_bytes,
+            self.max_search_results,
         ]
         .into_iter()
         .flatten()
@@ -859,6 +1122,84 @@ impl AnalyzerLimits {
         }
         Ok(())
     }
+
+    fn validate_complete_pi(&self, id: &str) -> Result<(), ConfigError> {
+        let missing = [
+            ("startup_timeout_secs", self.startup_timeout_secs),
+            ("idle_timeout_secs", self.idle_timeout_secs),
+            ("wall_timeout_secs", self.wall_timeout_secs),
+            ("termination_grace_secs", self.termination_grace_secs),
+            ("memory_bytes", self.memory_bytes),
+            ("cpu_time_secs", self.cpu_time_secs),
+            ("max_open_files", self.max_open_files),
+            ("max_processes", self.max_processes),
+            ("max_stdout_bytes", self.max_stdout_bytes),
+            ("max_stderr_bytes", self.max_stderr_bytes),
+            ("max_output_bytes", self.max_output_bytes),
+            ("max_findings", self.max_findings),
+            ("max_tool_calls", self.max_tool_calls),
+            ("max_bytes_read", self.max_bytes_read),
+            ("max_read_bytes_per_call", self.max_read_bytes_per_call),
+            ("max_search_calls", self.max_search_calls),
+            ("max_search_query_bytes", self.max_search_query_bytes),
+            ("max_search_results", self.max_search_results),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.is_none().then_some(name))
+        .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return invalid(format!(
+                "Pi analyzer '{id}' requires explicit limits: {}",
+                missing.join(", ")
+            ));
+        }
+        let wall = self.wall_timeout_secs.expect("checked above");
+        if self.startup_timeout_secs.expect("checked above") > wall
+            || self.idle_timeout_secs.expect("checked above") > wall
+            || self.termination_grace_secs.expect("checked above") > wall
+        {
+            return invalid(format!(
+                "Pi analyzer '{id}' startup, idle, and termination grace timeouts must not exceed wall_timeout_secs"
+            ));
+        }
+        if self.max_read_bytes_per_call.expect("checked above")
+            > self.max_bytes_read.expect("checked above")
+        {
+            return invalid(format!(
+                "Pi analyzer '{id}' max_read_bytes_per_call must not exceed max_bytes_read"
+            ));
+        }
+        let maximum_output = self.max_output_bytes.expect("checked above");
+        let maximum_read = self.max_read_bytes_per_call.expect("checked above");
+        let required_response = pi_encoded_response_upper_bound(maximum_read).ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "Pi analyzer '{id}' max_read_bytes_per_call is too large to bound a base64 response"
+            ))
+        })?;
+        if maximum_output < required_response {
+            return invalid(format!(
+                "Pi analyzer '{id}' max_output_bytes must be at least {required_response} to contain a base64 response for max_read_bytes_per_call"
+            ));
+        }
+        const EXTENSION_MAX_PROXY_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
+        if maximum_output > EXTENSION_MAX_PROXY_RESPONSE_BYTES {
+            return invalid(format!(
+                "Pi analyzer '{id}' max_output_bytes must not exceed the trusted extension limit of {EXTENSION_MAX_PROXY_RESPONSE_BYTES}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Base64 expands to four bytes per three input bytes. The fixed allowance
+/// covers the versioned JSON response envelope and numeric metadata. This is
+/// kept equal to the proxy's host-side reservation contract.
+fn pi_encoded_response_upper_bound(raw_bytes: u64) -> Option<u64> {
+    raw_bytes
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+        .and_then(|value| value.checked_add(512))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1084,6 +1425,24 @@ fn validate_absolute(field: &str, path: &Path) -> Result<(), ConfigError> {
         })
     {
         return invalid(format!("{field} must be an absolute path"));
+    }
+    Ok(())
+}
+
+fn validate_relative(field: &str, path: &Path) -> Result<(), ConfigError> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir
+                    | std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return invalid(format!("{field} must be a normalized relative path"));
     }
     Ok(())
 }
@@ -1399,5 +1758,121 @@ path = "/srv/uploads"
     fn checked_in_example_is_valid_strict_v2() {
         let config = parse(include_str!("../../config/config.toml")).unwrap();
         config.validate().unwrap();
+    }
+
+    fn pi_example() -> Config {
+        parse(include_str!(
+            "../../docs/examples/active-authorization-v2.toml"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn accepts_strict_pi_contract_and_audit_only_bindings() {
+        pi_example().validate().unwrap();
+    }
+
+    #[test]
+    fn pi_requires_every_limit_and_exact_protocol_versions() {
+        let mut config = pi_example();
+        let pi = config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap();
+        pi.limits.idle_timeout_secs = None;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("idle_timeout_secs"));
+
+        let mut config = pi_example();
+        let AnalyzerKind::PiClassifier { pi, .. } = &mut config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .kind
+        else {
+            panic!("expected Pi analyzer")
+        };
+        pi.output_schema = "untrusted/2".to_string();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn pi_output_budget_contains_maximum_base64_read_response() {
+        let mut config = pi_example();
+        let limits = &mut config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .limits;
+        limits.max_output_bytes = Some(1024 * 1024);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("max_output_bytes must be at least"));
+
+        let mut config = pi_example();
+        let limits = &mut config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .limits;
+        limits.max_bytes_read = Some(u64::MAX);
+        limits.max_read_bytes_per_call = Some(u64::MAX);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("too large to bound a base64 response"));
+    }
+
+    #[test]
+    fn pi_rejects_dangerous_credentials_and_non_audit_policy() {
+        let mut config = pi_example();
+        let AnalyzerKind::PiClassifier { pi, .. } = &mut config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .kind
+        else {
+            panic!("expected Pi analyzer")
+        };
+        pi.credentials[0].target_env = "NODE_OPTIONS".to_string();
+        assert!(config.validate().is_err());
+
+        let mut config = pi_example();
+        config
+            .policy_bindings
+            .iter_mut()
+            .find(|binding| binding.id == "llm-restricted-audit")
+            .unwrap()
+            .directive = PolicyDirective::Deny;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("must use directive = 'audit'"));
+    }
+
+    #[test]
+    fn pi_requires_complete_vocabulary_binding_for_each_profile() {
+        let mut config = pi_example();
+        config
+            .policy_bindings
+            .retain(|binding| binding.id != "llm-uncertain-audit");
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("classification 'uncertain' explicitly to audit"));
+    }
+
+    #[test]
+    fn pi_admin_paths_must_be_pairwise_disjoint() {
+        let mut config = pi_example();
+        let AnalyzerKind::PiClassifier { pi, .. } = &mut config
+            .analyzers
+            .iter_mut()
+            .find(|analyzer| analyzer.id == "publication-llm")
+            .unwrap()
+            .kind
+        else {
+            panic!("expected Pi analyzer")
+        };
+        pi.trusted_extension = pi.runtime_root.join("extension.js");
+        assert!(config.validate().is_err());
     }
 }
