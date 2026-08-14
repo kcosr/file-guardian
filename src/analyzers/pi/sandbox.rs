@@ -315,7 +315,11 @@ pub(crate) fn compile_sandbox_command(
     push_pair(&mut arguments, &spec.runtime_root, Path::new("/runtime"));
     arguments.push(OsString::from("--ro-bind"));
     push_pair(&mut arguments, &spec.trusted_extension, extension_target);
-    arguments.push(OsString::from("--ro-bind"));
+    // Pi's credential/settings stores create lock files even for reads and may
+    // persist an OAuth refresh. This is dedicated agent state, not the user's
+    // ambient Pi home. Every other persistent mount remains read-only, and no
+    // model-callable tool can address /config.
+    arguments.push(OsString::from("--bind"));
     push_pair(
         &mut arguments,
         &spec.isolated_agent_dir,
@@ -1119,10 +1123,6 @@ mod tests {
                 PathBuf::from("/policy/file-guardian-extension.js"),
             ),
             (
-                fixture.spec.isolated_agent_dir.clone(),
-                PathBuf::from("/config"),
-            ),
-            (
                 fixture.spec.runtime_root.join("etc/resolv.conf"),
                 PathBuf::from("/etc/resolv.conf"),
             ),
@@ -1153,6 +1153,24 @@ mod tests {
         })
         .collect::<BTreeSet<_>>();
         assert_eq!(actual_mounts, expected_mounts);
+        let writable_mounts = args
+            .windows(3)
+            .filter(|values| values[0] == "--bind")
+            .map(|values| (values[1].clone(), values[2].clone()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            writable_mounts,
+            [(
+                fixture
+                    .spec
+                    .isolated_agent_dir
+                    .to_string_lossy()
+                    .into_owned(),
+                "/config".to_string(),
+            )]
+            .into_iter()
+            .collect()
+        );
         let debug = format!("{command:?}");
         assert!(!args
             .iter()

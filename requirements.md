@@ -378,10 +378,13 @@ conventional `/etc` paths. The fixed environment includes `PI_OFFLINE=1` and
 shared network, while incidental discovery and telemetry are disabled.
 
 Production runtime/policy assets are root-owned, not owner-writable, and read
-by a dedicated service UID. The implementation's preflight hashing and
-revalidation detect ordinary changes, but path-based reopening and acceptance
-of service-UID-owned assets do not eliminate hostile same-UID mutation races;
-administrative ownership is part of the deployment trust boundary.
+by a dedicated service UID. The isolated Pi agent-state directory is a narrow
+exception: it is a mode-0700 dedicated copy writable only by that UID because
+Pi creates credential/settings locks and may persist OAuth refreshes. The
+implementation's preflight hashing and revalidation detect ordinary changes,
+but path-based reopening and writable agent state do not eliminate hostile
+same-UID mutation races; administrative ownership is part of the deployment
+trust boundary.
 
 Every classification code for every profile that selects Pi has exactly one
 classification binding and its directive is `audit`. Wildcard, missing,

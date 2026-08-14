@@ -220,7 +220,11 @@ fn native_outcomes_are_audited_and_only_fatal_failures_latch() {
         );
     }
 
-    assert!(EXTENSION.contains("/^[A-Za-z0-9_.:-]{1,128}$/"));
+    assert!(EXTENSION.contains("import { createHash } from \"node:crypto\""));
+    assert!(EXTENSION.contains("Buffer.byteLength(value, \"utf8\") > MAX_PATH_CHARACTERS"));
+    assert!(EXTENSION.contains("/[\\u0000-\\u001f\\u007f-\\u009f]/.test(value)"));
+    assert!(EXTENSION
+        .contains("`tc_${createHash(\"sha256\").update(value, \"utf8\").digest(\"hex\")}`"));
     assert!(EXTENSION.contains("error instanceof RecoverableNativeToolError"));
     assert!(EXTENSION.contains("Invalid search arguments. Revise them and retry."));
     assert!(EXTENSION.contains("Read offset is beyond end of file. Revise it and retry."));

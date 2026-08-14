@@ -4,6 +4,7 @@
 // coding-agent surface over the immutable analyzer view mounted at /input.
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { isAbsolute, relative, resolve, sep } from "node:path";
@@ -243,10 +244,16 @@ function readLineWindow(content, offset, limit) {
 }
 
 function normalizedToolCallId(value) {
-	if (typeof value !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(value)) {
+	if (
+		typeof value !== "string" ||
+		value.length === 0 ||
+		value.length > MAX_PATH_CHARACTERS ||
+		Buffer.byteLength(value, "utf8") > MAX_PATH_CHARACTERS ||
+		/[\u0000-\u001f\u007f-\u009f]/.test(value)
+	) {
 		throw new Error("invalid tool call identity");
 	}
-	return value;
+	return `tc_${createHash("sha256").update(value, "utf8").digest("hex")}`;
 }
 
 function isContained(root, candidate) {

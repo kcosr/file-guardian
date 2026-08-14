@@ -344,7 +344,10 @@ Every native call is bracketed by authenticated `native_tool_begin` and
 `native_tool_end` records over `file-guardian-pi-proxy/2`. The host validates
 the presentation path against the materialized view, charges the exact file or
 directory operation to configured budgets, and accepts the tool result only
-when its path, call ID, result count, output bytes, and outcome match. End
+when its path, call ID, result count, output bytes, and outcome match. The
+trusted extension hashes provider-specific tool-call IDs into fixed
+protocol-safe correlation IDs before either record is sent; raw provider IDs
+never enter the proxy protocol. End
 outcomes are a closed set: `completed`, `recoverable_error`, and `fatal_error`.
 An invalid model-supplied search pattern or argument closes the audit record as
 `recoverable_error` with the safe `invalid_arguments` code and returns a
@@ -432,12 +435,15 @@ Bubblewrap starts with user, mount, PID, IPC, UTS and cgroup isolation,
 explicitly shares only the host network namespace, disables nested user
 namespaces, drops all capabilities, and builds a temporary root. It mounts only
 the verified bundle at `/runtime`, reviewed extension at
-`/policy/file-guardian-extension.js`, isolated Pi configuration at `/config`,
-and the private socket directory at `/run/file-guardian`; `/work`, `/home`, and
-`/tmp` are temporary. Verified bundle-local resolver, hosts, name-service, and
-CA files are mounted at their conventional `/etc` locations. The host
-instruction is supplied through the authenticated proxy, not as an argument or
-host-file mount.
+`/policy/file-guardian-extension.js`, isolated Pi agent state at `/config`, and
+the private socket directory at `/run/file-guardian`; `/work`, `/home`, and
+`/tmp` are temporary. `/config` is the sole writable persistent mount because
+Pi creates credential/settings lock files and may persist OAuth refreshes. It
+is a dedicated private copy, never the user's ambient Pi home, and no
+model-callable tool can address it. Verified bundle-local resolver, hosts,
+name-service, and CA files are mounted at their conventional `/etc` locations.
+The host instruction is supplied through the authenticated proxy, not as an
+argument or host-file mount.
 
 The sandbox does not mount host `/lib`, `/usr`, or `/etc`. A runtime bundle
 that omits its loader, libraries, trust roots, resolver configuration, or any

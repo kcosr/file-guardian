@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 
@@ -12,6 +13,7 @@ globalThis.__fileGuardianTestHooks = {
   boundedLineOutput,
   consumeManifestPage,
   manifestPageResult,
+  normalizedToolCallId,
   readLineWindow,
   requiredBoundedIntegerEnvironment,
   getNextManifestCursor: () => nextManifestCursor,
@@ -34,6 +36,7 @@ const Type = new Proxy(
 );
 const context = {
 	Buffer,
+	createHash,
 	TextDecoder,
 	Type,
 	clearTimeout,
@@ -43,6 +46,14 @@ const context = {
 };
 vm.runInNewContext(source, context, { filename: extensionUrl.pathname });
 const hooks = context.__fileGuardianTestHooks;
+
+const providerToolCallId = "call_7G2ERUu9RTsYpne1UqqGmeeJ|fc_044c3f1c9703cdb5016a7ea72a094481";
+assert.equal(
+	hooks.normalizedToolCallId(providerToolCallId),
+	`tc_${createHash("sha256").update(providerToolCallId, "utf8").digest("hex")}`,
+);
+assert.match(hooks.normalizedToolCallId(providerToolCallId), /^tc_[0-9a-f]{64}$/);
+assert.throws(() => hooks.normalizedToolCallId("bad\nidentity"), /invalid tool call identity/);
 
 assert.equal(hooks.requiredBoundedIntegerEnvironment("FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS", 10_000), 37);
 for (const invalid of ["0", "01", "+1", " 1", "10001"]) {

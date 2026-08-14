@@ -217,8 +217,11 @@ entrypoint directly, without depending on a host `/usr/bin/env node` shebang.
 The bundle is self-contained: it includes the launcher, dynamic loader and
 shared libraries, Pi package and dependencies, and CA/resolver material needed
 by the approved model transport. Inside Bubblewrap the verified runtime,
-reviewed extension, isolated configuration, and private proxy endpoint are the
-only persistent mounts; the instruction is delivered by the authenticated host
+reviewed extension, isolated Pi agent state, and private proxy endpoint are the
+only persistent mounts. The isolated agent state is the sole writable
+persistent mount because Pi creates credential/settings lock files and may
+persist an OAuth refresh. It must be a dedicated copy containing no ambient
+user configuration. The instruction is delivered by the authenticated host
 proxy and live staging/object storage is never mounted.
 
 The sandbox does not mount the host `/lib`, `/usr`, or `/etc`. A missing or
@@ -237,11 +240,12 @@ disabled. The illustrative
 [runtime manifest](docs/examples/pi-classifier/runtime-manifest.example.json)
 shows the strict file-entry shape but uses placeholder hashes.
 
-For production, make the bundle, extension, instruction, and isolated
-configuration root-owned and not owner-writable, then run File Guardian under a
-dedicated service UID. Preflight hashing and revalidation detect ordinary
-changes, but the current path-based reopen permits service-UID-owned assets and
-does not defend against hostile concurrent mutation by that same UID.
+For production, make the bundle, extension, and instruction root-owned and not
+owner-writable, then run File Guardian under a dedicated service UID. Give only
+that UID access to its mode-0700 isolated Pi agent-state directory. Preflight
+hashing and revalidation detect ordinary changes, but the current path-based
+reopen and intentionally writable agent state do not defend against hostile
+concurrent mutation by that same UID.
 
 The model sees a generated immutable, text-only `/input` view, never live
 staging or the object store. Pi's built-ins are disabled; the reviewed extension
