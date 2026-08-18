@@ -887,12 +887,22 @@ pub fn resolve_phase(
     let preliminary = evaluate_phase_policy(runtime, phase, &BTreeSet::new())?;
     let adjudication = adjudicate_phase(runtime, phase, &preliminary, after_actions)?;
     let mut resolved = evaluate_phase_policy(runtime, phase, &adjudication.cleared_finding_ids)?;
-    if adjudication.stage_attestation
-        == Some(crate::analyzers::pi::triage::PiStageAttestation::BlockingConcernsObserved)
-    {
+    if stage_attestation_blocks(
+        runtime.pi_adjudication.as_ref().map(|policy| policy.mode),
+        adjudication.stage_attestation,
+    ) {
         resolved.decision = ProcessingPolicyDecision::Deny;
     }
     Ok((resolved, adjudication))
+}
+
+fn stage_attestation_blocks(
+    mode: Option<crate::processing::config::PiAdjudicationMode>,
+    attestation: Option<crate::analyzers::pi::triage::PiStageAttestation>,
+) -> bool {
+    mode == Some(crate::processing::config::PiAdjudicationMode::Authoritative)
+        && attestation
+            == Some(crate::analyzers::pi::triage::PiStageAttestation::BlockingConcernsObserved)
 }
 
 pub fn stage_subjects(phase: &CapturedPhase) -> Result<Vec<StageSubject>, ProcessingEngineError> {
@@ -1647,5 +1657,31 @@ fn map_git_error(
         ProcessingEngineError::Cancelled
     } else {
         ProcessingEngineError::Acquisition
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stage_attestation_blocks;
+    use crate::analyzers::pi::triage::PiStageAttestation;
+    use crate::processing::config::PiAdjudicationMode;
+
+    #[test]
+    fn only_authoritative_pi_stage_attestation_can_block_policy() {
+        let blocking = Some(PiStageAttestation::BlockingConcernsObserved);
+
+        assert!(!stage_attestation_blocks(None, blocking));
+        assert!(!stage_attestation_blocks(
+            Some(PiAdjudicationMode::Advisory),
+            blocking,
+        ));
+        assert!(stage_attestation_blocks(
+            Some(PiAdjudicationMode::Authoritative),
+            blocking,
+        ));
+        assert!(!stage_attestation_blocks(
+            Some(PiAdjudicationMode::Authoritative),
+            Some(PiStageAttestation::NoBlockingConcernsObserved),
+        ));
     }
 }
