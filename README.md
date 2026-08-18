@@ -60,8 +60,9 @@ Install version-pinned Gitleaks and TruffleHog binaries through the host's
 package or image-management process. Put them on the service's startup `PATH`.
 Do not allow a repository to supply either executable or scanner policy.
 
-Start with the checked-in
-[schema-3 example](docs/examples/processing-v3.toml) and
+Start with the built-in-only checked-in
+[schema-3 default](config/config.toml), or use the complete
+[scanner/Pi example](docs/examples/processing-v3.toml) with the
 [scanner policy templates](docs/examples/scanners/README.md). Replace every
 illustrative absolute path and version requirement with reviewed deployment
 values. Configuration precedence is `--config`, then

@@ -389,6 +389,11 @@ async fn remote_acquisition_freezes_all_refs_publishes_head_and_scrubs_repositor
         git_s(&stage, &["ls-files", "--error-unmatch", "tracked.txt"]),
         b"tracked.txt\n"
     );
+    assert!(git_s(
+        &stage,
+        &["for-each-ref", "--format=%(refname)", "refs/file-guardian/"]
+    )
+    .is_empty());
     assert_eq!(
         fs::read(stage.join("tracked.txt")).unwrap(),
         b"head bytes\n"
@@ -450,6 +455,43 @@ async fn remote_acquisition_honors_head_and_reachable_ref_scopes() {
     assert_eq!(reachable.repository.commits.len(), 3);
     assert_eq!(reachable.repository.frozen_refs.len(), 2);
     assert!(reachable_stage.join(".git").is_dir());
+}
+
+#[tokio::test]
+async fn remote_tag_checkout_uses_a_clean_detached_head() {
+    let fixture = repository_fixture();
+    git_s(fixture.path(), &["tag", "release"]);
+    let runner_dir = TempDir::new().unwrap();
+    let locator_text = "https://git@example.invalid/private/tagged.git";
+    let runner = remote_fixture_runner(runner_dir.path(), fixture.path(), locator_text, false);
+    let locator = RemoteLocator::parse(locator_text).unwrap();
+    let (_job, stage) = remote_job_paths();
+    let cancellation = AcquisitionCancellation::default();
+    let mut request = enumeration(GitHistoryScope::Head, vec![]);
+    request.checkout_ref = Some("refs/tags/release".to_owned());
+    request.allowed_checkout_ref_patterns = vec!["refs/tags/*".to_owned()];
+
+    acquire_remote_repository_source(
+        &runner,
+        &locator,
+        &request,
+        &stage,
+        &capture_limits(),
+        SymlinkPolicy::Reject,
+        &cancellation,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        git_s(&stage, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        b"HEAD\n"
+    );
+    assert!(git_s(&stage, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git_s(&stage, &["rev-parse", "HEAD"]),
+        git_s(fixture.path(), &["rev-parse", "refs/tags/release^{commit}"])
+    );
 }
 
 #[tokio::test]

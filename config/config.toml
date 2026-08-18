@@ -1,26 +1,73 @@
-# File Guardian schema 2 is a deliberate break from the legacy implicit scan
-# configuration. This example is evaluate-only and works without network
-# access or an external analyzer.
-schema_version = "2"
+# Strict schema-3 default. This profile uses only the built-in rule analyzer,
+# so it remains useful before optional Gitleaks, TruffleHog, and Pi runtimes are
+# installed. Replace the illustrative absolute paths for a real deployment.
+schema_version = "3"
 
-[authorization]
+[processing]
 default_profile = "publication"
 
-[authorization.workspace]
-root = "/var/lib/file-guardian/runs"
+[processing.jobs]
+root = "/var/lib/file-guardian/jobs"
+reports_root = "/var/lib/file-guardian/reports"
+quarantine_root = "/var/lib/file-guardian/quarantine"
+artifact_quarantine_root = "/var/lib/file-guardian/artifact-quarantine"
+stale_after_secs = 900
+max_report_bytes = 67108864
 
-[authorization.workspace.capture]
+[processing.jobs.capture]
 max_entries = 200000
 max_files = 100000
 max_file_bytes = 1073741824
 max_total_bytes = 10737418240
 max_depth = 64
 
-[[authorization.profiles]]
+[processing.jobs.retention]
+available_ttl_secs = 86400
+available_max_bytes = 107374182400
+quarantine_ttl_secs = 2592000
+quarantine_max_bytes = 536870912000
+artifact_quarantine_ttl_secs = 2592000
+artifact_quarantine_max_bytes = 53687091200
+
+[processing.acquisition]
+git_executable = "/usr/bin/git"
+git_timeout_secs = 600
+max_stdout_bytes = 1048576
+max_stderr_bytes = 1048576
+max_refs = 10000
+max_commits = 1000000
+max_unique_blobs = 1000000
+max_provenance_occurrences = 5000000
+max_git_bytes = 10737418240
+
+[processing.external_scanners]
+bubblewrap_executable = "/usr/bin/bwrap"
+expected_bubblewrap_version = "0.11.1"
+
+[[processing.profiles]]
 id = "publication"
 pipeline = "publication"
 action_mode = "evaluate"
-default_unbound_observation = "error"
+purpose = "handoff"
+default_unbound_observation = "deny"
+bindings = []
+
+[processing.profiles.source_scope]
+working_tree = true
+history = "none"
+history_ref_patterns = []
+
+[processing.profiles.git]
+allowed_checkout_ref_patterns = ["refs/heads/*", "refs/tags/*"]
+submodules = "reject"
+lfs = "reject_pointer"
+
+[processing.profiles.completion]
+allow = "retain"
+allow_modified = "retain"
+deny = "discard"
+error = "quarantine"
+cancelled = "quarantine"
 
 [[pipelines]]
 id = "publication"
@@ -32,43 +79,39 @@ max_concurrency = 1
 analyzers = ["publication-rules"]
 prior_observations = "none"
 
+[pipelines.stages.prior_limits]
+max_observations = 10000
+max_serialized_bytes = 1048576
+
 [[analyzers]]
 id = "publication-rules"
 kind = "builtin_rules"
-required = true
 rule_files = ["/etc/file-guardian/rules.d/publication.toml"]
 max_content_bytes = 16777216
 
-[analyzers.content_applicability]
-required_text_include = []
+[analyzers.execution]
+initial = "required"
+verification = "required"
 
 [analyzers.selection]
 include = ["**"]
 exclude = []
-artifact_kinds = ["physical_file"]
+artifact_kinds = ["physical_file", "symbolic_link"]
 
-[[policy_bindings]]
-id = "publication-rules-deny"
-profile = "publication"
-analyzer = "publication-rules"
-rule = "*"
-directive = "deny"
+[analyzers.content_applicability]
+required_text_include = []
+
+[analyzers.limits]
+max_findings = 10000
 
 [[daemon.jobs]]
 id = "uploads"
 enabled = false
-kind = "policy_scan"
 profile = "publication"
-every_secs = 300
-run_on_start = true
+schedule = "0 */5 * * * *"
+run_on_start = false
+overlap = "reject"
 
-[daemon.jobs.target]
-kind = "literal"
+[daemon.jobs.source]
+kind = "path"
 path = "/srv/uploads"
-
-[logging]
-level = "info"
-directory = "/var/log/file-guardian"
-max_bytes = 104857600
-max_files = 5
-console = false

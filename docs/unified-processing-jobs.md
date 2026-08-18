@@ -496,9 +496,10 @@ The clone target is the job's `stage/`. File Guardian initializes `.git`,
 fetches the frozen selected refs, materializes the selected HEAD with Git
 plumbing so hooks, filters, submodules, and LFS cannot execute implicitly, and
 populates the index from that same frozen HEAD so the staged clone has a clean,
-usable worktree. It retains `.git` for Pi, history review, and final handoff. Before analysis it
-removes credential-bearing remote URLs, `FETCH_HEAD`, native diagnostics, and
-other acquisition-only authentication data from that staged repository.
+usable worktree. It retains `.git` for Pi, history review, and final handoff.
+Before analysis it removes private acquisition refs, credential-bearing remote
+URLs, `FETCH_HEAD`, native diagnostics, and other acquisition-only
+authentication data from that staged repository.
 
 ### Git surfaces
 
@@ -535,13 +536,15 @@ ref that is missing, ambiguous, non-commit, or changes between freeze and
 materialization is an acquisition error.
 
 For a remote, File Guardian first freezes `ls-remote --symref` output, then
-fetches exact generated refspecs into private `refs/file-guardian/heads/*` and
-`refs/file-guardian/tags/*` namespaces, and verifies the resulting OIDs against
-the advertised map. For a local repository it freezes the corresponding local
-branch, remote-tracking branch, and tag namespaces through bounded plumbing.
-The configured/CLI checkout ref must match
-`allowed_checkout_ref_patterns`; it chooses resolved HEAD and is always added
-to the history root set. It does not implicitly add unrelated refs.
+fetches exact generated refspecs into temporary `refs/file-guardian/frozen/*`
+names, verifies the resulting OIDs against the advertised map, installs the
+selected advertised refs, and removes the temporary refs. For a local
+repository it freezes the corresponding local branch, remote-tracking branch,
+and tag namespaces through bounded plumbing. The configured/CLI checkout ref
+must match `allowed_checkout_ref_patterns`; it chooses resolved HEAD and is
+always added to the history root set. Branch selection produces a symbolic
+HEAD, while tag selection produces a detached HEAD at the peeled commit. It
+does not implicitly add unrelated refs.
 
 `reachable` and `all_refs` include the exact HEAD object graph in addition to
 the mandatory staged working tree. A `purpose = "report_only"` profile still

@@ -1779,6 +1779,15 @@ max_view_depth = 64
     }
 
     #[test]
+    fn checked_in_default_is_valid_schema_three() {
+        let config = ProcessingConfigFile::parse(include_str!("../../config/config.toml")).unwrap();
+        assert_eq!(config.schema_version, PROCESSING_CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.processing.default_profile, "publication");
+        assert_eq!(config.processing.profiles.len(), 1);
+        assert_eq!(config.analyzers.len(), 1);
+    }
+
+    #[test]
     fn rejects_schema_two_and_unknown_fields() {
         let schema_two = EXAMPLE.replacen("schema_version = \"3\"", "schema_version = \"2\"", 1);
         assert!(matches!(

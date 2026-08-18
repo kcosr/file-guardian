@@ -1151,7 +1151,33 @@ async fn install_frozen_remote_refs(
         run_repo(runner, repository, &["update-ref", &original, &object]).await?;
     }
     let checkout = logical_ref_name(checkout_ref)?;
-    run_repo(runner, repository, &["symbolic-ref", "HEAD", &checkout]).await?;
+    let selected = fetched
+        .iter()
+        .find(|reference| {
+            logical_ref_name(&reference.advertised.name).is_ok_and(|name| name == checkout)
+        })
+        .ok_or(GitAcquisitionError::CheckoutRefResolution)?;
+    if checkout.starts_with("refs/heads/") {
+        run_repo(runner, repository, &["symbolic-ref", "HEAD", &checkout]).await?;
+    } else if checkout.starts_with("refs/tags/") {
+        let commit = oid_argument(&selected.advertised.peeled_commit_id);
+        run_repo(
+            runner,
+            repository,
+            &["update-ref", "--no-deref", "HEAD", &commit],
+        )
+        .await?;
+    } else {
+        return Err(GitAcquisitionError::CheckoutRefResolution);
+    }
+    for reference in fetched {
+        run_repo(
+            runner,
+            repository,
+            &["update-ref", "-d", &reference.private_ref],
+        )
+        .await?;
+    }
     Ok(())
 }
 

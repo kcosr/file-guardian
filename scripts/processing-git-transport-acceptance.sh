@@ -260,6 +260,9 @@ run_retain() {
     die "$label handoff does not retain the complete two-commit clone"
   [[ -z $(git -C "$destination" status --porcelain) ]] || \
     die "$label handoff has an index or working-tree mismatch"
+  [[ -z $(git -C "$destination" for-each-ref \
+    --format='%(refname)' refs/file-guardian/) ]] || \
+    die "$label handoff retains private acquisition refs"
   if grep -Fq -- "$remote" "$report" "$stderr" "$receipt" || \
      grep -Fq -- "$SYNTHETIC_SECRET" "$report" "$stderr" "$receipt" || \
      grep -Fq -- "$HTTP_PASSWORD" "$report" "$stderr" "$receipt"; then

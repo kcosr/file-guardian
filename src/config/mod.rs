@@ -2039,8 +2039,11 @@ path = "/srv/uploads"
     }
 
     #[test]
-    fn checked_in_example_is_valid_strict_v2() {
-        let config = parse(include_str!("../../config/config.toml")).unwrap();
+    fn legacy_fixture_is_valid_strict_v2() {
+        let config = parse(include_str!(
+            "../../tests/fixtures/legacy-authorization-v2.toml"
+        ))
+        .unwrap();
         config.validate().unwrap();
     }
 
