@@ -581,6 +581,7 @@ async fn local_directory_copy_preserves_the_exact_repository_and_detects_git_aft
     write(fixture.path(), ".gitignore", b"ignored.txt\n");
     commit(fixture.path(), "ignore policy");
     write(fixture.path(), "tracked.txt", b"dirty working tree bytes\n");
+    fs::remove_file(fixture.path().join("bin/run")).unwrap();
     write(fixture.path(), "untracked.txt", b"untracked bytes\n");
     write(
         fixture.path(),
@@ -622,6 +623,17 @@ async fn local_directory_copy_preserves_the_exact_repository_and_detects_git_aft
     assert_eq!(
         fs::read(stage.join("ignored.txt")).unwrap(),
         b"ignored but published bytes\n"
+    );
+    assert!(!stage.join("bin/run").exists());
+    assert_eq!(
+        git_s(
+            &stage,
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        ),
+        git_s(
+            fixture.path(),
+            &["status", "--porcelain=v1", "--untracked-files=all"]
+        )
     );
     assert!(stage.join(".git").is_dir());
     assert!(repository

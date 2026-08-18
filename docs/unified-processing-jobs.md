@@ -1,8 +1,8 @@
 # Unified Processing Jobs
 
-Status: proposed implementation contract
+Status: implemented contract
 
-Base implementation: `feat/pi-tool-execution-sidecar` at `f3872c3`
+Implementation: `feat/unified-processing-jobs` (PR #5)
 
 Configuration schema: `3`
 
@@ -1634,7 +1634,8 @@ selecting Linux-only Pi/sandbox behavior fails closed with a typed issue.
 - Validation matrix covers every history mode with empty/nonempty exact/glob
   patterns, zero/multiple matches, checkout ref allowed/forbidden, annotated
   tags, symbolic HEAD, advertised-ref movement, and remote-to-private namespace
-  mapping.
+  verification. Temporary acquisition refs are absent from the final stage;
+  branch checkout is symbolic and tag checkout is detached.
 - Every profile without working-tree coverage is rejected at compile time;
   report-only purpose cannot produce a handoff reference.
 
