@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Replaced the `authorize` command and schema-2 authorization configuration
+  with strict schema-3 `process path|git` jobs and processing report schema 2.
+  ([#5](https://github.com/kcosr/file-guardian/pull/5))
+
+### Added
+
+- Added durable owned stages, exact local-directory copy and authenticated
+  HTTPS/SSH cloning, Git history scopes, PATH-discovered Gitleaks and
+  TruffleHog pipelines, trusted Pi evidence triage and false-positive
+  adjudication, stage-only remediation with full verification, lifecycle
+  disposition/handoff/recovery, artifact quarantine, and daemon processing.
+  ([#5](https://github.com/kcosr/file-guardian/pull/5))
+
+### Changed
+
+- Pi now receives actual matched evidence and the complete staged repository or
+  directory read-only; its Bubblewrap boundary prevents mistaken mutation and
+  contains descendants rather than treating Pi as an adversary.
+  ([#5](https://github.com/kcosr/file-guardian/pull/5))
+
 ### Fixed
 
 - Fixed release script cleanup handling after successful GitHub release creation.
