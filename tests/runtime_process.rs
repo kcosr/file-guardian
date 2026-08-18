@@ -88,6 +88,40 @@ impl Fixture {
     }
 
     fn failing_verification() -> Self {
+        Self::verification_fixture(
+            br#"#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '%s\n' 'gitleaks version 8.25.1'
+  exit 0
+fi
+if [ -e /input/delete.txt ]; then
+  file=delete.txt
+else
+  file=keep.txt
+fi
+printf '[{"RuleID":"generic-password","StartLine":1,"EndLine":1,"StartColumn":1,"EndColumn":8,"File":"%s","SymlinkFile":"","Commit":"","Tags":["password"],"Secret":"REDACTED"}]' "$file" > /output/findings.json
+exit 42
+"#,
+        )
+    }
+
+    fn crashing_verification() -> Self {
+        Self::verification_fixture(
+            br#"#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '%s\n' 'gitleaks version 8.25.1'
+  exit 0
+fi
+if [ ! -e /input/delete.txt ]; then
+  exit 9
+fi
+printf '[{"RuleID":"generic-password","StartLine":1,"EndLine":1,"StartColumn":1,"EndColumn":8,"File":"delete.txt","SymlinkFile":"","Commit":"","Tags":["password"],"Secret":"REDACTED"}]' > /output/findings.json
+exit 42
+"#,
+        )
+    }
+
+    fn verification_fixture(scanner_contents: &[u8]) -> Self {
         let temporary = private_tempdir();
         let jobs = private_dir(temporary.path(), "jobs");
         let reports = private_dir(temporary.path(), "reports");
@@ -104,23 +138,7 @@ impl Fixture {
 
         let scanner_bin = private_dir(temporary.path(), "scanner-bin");
         let scanner = scanner_bin.join("gitleaks");
-        fs::write(
-            &scanner,
-            br#"#!/bin/sh
-if [ "$1" = "version" ]; then
-  printf '%s\n' 'gitleaks version 8.25.1'
-  exit 0
-fi
-if [ -e /input/delete.txt ]; then
-  file=delete.txt
-else
-  file=keep.txt
-fi
-printf '[{"RuleID":"generic-password","StartLine":1,"EndLine":1,"StartColumn":1,"EndColumn":8,"File":"%s","SymlinkFile":"","Commit":"","Tags":["password"],"Secret":"REDACTED"}]' "$file" > /output/findings.json
-exit 42
-"#,
-        )
-        .unwrap();
+        fs::write(&scanner, scanner_contents).unwrap();
         fs::set_permissions(&scanner, fs::Permissions::from_mode(0o700)).unwrap();
         let scanner_config = temporary.path().join("gitleaks.toml");
         let scanner_ignore = temporary.path().join("gitleaks.ignore");
@@ -797,6 +815,62 @@ fn failed_second_pipeline_run_quarantines_the_modified_stage_without_handoff_or_
         .issues
         .iter()
         .any(|issue| issue.code.as_str() == "verification_failed"));
+    let stage = report.stage.as_ref().unwrap();
+    assert_eq!(stage.configured_disposition, ConfiguredDisposition::Discard);
+    assert_eq!(
+        stage.effective_disposition,
+        EffectiveDisposition::Quarantined
+    );
+    assert_eq!(stage.handoff_status, HandoffStatus::Unavailable);
+    assert!(stage.reference.is_none());
+
+    assert_eq!(
+        fs::read(fixture.input.join("delete.txt")).unwrap(),
+        original_delete
+    );
+    assert_eq!(
+        fs::read(fixture.input.join("keep.txt")).unwrap(),
+        original_keep
+    );
+    let quarantined_stage = fixture
+        .quarantine
+        .join(report.run_id.as_str())
+        .join("stage");
+    assert!(!quarantined_stage.join("delete.txt").exists());
+    assert_eq!(
+        fs::read(quarantined_stage.join("keep.txt")).unwrap(),
+        original_keep
+    );
+}
+
+#[test]
+fn technical_failure_during_second_pipeline_quarantines_without_handoff_or_rollback() {
+    let fixture = Fixture::crashing_verification();
+    let original_delete = fs::read(fixture.input.join("delete.txt")).unwrap();
+    let original_keep = fs::read(fixture.input.join("keep.txt")).unwrap();
+
+    let output = fixture.process_path(Some("verification-crash"));
+
+    assert_eq!(
+        output.status.code(),
+        Some(30),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_private(&output, &fixture, &original_delete);
+    let report = report(&output);
+    assert_eq!(report.outcome, ProcessingOutcome::Error);
+    assert_eq!(report.exit_code, 30);
+    assert!(report.modified, "{report:#?}");
+    assert!(report.phases.initial.is_none());
+    assert!(report.phases.verification.is_none());
+    assert_eq!(report.actions.len(), 1);
+    assert_eq!(report.actions[0].kind, ActionKind::Delete);
+    assert_eq!(report.actions[0].state, ActionState::Committed);
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.code.as_str() == "required_analysis_failed"));
     let stage = report.stage.as_ref().unwrap();
     assert_eq!(stage.configured_disposition, ConfiguredDisposition::Discard);
     assert_eq!(
