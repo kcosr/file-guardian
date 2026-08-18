@@ -8,15 +8,19 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use file_guardian::processing::config::ProcessingConfigFile;
+use file_guardian::processing::job::{JobStore, JobStorePaths};
 use file_guardian::processing::report::{
     ActionKind, ActionState, ConfiguredDisposition, EffectiveDisposition, HandoffStatus,
-    ProcessingOutcome, ProcessingReport, SourceSummary,
+    PersistenceStatus, ProcessingOutcome, ProcessingReport, SourceSummary,
 };
+use file_guardian::processing::retention::RetentionController;
+use file_guardian::processing::runtime::FrozenRetentionLimits;
 
 struct Fixture {
     _temporary: tempfile::TempDir,
     config: PathBuf,
     input: PathBuf,
+    jobs: PathBuf,
     reports: PathBuf,
     quarantine: PathBuf,
     artifact_quarantine: PathBuf,
@@ -75,6 +79,7 @@ impl Fixture {
             _temporary: temporary,
             config,
             input,
+            jobs,
             reports,
             quarantine,
             artifact_quarantine,
@@ -145,6 +150,7 @@ exit 42
             _temporary: temporary,
             config,
             input,
+            jobs,
             reports,
             quarantine,
             artifact_quarantine,
@@ -186,6 +192,32 @@ exit 42
             .args(arguments)
             .output()
             .unwrap()
+    }
+
+    fn retention_controller(&self) -> (JobStore, RetentionController) {
+        let config =
+            ProcessingConfigFile::parse(&fs::read_to_string(&self.config).unwrap()).unwrap();
+        let store = JobStore::open(JobStorePaths {
+            jobs_root: config.processing.jobs.root.clone(),
+            reports_root: config.processing.jobs.reports_root.clone(),
+            quarantine_root: config.processing.jobs.quarantine_root.clone(),
+        })
+        .unwrap();
+        let retention = &config.processing.jobs.retention;
+        let controller = RetentionController::open(
+            &store,
+            &config.processing.jobs.artifact_quarantine_root,
+            FrozenRetentionLimits {
+                available_ttl_secs: retention.available_ttl_secs,
+                available_max_bytes: retention.available_max_bytes,
+                quarantine_ttl_secs: retention.quarantine_ttl_secs,
+                quarantine_max_bytes: retention.quarantine_max_bytes,
+                artifact_quarantine_ttl_secs: retention.artifact_quarantine_ttl_secs,
+                artifact_quarantine_max_bytes: retention.artifact_quarantine_max_bytes,
+            },
+        )
+        .unwrap();
+        (store, controller)
     }
 
     fn initialize_git_repository(&self) {
@@ -492,6 +524,43 @@ fn matching_path_denies_without_exposing_or_mutating_secret() {
 }
 
 #[test]
+fn oversized_decision_report_fails_closed_with_a_bounded_durable_error() {
+    let contents = b"password = \"FG_PRIVATE_OVERSIZED_REPORT_PASSWORD\"\n";
+    let fixture = Fixture::new("settings-00.txt", contents);
+    for index in 1..80 {
+        fs::write(
+            fixture.input.join(format!("settings-{index:02}.txt")),
+            contents,
+        )
+        .unwrap();
+    }
+    let config = fs::read_to_string(&fixture.config)
+        .unwrap()
+        .replace("max_report_bytes = 1048576", "max_report_bytes = 4096");
+    ProcessingConfigFile::parse(&config).unwrap();
+    fs::write(&fixture.config, config).unwrap();
+
+    let output = fixture.process_path(Some("bounded-report"));
+
+    assert_eq!(output.status.code(), Some(30));
+    assert!(output.stdout.len() <= 4096);
+    assert_private(&output, &fixture, contents);
+    let report = report(&output);
+    assert_eq!(report.outcome, ProcessingOutcome::Error);
+    assert!(report.omissions.details_omitted);
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.code.as_str() == "report_construction_failed"));
+    assert!(report.phases.initial.is_none());
+    assert!(report.actions.is_empty());
+    let persisted = fixture
+        .reports
+        .join(format!("{}.json", report.run_id.as_str()));
+    assert_eq!(fs::read(persisted).unwrap(), output.stdout);
+}
+
+#[test]
 fn missing_path_returns_one_durable_error_report() {
     let fixture = Fixture::new("placeholder.txt", b"temporary fixture\n");
     fs::remove_dir_all(&fixture.input).unwrap();
@@ -574,6 +643,125 @@ fn apply_delete_modifies_only_the_owned_stage_and_returns_allow_modified() {
         fs::read(destination.join("keep.txt")).unwrap(),
         b"public fixture\n"
     );
+}
+
+#[test]
+fn retained_capacity_is_reserved_until_the_stage_is_consumed() {
+    let fixture = Fixture::applying("safe.txt", b"ordinary retained fixture\n");
+    let first = fixture.process_path(Some("capacity-first"));
+    assert_eq!(first.status.code(), Some(0));
+    let first_report = report(&first);
+
+    let blocked = fixture.process_path(Some("capacity-blocked"));
+    assert_eq!(blocked.status.code(), Some(30));
+    let blocked_report = report(&blocked);
+    assert_eq!(blocked_report.outcome, ProcessingOutcome::Error);
+    assert_eq!(
+        blocked_report.persistence.status,
+        PersistenceStatus::Unavailable
+    );
+    assert!(blocked_report
+        .issues
+        .iter()
+        .any(|issue| issue.code.as_str() == "retention_capacity_unavailable"));
+
+    let destination = fixture._temporary.path().join("capacity-handoff");
+    let handoff = fixture.handoff_copy(first_report.run_id.as_str(), &destination);
+    assert_eq!(handoff.status.code(), Some(0));
+    let admitted = fixture.process_path(Some("capacity-after-handoff"));
+    assert_eq!(admitted.status.code(), Some(0));
+}
+
+#[test]
+fn explicit_retention_sweep_expires_a_retained_stage_but_preserves_its_report() {
+    let fixture = Fixture::applying("safe.txt", b"expiring retained fixture\n");
+    let output = fixture.process_path(Some("expiry"));
+    assert_eq!(output.status.code(), Some(0));
+    let report = report(&output);
+    let expires_at = report
+        .stage
+        .as_ref()
+        .and_then(|stage| stage.expires_at.as_ref())
+        .unwrap();
+    let future = chrono::DateTime::parse_from_rfc3339(expires_at.as_str())
+        .unwrap()
+        .timestamp_millis()
+        + 1;
+    let (store, controller) = fixture.retention_controller();
+
+    let sweep = controller.sweep_expired(&store, future, 60_000).unwrap();
+
+    assert_eq!(sweep.expired_jobs, 1);
+    assert!(!fixture.jobs.join(report.run_id.as_str()).exists());
+    assert!(fixture
+        .reports
+        .join(format!("{}.json", report.run_id.as_str()))
+        .is_file());
+}
+
+#[test]
+fn whole_job_quarantine_expires_without_removing_its_public_report() {
+    let fixture = Fixture::failing_verification();
+    let output = fixture.process_path(Some("quarantine-expiry"));
+    assert_eq!(output.status.code(), Some(30));
+    let report = report(&output);
+    assert!(fixture.quarantine.join(report.run_id.as_str()).is_dir());
+    let future = chrono::DateTime::parse_from_rfc3339(report.finished_at.as_str())
+        .unwrap()
+        .timestamp_millis()
+        + 61_000;
+    let (store, controller) = fixture.retention_controller();
+
+    let sweep = controller.sweep_expired(&store, future, 60_000).unwrap();
+
+    assert_eq!(sweep.expired_jobs, 1);
+    assert!(!fixture.quarantine.join(report.run_id.as_str()).exists());
+    assert!(fixture
+        .reports
+        .join(format!("{}.json", report.run_id.as_str()))
+        .is_file());
+}
+
+#[test]
+fn artifact_quarantine_capacity_and_ttl_are_independent_of_stage_handoff() {
+    let contents = b"password = \"FG_PRIVATE_ARTIFACT_RETENTION_PASSWORD\"\n";
+    let fixture = Fixture::quarantining("quarantine.txt", contents);
+    let first = fixture.process_path(Some("artifact-retention"));
+    assert_eq!(first.status.code(), Some(10));
+    let first_report = report(&first);
+    let quarantine_id = first_report.actions[0]
+        .artifact_quarantine_id
+        .as_ref()
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let destination = fixture._temporary.path().join("artifact-retention-handoff");
+    assert_eq!(
+        fixture
+            .handoff_copy(first_report.run_id.as_str(), &destination)
+            .status
+            .code(),
+        Some(0)
+    );
+
+    let blocked = fixture.process_path(Some("artifact-capacity-blocked"));
+    assert_eq!(blocked.status.code(), Some(30));
+    assert_eq!(
+        report(&blocked).persistence.status,
+        PersistenceStatus::Unavailable
+    );
+
+    let future = chrono::DateTime::parse_from_rfc3339(first_report.finished_at.as_str())
+        .unwrap()
+        .timestamp_millis()
+        + 61_000;
+    let (store, controller) = fixture.retention_controller();
+    let sweep = controller.sweep_expired(&store, future, 60_000).unwrap();
+    assert_eq!(sweep.expired_artifacts, 1);
+    assert!(!fixture.artifact_quarantine.join(&quarantine_id).exists());
+
+    let admitted = fixture.process_path(Some("artifact-capacity-released"));
+    assert_eq!(admitted.status.code(), Some(10));
 }
 
 #[test]

@@ -492,6 +492,42 @@ pub fn discard_retained_stage(store: &JobStore, run_id: &RunId) -> Result<(), Co
     )
 }
 
+/// Removes the private tombstone for a terminal job after its configured
+/// retention interval. Public reports remain in the independent report root.
+/// Available stages must first be revoked with `discard_retained_stage`.
+pub fn purge_terminal_job(store: &JobStore, run_id: &RunId) -> Result<(), CompletionError> {
+    let lease = match store.try_acquire(run_id) {
+        Ok(lease) => lease,
+        Err(JobStoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            store.try_acquire_quarantined(run_id)?
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let status = inspect_job(store, run_id)?;
+    let terminal = lease
+        .state()
+        .terminal
+        .ok_or(CompletionError::InvalidTerminal)?;
+    if lease.state().execution != JobExecutionState::Terminal
+        || !status.report_published
+        || terminal.outcome != status.outcome
+        || terminal.disposition != status.disposition
+        || terminal.handoff != status.handoff
+        || status.stage_available()
+    {
+        return Err(CompletionError::InvalidTerminal);
+    }
+    let (root_path, operation) = match lease.location() {
+        JobLocation::Active => (&store.paths().jobs_root, "purge terminal job"),
+        JobLocation::Quarantined => (&store.paths().quarantine_root, "purge terminal quarantine"),
+    };
+    let root = fs::open(root_path, DIRECTORY_FLAGS, Mode::empty())
+        .map_err(|error| io_error(operation, error))?;
+    let name = CString::new(run_id.as_str()).map_err(|_| CompletionError::UnsafePath)?;
+    remove_named_tree(&root, name.as_c_str())?;
+    fs::fsync(&root).map_err(|error| io_error(operation, error))
+}
+
 /// Resumes a stale pre-terminal job from its durable decision. The caller
 /// supplies the reconstructed final report; an already published byte-identical
 /// report is accepted, while any mismatch fails closed.

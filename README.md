@@ -221,8 +221,12 @@ Report-only profiles cannot retain a handoff stage.
 
 Retention TTLs and capacity ceilings are admission controls, not opportunistic
 eviction. Unexpired available or quarantined jobs are never deleted to admit a
-new run. `job recover` resumes or fails stale work from durable identities and
-journals; it never manufactures an allowed decision from incomplete state.
+new run. Each job reserves its configured maximum publication payload before
+acquisition; a capacity failure therefore occurs before the source is copied or
+cloned. New admissions and `job recover` remove only expired terminal payloads
+while preserving their immutable reports. Recovery resumes or fails stale work
+from durable identities and journals; it never manufactures an allowed decision
+from incomplete state.
 
 ## Operator documentation and testing
 

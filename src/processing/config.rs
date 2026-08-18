@@ -77,6 +77,49 @@ impl ProcessingConfigFile {
         }
         for profile in &self.processing.profiles {
             profile.validate()?;
+            let reservation_bytes = self.processing.jobs.capture.max_total_bytes;
+            let completion = [
+                profile.completion.allow,
+                profile.completion.allow_modified,
+                profile.completion.deny,
+                profile.completion.error,
+                profile.completion.cancelled,
+            ];
+            if completion.contains(&CompletionDisposition::Retain)
+                && self.processing.jobs.retention.available_max_bytes < reservation_bytes
+            {
+                return invalid(format!(
+                    "profile '{}' can retain a stage but available_max_bytes is smaller than max_total_bytes",
+                    profile.id
+                ));
+            }
+            let can_mutate = profile.action_mode == ActionMode::Apply
+                && profile.bindings.iter().any(|binding| {
+                    matches!(
+                        binding.directive,
+                        ProcessingPolicyDirective::Delete | ProcessingPolicyDirective::Quarantine
+                    )
+                });
+            if (completion.contains(&CompletionDisposition::Quarantine) || can_mutate)
+                && self.processing.jobs.retention.quarantine_max_bytes < reservation_bytes
+            {
+                return invalid(format!(
+                    "profile '{}' can quarantine a job but quarantine_max_bytes is smaller than max_total_bytes",
+                    profile.id
+                ));
+            }
+            if profile.action_mode == ActionMode::Apply
+                && profile
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.directive == ProcessingPolicyDirective::Quarantine)
+                && self.processing.jobs.retention.artifact_quarantine_max_bytes < reservation_bytes
+            {
+                return invalid(format!(
+                    "profile '{}' can quarantine an artifact but artifact_quarantine_max_bytes is smaller than max_total_bytes",
+                    profile.id
+                ));
+            }
             let pipeline = pipelines
                 .get(profile.pipeline.as_str())
                 .map(|index| &self.pipelines[*index])
@@ -240,7 +283,9 @@ impl JobsConfig {
             }
         }
         positive("processing.jobs.stale_after_secs", self.stale_after_secs)?;
-        positive("processing.jobs.max_report_bytes", self.max_report_bytes)?;
+        if self.max_report_bytes < 4_096 {
+            return invalid("processing.jobs.max_report_bytes must be at least 4096");
+        }
         self.capture.validate()?;
         self.retention.validate()
     }
@@ -1817,6 +1862,17 @@ max_view_depth = 64
 
         let zero = EXAMPLE.replacen("max_refs = 10000", "max_refs = 0", 1);
         assert!(ProcessingConfigFile::parse(&zero).is_err());
+
+        let undersized_report =
+            EXAMPLE.replacen("max_report_bytes = 67108864", "max_report_bytes = 4095", 1);
+        assert!(ProcessingConfigFile::parse(&undersized_report).is_err());
+
+        let undersized_retention = EXAMPLE.replacen(
+            "available_max_bytes = 107374182400",
+            "available_max_bytes = 1",
+            1,
+        );
+        assert!(ProcessingConfigFile::parse(&undersized_retention).is_err());
     }
 
     #[test]

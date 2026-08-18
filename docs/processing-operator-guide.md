@@ -192,6 +192,19 @@ Artifact quarantine outlives stage handoff or discard until its own retention
 policy expires. Use `artifact inspect` for safe metadata, `artifact recover` to
 an absent trusted destination, and `artifact discard` for explicit removal.
 
+Capacity is reserved before acquisition using `capture.max_total_bytes` for
+each terminal pool the selected profile can reach. Make each applicable pool
+at least that large; larger ceilings allow multiple outstanding stages. A
+capacity rejection happens before File Guardian copies or clones the source and
+returns an unavailable error report. It never evicts an unexpired result to
+make room.
+
+Every `process` admission and `job recover` invocation performs retention
+maintenance. It discards expired retained stages, whole-job quarantines, and
+artifact quarantines, but leaves the corresponding immutable report in
+`reports_root`. A reservation belonging to interrupted work remains charged
+until that work is recovered or its absent job is proven stale.
+
 ## Parse reports fail closed
 
 For every process invocation:

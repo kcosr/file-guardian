@@ -295,6 +295,7 @@ fn phase(phase: InspectionPhase, directive: Option<PolicyDirective>) -> PhaseFix
                 state: AnalyzerRunState::Complete,
                 assigned: 1,
                 scanner_version: None,
+                timing: None,
             }],
             issues: Vec::new(),
             required_complete: true,

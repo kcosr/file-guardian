@@ -102,6 +102,10 @@ impl Rfc3339Timestamp {
     fn parsed(&self) -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339(&self.0).expect("timestamp constructor validated value")
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl<'de> Deserialize<'de> for Rfc3339Timestamp {

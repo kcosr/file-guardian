@@ -19,6 +19,7 @@ pub mod pi_report;
 pub mod policy;
 pub mod report;
 pub mod report_builder;
+pub mod retention;
 pub mod runtime;
 
 pub use domain::*;

@@ -32,6 +32,7 @@ use file_guardian::processing::report::{
     IssueSummary, OmissionSummary, PersistenceStatus, PhasesSummary, ProcessingOutcome,
     ProcessingReport, ProcessingReportData, ProcessingStatistics, Rfc3339Timestamp, SafeId,
 };
+use file_guardian::processing::retention::RetentionController;
 use file_guardian::processing::runtime::{
     compile_processing_runtime, ProcessingCompileRequest, ProcessingSourceRequest,
     RequestedActionMode,
@@ -345,7 +346,15 @@ async fn execute_processing(
     engine
         .process(ProcessingEngineRequest { request_id })
         .await
-        .map_err(|_| "processing_execution_failure")
+        .map_err(|error| match error {
+            file_guardian::processing::engine::ProcessingEngineError::RetentionCapacity => {
+                "retention_capacity_unavailable"
+            }
+            file_guardian::processing::engine::ProcessingEngineError::RetentionMaintenance => {
+                "retention_maintenance_failure"
+            }
+            _ => "processing_execution_failure",
+        })
 }
 
 async fn run_daemon(
@@ -751,6 +760,35 @@ fn run_job_recover(config: &ProcessingConfigFile, report_run_id: SafeId) -> Exit
                 }
             }
         }
+    }
+    let retention = file_guardian::processing::runtime::FrozenRetentionLimits {
+        available_ttl_secs: config.processing.jobs.retention.available_ttl_secs,
+        available_max_bytes: config.processing.jobs.retention.available_max_bytes,
+        quarantine_ttl_secs: config.processing.jobs.retention.quarantine_ttl_secs,
+        quarantine_max_bytes: config.processing.jobs.retention.quarantine_max_bytes,
+        artifact_quarantine_ttl_secs: config
+            .processing
+            .jobs
+            .retention
+            .artifact_quarantine_ttl_secs,
+        artifact_quarantine_max_bytes: config
+            .processing
+            .jobs
+            .retention
+            .artifact_quarantine_max_bytes,
+    };
+    let maintenance = RetentionController::open(
+        &store,
+        &config.processing.jobs.artifact_quarantine_root,
+        retention,
+    )
+    .and_then(|controller| controller.sweep_expired(&store, now, stale_after_millis));
+    if maintenance.is_err() {
+        return emit_auxiliary_error_name(
+            "job_recover",
+            report_run_id,
+            "retention_maintenance_failure",
+        );
     }
     let batch = JobRecoveryBatch {
         recovered,

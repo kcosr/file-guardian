@@ -287,6 +287,11 @@ async fn advisory_failure_and_disabled_analyzer_do_not_stop_required_work() {
             AnalyzerRunState::Complete,
         ]
     );
+    assert!(result.analyzer_runs[0].timing.is_some());
+    assert!(result.analyzer_runs[1].timing.is_none());
+    assert!(result.analyzer_runs[2..].iter().all(|run| run
+        .timing
+        .is_some_and(|timing| { timing.finished_unix_millis >= timing.started_unix_millis })));
     assert!(!fake
         .calls
         .lock()

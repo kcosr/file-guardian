@@ -1162,15 +1162,22 @@ filesystem so quarantine is one journaled atomic rename. Artifact quarantine
 has its own root/capacity/TTL.
 
 Reports persist independently. Retention has explicit TTL and aggregate byte
-ceilings. Capacity is reserved before acquisition/actions based on configured
-worst-case/job quotas and adjusted monotonically as actual use becomes known.
-No unexpired available or quarantined job is evicted to admit another. Failed
-admission produces an error before source acquisition; failed terminal
-quarantine reservation leaves a private `retained_error` job in the jobs root.
-Cleanup is descriptor-rooted or proves that the target is one validated run ID
-directly beneath the configured root. A disposition failure is visible and
-prevents an allowed result; File Guardian applies the fixed safe fallback once
-and never loops.
+admission ceilings. Before a job directory or source is created, File Guardian
+durably reserves `capture.max_total_bytes` in every retention pool the frozen
+profile can reach, including the mandatory whole-job quarantine path after a
+failed post-action verification. Configuration rejects a reachable pool whose
+ceiling is smaller than that reservation. After a terminal report is durable,
+the reservation is released and later admissions count the actual retained
+payload already present in each root. Reservations survive a crash and are
+released only after terminal recovery or after proving that an orphan is stale.
+
+Every new processing admission and explicit `job recover` pass performs TTL
+maintenance. Expired available stages, whole-job quarantines, and artifact
+quarantines are removed descriptor-safely while their immutable public reports
+remain. No unexpired available or quarantined job is evicted to admit another.
+Failed admission produces an error before source acquisition. A disposition
+failure is visible, leaves a private `retained_error` job, prevents an allowed
+result, and never enters a fallback loop.
 
 ## Processing report schema 2
 
@@ -1304,6 +1311,11 @@ The report records:
 - planned/applied action codes and opaque quarantine IDs;
 - terminal disposition and handoff eligibility.
 
+Acquisition, phase, analyzer, Pi-invocation, and whole-job durations are
+measured from the actual execution. The monotonic clock supplies elapsed
+durations; canonical wall-clock timestamps supply report bounds. A completed
+report never substitutes constant placeholder timings.
+
 Only an available retained stage may expose a trusted-caller handoff reference.
 The normal report does not expose internal object, analyzer-view, scanner-output,
 Pi scratch, proxy, socket, token, acquisition repository, or quarantine paths.
@@ -1317,12 +1329,13 @@ Reports never contain matched values, snippets, scanner stdout/stderr, Git
 diagnostics, remote URL, URL userinfo/query, source absolute path, environment,
 credential, model prompt/transcript/prose, chain of thought, or raw tool output.
 Report construction and serialization are recursively checked with privacy
-canaries. `processing.jobs.max_report_bytes`, per-array count ceilings, maximum
-path/ref bytes, and maximum normalized finding/action counts are validated
-against the acquisition/analyzer maxima before admission. Successful and deny
-reports never truncate required evidence. If actual safe evidence cannot fit,
-the job becomes error and emits a bounded error report with aggregate counts
-and `omissions.details_omitted = true`; an omission can never coexist with an
+canaries. Acquisition, analyzer, path/ref, finding, and action limits bound the
+inputs from which the report is built. File Guardian then enforces
+`processing.jobs.max_report_bytes` against the actual canonical serialized
+report before publishing a decision. Successful and deny reports never
+truncate required evidence. If actual safe evidence cannot fit, the job becomes
+error and emits a bounded error report with aggregate counts and
+`omissions.details_omitted = true`; an omission can never coexist with an
 allowed or deny outcome. Report publication follows the private-decision/
 disposition/final-publication protocol above. A report-write failure prevents
 `allow` and `allow_modified`.

@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::analyzers::external::ScannerCancellation;
 use crate::analyzers::pi::triage::PriorFinding;
@@ -70,6 +70,7 @@ use crate::processing::report_builder::{
     build_processing_report, AcquisitionReportInput, CompletionReportInput, PhaseReportInput,
     ProcessingReportBuildInput, ReportActionInput, ReportActionState, SafeComponentEvent,
 };
+use crate::processing::retention::{RetentionController, RetentionError};
 use crate::processing::runtime::{CompiledProcessingRuntime, FrozenSourceRequest};
 use crate::processing::FindingId;
 
@@ -101,6 +102,10 @@ pub enum ProcessingEngineError {
     Report,
     #[error("processing completion failed")]
     Completion,
+    #[error("processing retention capacity is unavailable")]
+    RetentionCapacity,
+    #[error("processing retention maintenance failed")]
+    RetentionMaintenance,
 }
 
 /// Owned, path-free acquisition result consumed by catalog capture. The
@@ -139,6 +144,7 @@ pub fn recapture_processing_source(
 pub struct CapturedPhase {
     pub catalog: CapturedProcessingCatalog,
     pub result: ProcessingPhaseResult,
+    pub duration_ms: u64,
 }
 
 pub struct ProcessingEngineRequest {
@@ -177,20 +183,55 @@ impl ProcessingEngine {
         &self,
         request: ProcessingEngineRequest,
     ) -> Result<ProcessingReport, ProcessingEngineError> {
+        let retention = RetentionController::open(
+            &self.store,
+            &self.runtime.jobs.artifact_quarantine_root,
+            self.runtime.jobs.retention,
+        )
+        .map_err(|_| ProcessingEngineError::RetentionMaintenance)?;
+        let now = system_time_unix_millis().map_err(|_| ProcessingEngineError::Job)?;
+        let stale_after_millis = self
+            .runtime
+            .jobs
+            .stale_after_secs
+            .checked_mul(1_000)
+            .ok_or(ProcessingEngineError::RetentionMaintenance)?;
+        retention
+            .sweep_expired(&self.store, now, stale_after_millis)
+            .map_err(|_| ProcessingEngineError::RetentionMaintenance)?;
+        let reservation = retention
+            .reserve(&self.store, &self.runtime, now)
+            .map_err(|error| match error {
+                RetentionError::CapacityUnavailable => ProcessingEngineError::RetentionCapacity,
+                _ => ProcessingEngineError::RetentionMaintenance,
+            })?;
+        let failure_started_at = timestamp_now()?;
+        let failure_timer = Instant::now();
         let request_id = request.request_id.clone();
-        match self.process_transaction(request).await {
+        let result = match self.process_transaction(request).await {
             Ok(report) => Ok(report),
             Err(error) => match self.store.try_acquire(&self.runtime.run_id) {
-                Ok(lease) => self.finalize_error(lease, request_id.as_deref(), &error),
+                Ok(lease) => self.finalize_error(
+                    lease,
+                    request_id.as_deref(),
+                    &error,
+                    failure_started_at,
+                    duration_millis(failure_timer.elapsed()),
+                ),
                 Err(_) => Err(error),
             },
+        };
+        if result.is_ok() {
+            let _ = reservation.release();
         }
+        result
     }
 
     async fn process_transaction(
         &self,
         request: ProcessingEngineRequest,
     ) -> Result<ProcessingReport, ProcessingEngineError> {
+        let processing_started = Instant::now();
         let started_at = timestamp_now()?;
         let started_millis = system_time_unix_millis().map_err(|_| ProcessingEngineError::Job)?;
         let mut lease = self
@@ -203,8 +244,10 @@ impl ProcessingEngine {
             .map_err(|_| ProcessingEngineError::Job)?;
         transition(&mut lease, JobExecutionState::Acquiring)?;
         let acquisition_started = timestamp_now()?;
+        let acquisition_timer = Instant::now();
         let acquired =
             acquire_processing_source(&self.runtime, lease.paths(), &self.cancellation).await?;
+        let acquisition_duration_ms = duration_millis(acquisition_timer.elapsed());
         let acquisition_finished = timestamp_now()?;
         transition(&mut lease, JobExecutionState::Acquired)?;
         transition(&mut lease, JobExecutionState::BaselineCaptured)?;
@@ -372,7 +415,12 @@ impl ProcessingEngine {
                 )
             })
             .transpose()?;
-        let acquisition = acquisition_report(&acquired, acquisition_started, acquisition_finished)?;
+        let acquisition = acquisition_report(
+            &acquired,
+            acquisition_started,
+            acquisition_finished,
+            acquisition_duration_ms,
+        )?;
         let finished_at = timestamp_now()?;
         let action_inputs = actions
             .iter()
@@ -384,7 +432,7 @@ impl ProcessingEngine {
         let initial_durations = analyzer_durations(&initial);
         let verification_durations = verification.as_ref().map(analyzer_durations);
         let pi_invocations =
-            pi_invocation_summaries(&self.runtime, &initial, verification.as_ref(), &finished_at)?;
+            pi_invocation_summaries(&self.runtime, &initial, verification.as_ref())?;
         let report = build_processing_report(ProcessingReportBuildInput {
             run_id: &self.runtime.run_id,
             request_id: request.request_id.as_deref(),
@@ -398,7 +446,7 @@ impl ProcessingEngine {
                 artifact_metadata: &initial.catalog.report_metadata,
                 policy: &initial_policy,
                 analyzer_duration_ms: &initial_durations,
-                duration_ms: 0,
+                duration_ms: initial.duration_ms,
             }),
             verification: verification.as_ref().map(|phase| PhaseReportInput {
                 result: &phase.result,
@@ -411,7 +459,7 @@ impl ProcessingEngine {
                 analyzer_duration_ms: verification_durations
                     .as_ref()
                     .expect("verification durations set"),
-                duration_ms: 0,
+                duration_ms: phase.duration_ms,
             }),
             completion: completion.as_ref(),
             pi_invocations,
@@ -421,12 +469,7 @@ impl ProcessingEngine {
             degradations: &[],
             started_at,
             finished_at,
-            duration_ms: u64::try_from(
-                system_time_unix_millis()
-                    .map_err(|_| ProcessingEngineError::Job)?
-                    .saturating_sub(started_millis),
-            )
-            .unwrap_or(0),
+            duration_ms: duration_millis(processing_started.elapsed()),
             persistence_status: PersistenceStatus::Durable,
             omission_reason: None,
         })
@@ -434,6 +477,7 @@ impl ProcessingEngine {
         let report_bytes = report
             .to_json_line()
             .map_err(|_| ProcessingEngineError::Report)?;
+        require_report_size(&self.runtime, &report_bytes)?;
         let report_identity = Digest::sha256(&report_bytes);
         let evidence_identity = Digest::sha256(
             serde_json::to_vec(&(
@@ -482,8 +526,10 @@ impl ProcessingEngine {
         mut lease: crate::processing::job::JobLease,
         request_id: Option<&str>,
         error: &ProcessingEngineError,
+        started_at: Rfc3339Timestamp,
+        duration_ms: u64,
     ) -> Result<ProcessingReport, ProcessingEngineError> {
-        let now = timestamp_now()?;
+        let finished_at = timestamp_now()?;
         let proposed = if matches!(error, ProcessingEngineError::Cancelled) {
             Outcome::Cancelled
         } else {
@@ -529,36 +575,46 @@ impl ProcessingEngine {
                 state: *state,
             })
             .collect::<Vec<_>>();
-        let report = build_processing_report(ProcessingReportBuildInput {
-            run_id: &self.runtime.run_id,
-            request_id,
-            runtime: Some(&self.runtime),
-            source: None,
-            acquisition: None,
-            initial: None,
-            verification: None,
-            completion: Some(&completion),
-            pi_invocations: Vec::new(),
-            adjudications: &[],
-            actions: &action_inputs,
-            issues: &issues,
-            degradations: &[],
-            started_at: now.clone(),
-            finished_at: now,
-            duration_ms: 0,
-            persistence_status: PersistenceStatus::Durable,
-            omission_reason: Some(if action_recovery.details_omitted {
-                "action_failure_details_withheld"
-            } else {
-                "failure_details_withheld"
-            }),
-        })
-        .map_err(|_| ProcessingEngineError::Report)?;
-        let identity = Digest::sha256(
-            report
+        let build_error_report = |actions: &[ReportActionInput<'_>], omission_reason| {
+            build_processing_report(ProcessingReportBuildInput {
+                run_id: &self.runtime.run_id,
+                request_id,
+                runtime: Some(&self.runtime),
+                source: None,
+                acquisition: None,
+                initial: None,
+                verification: None,
+                completion: Some(&completion),
+                pi_invocations: Vec::new(),
+                adjudications: &[],
+                actions,
+                issues: &issues,
+                degradations: &[],
+                started_at: started_at.clone(),
+                finished_at: finished_at.clone(),
+                duration_ms,
+                persistence_status: PersistenceStatus::Durable,
+                omission_reason: Some(omission_reason),
+            })
+            .map_err(|_| ProcessingEngineError::Report)
+        };
+        let omission = if action_recovery.details_omitted {
+            "action_failure_details_withheld"
+        } else {
+            "failure_details_withheld"
+        };
+        let mut report = build_error_report(&action_inputs, omission)?;
+        let mut report_bytes = report
+            .to_json_line()
+            .map_err(|_| ProcessingEngineError::Report)?;
+        if report_bytes.len() as u64 > self.runtime.jobs.max_report_bytes {
+            report = build_error_report(&[], "report_limit_details_withheld")?;
+            report_bytes = report
                 .to_json_line()
-                .map_err(|_| ProcessingEngineError::Report)?,
-        );
+                .map_err(|_| ProcessingEngineError::Report)?;
+        }
+        require_report_size(&self.runtime, &report_bytes)?;
+        let identity = Digest::sha256(&report_bytes);
         let decision = PrivateDecisionRecord::new(
             self.runtime.run_id.clone(),
             proposed,
@@ -915,6 +971,7 @@ pub async fn execute_captured_phase(
     phase: InspectionPhase,
     correlation_key: JobCorrelationKey,
 ) -> Result<CapturedPhase, ProcessingEngineError> {
+    let phase_started = Instant::now();
     let capture_root = private_subdirectory(
         &paths.temporary(),
         match phase {
@@ -1005,7 +1062,11 @@ pub async fn execute_captured_phase(
     )
     .await
     .map_err(|_| ProcessingEngineError::Analysis)?;
-    Ok(CapturedPhase { catalog, result })
+    Ok(CapturedPhase {
+        catalog,
+        result,
+        duration_ms: duration_millis(phase_started.elapsed()),
+    })
 }
 
 pub async fn acquire_processing_source(
@@ -1418,6 +1479,7 @@ fn acquisition_report(
     acquired: &AcquiredProcessingSource,
     started_at: Rfc3339Timestamp,
     finished_at: Rfc3339Timestamp,
+    duration_ms: u64,
 ) -> Result<AcquisitionReportInput, ProcessingEngineError> {
     let source_identity = match &acquired.source {
         ProcessSource::Path {
@@ -1435,7 +1497,7 @@ fn acquisition_report(
         implementation_version: acquired.implementation_version.clone(),
         started_at,
         finished_at,
-        duration_ms: 0,
+        duration_ms,
         source_identity,
         issue_codes: Vec::new(),
     })
@@ -1446,7 +1508,12 @@ fn analyzer_durations(phase: &CapturedPhase) -> BTreeMap<crate::domain::Analyzer
         .result
         .analyzer_runs
         .iter()
-        .map(|run| (run.analyzer_id.clone(), 0))
+        .map(|run| {
+            (
+                run.analyzer_id.clone(),
+                run.timing.map_or(0, |timing| timing.duration_ms),
+            )
+        })
         .collect()
 }
 
@@ -1454,27 +1521,32 @@ fn pi_invocation_summaries(
     runtime: &CompiledProcessingRuntime,
     initial: &CapturedPhase,
     verification: Option<&CapturedPhase>,
-    at: &Rfc3339Timestamp,
 ) -> Result<Vec<PiInvocationSummary>, ProcessingEngineError> {
-    initial
-        .result
-        .pi_results
-        .iter()
-        .chain(
-            verification
-                .into_iter()
-                .flat_map(|phase| phase.result.pi_results.iter()),
-        )
-        .map(|result| {
-            crate::processing::pi_report::pi_invocation_summary(
-                runtime,
-                result,
-                at.clone(),
-                at.clone(),
-            )
-            .map_err(|_| ProcessingEngineError::Report)
-        })
-        .collect()
+    let mut summaries = Vec::new();
+    for phase in std::iter::once(initial).chain(verification) {
+        for result in &phase.result.pi_results {
+            let mut matching = phase
+                .result
+                .analyzer_runs
+                .iter()
+                .filter(|run| run.analyzer_id == result.analyzer_id);
+            let run = matching.next().ok_or(ProcessingEngineError::Report)?;
+            if matching.next().is_some() {
+                return Err(ProcessingEngineError::Report);
+            }
+            let timing = run.timing.ok_or(ProcessingEngineError::Report)?;
+            summaries.push(
+                crate::processing::pi_report::pi_invocation_summary(
+                    runtime,
+                    result,
+                    timestamp_from_unix_millis(timing.started_unix_millis)?,
+                    timestamp_from_unix_millis(timing.finished_unix_millis)?,
+                )
+                .map_err(|_| ProcessingEngineError::Report)?,
+            );
+        }
+    }
+    Ok(summaries)
 }
 
 fn timestamp_now() -> Result<Rfc3339Timestamp, ProcessingEngineError> {
@@ -1485,6 +1557,26 @@ fn timestamp_from(
     value: chrono::DateTime<chrono::Utc>,
 ) -> Result<Rfc3339Timestamp, ProcessingEngineError> {
     Rfc3339Timestamp::new(value.to_rfc3339()).map_err(|_| ProcessingEngineError::Report)
+}
+
+fn timestamp_from_unix_millis(value: i64) -> Result<Rfc3339Timestamp, ProcessingEngineError> {
+    let value = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
+        .ok_or(ProcessingEngineError::Report)?;
+    timestamp_from(value)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn require_report_size(
+    runtime: &CompiledProcessingRuntime,
+    bytes: &[u8],
+) -> Result<(), ProcessingEngineError> {
+    if bytes.len() as u64 > runtime.jobs.max_report_bytes {
+        return Err(ProcessingEngineError::Report);
+    }
+    Ok(())
 }
 
 fn random_correlation_key() -> Result<JobCorrelationKey, ProcessingEngineError> {
@@ -1530,6 +1622,8 @@ const fn error_code(error: &ProcessingEngineError) -> &'static str {
         ProcessingEngineError::Action => "action_transaction_failed",
         ProcessingEngineError::Report => "report_construction_failed",
         ProcessingEngineError::Completion => "completion_failed",
+        ProcessingEngineError::RetentionCapacity => "retention_capacity_unavailable",
+        ProcessingEngineError::RetentionMaintenance => "retention_maintenance_failed",
     }
 }
 

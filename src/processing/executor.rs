@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::join_all;
 use globset::{Candidate, GlobBuilder, GlobSet, GlobSetBuilder};
@@ -326,6 +327,14 @@ pub struct AnalyzerRunRecord {
     pub state: AnalyzerRunState,
     pub assigned: u64,
     pub scanner_version: Option<ScannerVersion>,
+    pub timing: Option<AnalyzerRunTiming>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AnalyzerRunTiming {
+    pub started_unix_millis: i64,
+    pub finished_unix_millis: i64,
+    pub duration_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -687,7 +696,7 @@ async fn execute_stage(
     prepared: &[PreparedAnalyzer<'_>],
     inputs: PhaseAnalyzerInputs,
     backends: &ProcessingBackends<'_>,
-) -> Vec<Result<ValidatedAnalyzerResult, AnalyzerBackendError>> {
+) -> Vec<TimedAnalyzerResult> {
     let concurrency = match execution {
         StageExecution::Serial => 1,
         StageExecution::Parallel { max_concurrency } => max_concurrency,
@@ -699,7 +708,7 @@ async fn execute_stage(
             .map(|prepared| execute_analyzer(prepared, context, inputs.clone(), backends));
         let batch_results = join_all(futures).await;
         let required_failed = batch.iter().zip(&batch_results).any(|(prepared, result)| {
-            prepared.execution == PhaseExecution::Required && result.is_err()
+            prepared.execution == PhaseExecution::Required && result.result.is_err()
         });
         results.extend(batch_results);
         if required_failed {
@@ -710,6 +719,26 @@ async fn execute_stage(
 }
 
 async fn execute_analyzer(
+    prepared: &PreparedAnalyzer<'_>,
+    context: &ProcessingExecutionContext,
+    inputs: PhaseAnalyzerInputs,
+    backends: &ProcessingBackends<'_>,
+) -> TimedAnalyzerResult {
+    let started_unix_millis = unix_millis_now();
+    let started = Instant::now();
+    let result = execute_analyzer_inner(prepared, context, inputs, backends).await;
+    let finished_unix_millis = unix_millis_now().max(started_unix_millis);
+    TimedAnalyzerResult {
+        result,
+        timing: AnalyzerRunTiming {
+            started_unix_millis,
+            finished_unix_millis,
+            duration_ms: duration_millis(started.elapsed()),
+        },
+    }
+}
+
+async fn execute_analyzer_inner(
     prepared: &PreparedAnalyzer<'_>,
     context: &ProcessingExecutionContext,
     inputs: PhaseAnalyzerInputs,
@@ -916,10 +945,14 @@ fn validate_backend_output(
 fn absorb_result(
     stage: &crate::processing::runtime::FrozenStage,
     prepared: &PreparedAnalyzer<'_>,
-    backend: Result<ValidatedAnalyzerResult, AnalyzerBackendError>,
+    backend: TimedAnalyzerResult,
     evidence: &mut Vec<BackendObservationEvidence>,
     result: &mut ProcessingPhaseResult,
 ) -> bool {
+    let TimedAnalyzerResult {
+        result: backend,
+        timing,
+    } = backend;
     let stage_id = stage.id.as_str().to_owned();
     if prepared.execution == PhaseExecution::Disabled {
         result.analyzer_runs.push(AnalyzerRunRecord {
@@ -929,6 +962,7 @@ fn absorb_result(
             state: AnalyzerRunState::Disabled,
             assigned: 0,
             scanner_version: None,
+            timing: None,
         });
         return false;
     }
@@ -948,6 +982,7 @@ fn absorb_result(
                 state: AnalyzerRunState::Complete,
                 assigned: prepared.assignments.len() as u64,
                 scanner_version: backend.scanner_version,
+                timing: Some(timing),
             });
             false
         }
@@ -976,6 +1011,7 @@ fn absorb_result(
                 },
                 assigned: prepared.assignments.len() as u64,
                 scanner_version: None,
+                timing: Some(timing),
             });
             required
         }
@@ -1099,8 +1135,26 @@ fn append_skipped_from(
             },
             assigned: prepared.assignments.len() as u64,
             scanner_version: None,
+            timing: None,
         });
     }
+}
+
+struct TimedAnalyzerResult {
+    result: Result<ValidatedAnalyzerResult, AnalyzerBackendError>,
+    timing: AnalyzerRunTiming,
+}
+
+fn unix_millis_now() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn incomplete_coverage(
