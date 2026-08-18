@@ -384,6 +384,11 @@ async fn remote_acquisition_freezes_all_refs_publishes_head_and_scrubs_repositor
 
     assert!(stage.join(".git").is_dir());
     assert!(!git_s(&stage, &["log", "-1", "--format=%H"]).is_empty());
+    assert!(git_s(&stage, &["status", "--porcelain"]).is_empty());
+    assert_eq!(
+        git_s(&stage, &["ls-files", "--error-unmatch", "tracked.txt"]),
+        b"tracked.txt\n"
+    );
     assert_eq!(
         fs::read(stage.join("tracked.txt")).unwrap(),
         b"head bytes\n"

@@ -53,7 +53,9 @@ requires history and no repository is detected, acquisition fails.
 
 Use `process git` for an HTTPS or SSH remote. File Guardian clones directly
 into the owned stage and retains `.git`; there is no hidden second repository
-or stripped source-tree projection. Authentication is entirely ambient to the
+or stripped source-tree projection. The staged index and worktree both match
+the frozen selected HEAD, so a retained handoff remains an ordinary clean Git
+worktree. Authentication is entirely ambient to the
 configured Git process. For unattended use, arrange an existing credential
 helper, SSH agent/key policy, and known-hosts policy before launch. File
 Guardian deliberately has no credential configuration. Git is invoked

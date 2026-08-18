@@ -495,7 +495,8 @@ backed rule described below.
 The clone target is the job's `stage/`. File Guardian initializes `.git`,
 fetches the frozen selected refs, materializes the selected HEAD with Git
 plumbing so hooks, filters, submodules, and LFS cannot execute implicitly, and
-retains `.git` for Pi, history review, and final handoff. Before analysis it
+populates the index from that same frozen HEAD so the staged clone has a clean,
+usable worktree. It retains `.git` for Pi, history review, and final handoff. Before analysis it
 removes credential-bearing remote URLs, `FETCH_HEAD`, native diagnostics, and
 other acquisition-only authentication data from that staged repository.
 

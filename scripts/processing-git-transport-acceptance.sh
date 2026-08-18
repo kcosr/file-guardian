@@ -258,6 +258,8 @@ run_retain() {
     die "$label handoff does not match the selected HEAD"
   [[ $(git -C "$destination" rev-list --count HEAD) == 2 ]] || \
     die "$label handoff does not retain the complete two-commit clone"
+  [[ -z $(git -C "$destination" status --porcelain) ]] || \
+    die "$label handoff has an index or working-tree mismatch"
   if grep -Fq -- "$remote" "$report" "$stderr" "$receipt" || \
      grep -Fq -- "$SYNTHETIC_SECRET" "$report" "$stderr" "$receipt" || \
      grep -Fq -- "$HTTP_PASSWORD" "$report" "$stderr" "$receipt"; then
