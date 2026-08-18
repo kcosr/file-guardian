@@ -594,14 +594,15 @@ async fn terminate_and_reap(
 async fn observe_exit_without_reaping(raw_pid: u32) -> Result<(), ScannerRunError> {
     let pid = rustix::process::Pid::from_raw(raw_pid as i32).ok_or(ScannerRunError::Supervision)?;
     loop {
-        let status = rustix::process::waitid(
+        let exited = rustix::process::waitid(
             rustix::process::WaitId::Pid(pid),
             rustix::process::WaitIdOptions::EXITED
                 | rustix::process::WaitIdOptions::NOWAIT
                 | rustix::process::WaitIdOptions::NOHANG,
         )
-        .map_err(|_| ScannerRunError::Supervision)?;
-        if status.is_some() {
+        .map_err(|_| ScannerRunError::Supervision)?
+        .is_some();
+        if exited {
             return Ok(());
         }
         tokio::task::yield_now().await;

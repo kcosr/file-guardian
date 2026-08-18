@@ -4,7 +4,7 @@ version = "0.0.4"
 edition = "2021"
 license = "MIT"
 authors = ["kevin <kevin@example.com>"]
-description = "Fail-closed authorization of staged file trees using configurable policy analyzers."
+description = "Fail-closed processing of staged directories and Git repositories using configurable policy analyzers."
 
 [[bin]]
 name = "file-guardian"

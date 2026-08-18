@@ -588,8 +588,10 @@ impl Drop for ProcessGroupGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(target_os = "linux")]
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
     use tempfile::TempDir;

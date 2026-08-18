@@ -136,6 +136,7 @@ type FakePiFuture = Pin<Box<dyn Future<Output = Result<(), PiRunError>> + Send>>
 #[derive(Clone)]
 struct FakePiInvocation {
     socket_path: std::path::PathBuf,
+    analyzer_input_view: std::path::PathBuf,
     token: String,
     run_id: RunId,
     analyzer_id: AnalyzerId,
@@ -443,6 +444,7 @@ impl PiClassifierAnalyzer {
             PiRunnerBackend::Fake(fake) => {
                 fake(FakePiInvocation {
                     socket_path: proxy.endpoint().host_socket_path().to_path_buf(),
+                    analyzer_input_view: invocation.analyzer_input_view.to_path_buf(),
                     token: token.clone(),
                     run_id: self.run_id.clone(),
                     analyzer_id: self.id.clone(),
@@ -686,6 +688,8 @@ mod tests {
             fs::create_dir(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
             fs::write(input.join("fixture.txt"), b"password = example-only").unwrap();
+            fs::create_dir(input.join(".git")).unwrap();
+            fs::write(input.join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
             let run_id = RunId::from_suffix("pi-triage-e2e").unwrap();
             let workspace = Arc::new(InvocationWorkspace::create(&root, &run_id).unwrap());
             let manifest = Arc::new(
@@ -814,7 +818,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_pi_reads_bound_request_and_submits_candidate_free_triage() {
+    async fn fake_pi_reads_bound_evidence_and_exact_staged_repository() {
         let fixture = Fixture::new();
         let artifact_id = fixture.manifest.artifacts()[0].id.clone();
         let finding_id = FindingId::from_suffix("fixture").unwrap();
@@ -867,6 +871,10 @@ mod tests {
         let analyzer = analyzer(&fixture, move |invocation| {
             let expected_request = Arc::clone(&expected_request);
             Box::pin(async move {
+                assert_eq!(
+                    fs::read(invocation.analyzer_input_view.join(".git/HEAD")).unwrap(),
+                    b"ref: refs/heads/main\n"
+                );
                 assert_eq!(
                     exchange(
                         &invocation.socket_path,
@@ -925,12 +933,15 @@ mod tests {
                 Ok(())
             })
         });
-        let assignments =
-            EligibilitySelector::compile(&["**".to_string()], &[], [ArtifactKind::PhysicalFile])
-                .unwrap()
-                .assign(&AnalyzerId::new("pi-triage").unwrap(), &fixture.manifest)
-                .unwrap()
-                .assignments;
+        let assignments = EligibilitySelector::compile(
+            &["fixture.txt".to_string()],
+            &[],
+            [ArtifactKind::PhysicalFile],
+        )
+        .unwrap()
+        .assign(&AnalyzerId::new("pi-triage").unwrap(), &fixture.manifest)
+        .unwrap()
+        .assignments;
         let before = fs::read(fixture.input.join("fixture.txt")).unwrap();
         let result = analyzer
             .analyze_triage(
@@ -938,7 +949,7 @@ mod tests {
                 assignments,
                 Arc::clone(&fixture.workspace),
                 request,
-                None,
+                Some(fixture.input.clone()),
             )
             .await
             .unwrap();

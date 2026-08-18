@@ -521,7 +521,7 @@ fn copy_verified(
     output.sync_all().map_err(AnalyzerViewError::SyncFile)?;
     fs::fchmod(&output, Mode::from_raw_mode(0o400)).map_err(AnalyzerViewError::SealFile)?;
     let stat = fs::fstat(&output).map_err(AnalyzerViewError::InspectEntry)?;
-    #[allow(clippy::useless_conversion)]
+    #[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
     let links = u64::try_from(stat.st_nlink).map_err(|_| AnalyzerViewError::InvalidEntry)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || stat.st_uid != geteuid().as_raw()

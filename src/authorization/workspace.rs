@@ -395,7 +395,7 @@ impl ObjectStore {
         )
         .map_err(WorkspaceError::OpenObject)?;
         let stat = fs::fstat(&fd).map_err(WorkspaceError::InspectObject)?;
-        #[allow(clippy::useless_conversion)]
+        #[allow(clippy::unnecessary_fallible_conversions, clippy::useless_conversion)]
         let link_count = u64::try_from(stat.st_nlink).map_err(|_| WorkspaceError::InvalidObject)?;
         if !fs::FileType::from_raw_mode(stat.st_mode).is_file() || link_count != 1 {
             return Err(WorkspaceError::InvalidObject);

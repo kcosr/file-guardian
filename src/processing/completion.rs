@@ -1238,12 +1238,16 @@ fn enumerate(directory: &OwnedFd) -> Result<Vec<DirectoryEntry>, CompletionError
         }
         let stat = fs::statat(directory, name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
             .map_err(|error| io_error("inspect directory entry", error))?;
+        #[cfg(target_os = "macos")]
+        let mode = u32::from(stat.st_mode);
+        #[cfg(not(target_os = "macos"))]
+        let mode = stat.st_mode;
         rows.push(DirectoryEntry {
             segment: PathSegment::from_bytes(name.to_bytes())
                 .map_err(|_| CompletionError::StageMismatch)?,
             name,
             kind: FileType::from_raw_mode(stat.st_mode),
-            mode: stat.st_mode,
+            mode,
         });
     }
     rows.sort_by(|left, right| left.segment.cmp(&right.segment));

@@ -1055,7 +1055,11 @@ fn open_secure_root(
     if stat.st_uid != geteuid().as_raw() || stat.st_mode & 0o7777 != 0o700 {
         return Err(JobStoreError::InsecureRoot);
     }
-    Ok((fd, (stat.st_dev, stat.st_ino)))
+    #[cfg(target_os = "macos")]
+    let device = u64::try_from(stat.st_dev).map_err(|_| JobStoreError::InsecureRoot)?;
+    #[cfg(not(target_os = "macos"))]
+    let device = stat.st_dev;
+    Ok((fd, (device, stat.st_ino)))
 }
 
 fn canonical_root(path: &Path, expected: (u64, u64)) -> Result<PathBuf, JobStoreError> {

@@ -53,8 +53,10 @@ original finding and Pi's assessment both remain in the report.
 
 The sandbox is an accidental-mutation boundary, not a confidentiality or
 adversarial-agent boundary. Pi may read password-bearing candidate content and
-ordinary host files. The host filesystem and candidate stage are mounted
-read-only, while a dedicated scratch directory is writable. Pi uses the normal
+ordinary files exposed by its configured review surface. The candidate stage,
+normal runtime/library/configuration directories, and configured installed-tool
+roots are mounted read-only; unrelated host paths need not be mounted. A
+dedicated scratch directory is writable. Pi uses the normal
 administrator-installed runtime and shared libraries; File Guardian does not
 construct, copy, inspect, or attest a private runtime closure.
 
@@ -754,7 +756,8 @@ The generic delegate supervisor provides:
 
 - a generated immutable candidate view, read-only at the OS boundary;
 - private output/scratch outside the stage;
-- the normal administrator-installed runtime on a read-only host filesystem;
+- the normal administrator-installed runtime and its required runtime/tool
+  roots mounted read-only;
 - disabled network on Linux;
 - bounded wall time, process group, memory/CPU/file descriptors where
   supported, and stdout/stderr/output sizes;
@@ -878,11 +881,13 @@ incorrect deterministic finding.
 
 Pi receives normalized prior findings, their actual bounded evidence, and
 read-only access to the complete immutable stage and selected Git-history
-artifacts. Its shell runs with the ordinary host filesystem visible read-only
-and a dedicated writable scratch directory. The sandbox prevents accidental
-host or stage modification; it does not conceal candidate passwords, host
-files, the installed runtime, or shared libraries from Pi. The Pi host process
-retains model networking and its configured provider credentials.
+artifacts. Its shell sees the stage and the ordinary
+runtime/library/configuration/tool roots it needs read-only, plus a dedicated
+writable scratch directory. Unrelated host paths are not mounted merely for
+completeness. The sandbox prevents accidental host or stage modification; it
+does not conceal candidate passwords, the installed runtime, or shared
+libraries from Pi. The Pi host process retains model networking and its
+configured provider credentials.
 
 Pi phase execution is explicit:
 
@@ -1226,10 +1231,11 @@ inserted, avoiding self-reference.
 - remote Git: `{kind:"git", transport:"https|ssh", repository_id,
   resolved_head, working_tree, history, frozen_refs:[...]}`.
 
-Repository IDs are HMAC-SHA-256 tokens under the random job correlation key,
-not raw locator hashes. Frozen ref rows contain a bounded safe ref token,
-object ID, and peeled commit ID; unsafe/raw ref bytes use the same segment-safe
-encoding as paths. They never contain the locator or username.
+Repository IDs are SHA-256 identities derived from the frozen object format,
+resolved HEAD, and selected ref/OID map—not from the remote locator. Frozen ref
+rows contain a bounded safe ref token, object ID, and peeled commit ID;
+unsafe/raw ref bytes use the same segment-safe encoding as paths. These fields
+never contain the locator or username.
 
 `acquisition` contains `status: complete|failed`, implementation/version
 identity, start/end/duration, frozen source identity when known, and safe issue

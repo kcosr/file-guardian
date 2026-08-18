@@ -331,14 +331,15 @@ impl GitCommandRunner {
 async fn observe_exit_without_reaping(raw_pid: u32) -> Result<(), GitAcquisitionError> {
     let pid = rustix::process::Pid::from_raw(raw_pid as i32).ok_or(GitAcquisitionError::Wait)?;
     loop {
-        let status = rustix::process::waitid(
+        let exited = rustix::process::waitid(
             rustix::process::WaitId::Pid(pid),
             rustix::process::WaitIdOptions::EXITED
                 | rustix::process::WaitIdOptions::NOWAIT
                 | rustix::process::WaitIdOptions::NOHANG,
         )
-        .map_err(|_| GitAcquisitionError::Wait)?;
-        if status.is_some() {
+        .map_err(|_| GitAcquisitionError::Wait)?
+        .is_some();
+        if exited {
             return Ok(());
         }
         sleep(Duration::from_millis(5)).await;

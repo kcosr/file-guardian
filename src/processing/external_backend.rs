@@ -386,10 +386,20 @@ pub(crate) fn canonical_evidence_window(
             let line = bytes.split(|byte| *byte == b'\n').nth(index)?;
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             let text = std::str::from_utf8(line).ok()?;
-            if column > text.chars().count() as u64 + 1 {
+            let character = usize::try_from(column.saturating_sub(1)).ok()?;
+            let character_count = text.chars().count();
+            if character > character_count {
                 return None;
             }
-            &line[..line.len().min(MAX_EVIDENCE_WINDOW_BYTES)]
+            let center = if character == character_count {
+                line.len()
+            } else {
+                text.char_indices().nth(character)?.0
+            };
+            let left = center
+                .saturating_sub(MAX_EVIDENCE_WINDOW_BYTES / 2)
+                .min(line.len().saturating_sub(MAX_EVIDENCE_WINDOW_BYTES));
+            &line[left..line.len().min(left + MAX_EVIDENCE_WINDOW_BYTES)]
         }
     };
     if window.is_empty() {
@@ -904,5 +914,18 @@ mod tests {
             required,
             Err(MaterializationError::InvalidContent)
         ));
+    }
+
+    #[test]
+    fn line_column_evidence_window_contains_a_match_late_in_a_long_line() {
+        let mut bytes = vec![b'x'; 900];
+        bytes[700..706].copy_from_slice(b"secret");
+
+        let evidence =
+            canonical_evidence_window(&bytes, &ValidatedLocation::line_column(1, 701).unwrap())
+                .unwrap();
+
+        assert_eq!(evidence.len(), MAX_EVIDENCE_WINDOW_BYTES);
+        assert!(evidence.windows(6).any(|window| window == b"secret"));
     }
 }

@@ -1,4 +1,5 @@
 use super::proxy::NATIVE_SEARCH_MAX_RESULTS;
+#[cfg(target_os = "linux")]
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -55,7 +56,7 @@ impl PreparedPiRuntime {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = spec;
-            return Err(PiSandboxError::UnsupportedPlatform);
+            Err(PiSandboxError::UnsupportedPlatform)
         }
         #[cfg(target_os = "linux")]
         {
@@ -535,6 +536,7 @@ fn validate_environment(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn runtime_identity(spec: &PiRuntimeSpec) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for value in [
