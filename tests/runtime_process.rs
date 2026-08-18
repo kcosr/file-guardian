@@ -47,7 +47,7 @@ impl Fixture {
     }
 
     fn with_profile(filename: &str, contents: &[u8], apply: bool, git_history: bool) -> Self {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = private_tempdir();
         let jobs = private_dir(temporary.path(), "jobs");
         let reports = private_dir(temporary.path(), "reports");
         let quarantine = private_dir(temporary.path(), "quarantine");
@@ -83,7 +83,7 @@ impl Fixture {
     }
 
     fn failing_verification() -> Self {
-        let temporary = tempfile::tempdir().unwrap();
+        let temporary = private_tempdir();
         let jobs = private_dir(temporary.path(), "jobs");
         let reports = private_dir(temporary.path(), "reports");
         let quarantine = private_dir(temporary.path(), "quarantine");
@@ -666,6 +666,38 @@ fn artifact_quarantine_can_be_inspected_recovered_and_idempotently_discarded() {
         .windows(contents.len())
         .any(|window| window == contents));
 
+    let untrusted_parent = fixture._temporary.path().join("untrusted-recovery-parent");
+    fs::create_dir(&untrusted_parent).unwrap();
+    fs::set_permissions(&untrusted_parent, fs::Permissions::from_mode(0o777)).unwrap();
+    let untrusted_destination = untrusted_parent.join("recovered.txt");
+    let rejected_recover = fixture.artifact_command(&[
+        "artifact",
+        "recover",
+        report.run_id.as_str(),
+        quarantine_id,
+        "--destination",
+        untrusted_destination.to_str().unwrap(),
+    ]);
+    assert_eq!(rejected_recover.status.code(), Some(30));
+    assert!(!untrusted_destination.exists());
+
+    let trusted_parent = fixture._temporary.path().join("trusted-recovery-parent");
+    fs::create_dir(&trusted_parent).unwrap();
+    fs::set_permissions(&trusted_parent, fs::Permissions::from_mode(0o700)).unwrap();
+    let parent_link = fixture._temporary.path().join("recovery-parent-link");
+    std::os::unix::fs::symlink(&trusted_parent, &parent_link).unwrap();
+    let linked_destination = parent_link.join("recovered.txt");
+    let linked_recover = fixture.artifact_command(&[
+        "artifact",
+        "recover",
+        report.run_id.as_str(),
+        quarantine_id,
+        "--destination",
+        linked_destination.to_str().unwrap(),
+    ]);
+    assert_eq!(linked_recover.status.code(), Some(30));
+    assert!(!trusted_parent.join("recovered.txt").exists());
+
     let destination = fixture._temporary.path().join("recovered.txt");
     let recover = fixture.artifact_command(&[
         "artifact",
@@ -702,6 +734,12 @@ fn artifact_quarantine_can_be_inspected_recovered_and_idempotently_discarded() {
     let inspect_after =
         fixture.artifact_command(&["artifact", "inspect", report.run_id.as_str(), quarantine_id]);
     assert_eq!(inspect_after.status.code(), Some(20));
+}
+
+fn private_tempdir() -> tempfile::TempDir {
+    let temporary = tempfile::tempdir().unwrap();
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    temporary
 }
 
 #[test]

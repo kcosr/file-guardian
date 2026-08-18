@@ -76,6 +76,8 @@ pub enum ArtifactQuarantineError {
     Integrity,
     #[error("recovery destination is invalid")]
     DestinationInvalid,
+    #[error("recovery destination parent is not trusted")]
+    DestinationUntrusted,
     #[error("recovery destination already exists")]
     DestinationExists,
     #[error("artifact operation could not be made durable")]
@@ -131,8 +133,7 @@ impl ArtifactQuarantineStore {
     ) -> Result<ArtifactRecoveryReceipt, ArtifactQuarantineError> {
         let _lock = self.lock()?;
         let artifact = self.inspect_unlocked(run_id, quarantine_id)?;
-        let (parent, leaf) = destination_parent(destination)?;
-        let parent_fd = open_root(&parent)?;
+        let (parent_fd, leaf) = destination_parent(destination)?;
         if fs::statat(&parent_fd, &leaf, AtFlags::SYMLINK_NOFOLLOW).is_ok() {
             return Err(ArtifactQuarantineError::DestinationExists);
         }
@@ -428,26 +429,35 @@ fn open_root(path: &Path) -> Result<OwnedFd, ArtifactQuarantineError> {
     fs::open(path, ROOT_FLAGS, Mode::empty()).map_err(|_| ArtifactQuarantineError::StoreUnavailable)
 }
 
-fn destination_parent(destination: &Path) -> Result<(PathBuf, CString), ArtifactQuarantineError> {
-    if !destination.is_absolute()
-        || destination.components().any(|component| {
-            matches!(
-                component,
-                Component::CurDir | Component::ParentDir | Component::Prefix(_)
-            )
-        })
-    {
+fn destination_parent(destination: &Path) -> Result<(OwnedFd, CString), ArtifactQuarantineError> {
+    if !destination.is_absolute() {
         return Err(ArtifactQuarantineError::DestinationInvalid);
     }
+    let leaf = destination
+        .file_name()
+        .filter(|value| !value.as_bytes().is_empty())
+        .ok_or(ArtifactQuarantineError::DestinationInvalid)?;
+    let leaf = safe_os_name(leaf)?;
     let parent = destination
         .parent()
         .ok_or(ArtifactQuarantineError::DestinationInvalid)?;
-    let leaf = destination
-        .file_name()
-        .ok_or(ArtifactQuarantineError::DestinationInvalid)?;
-    let parent =
-        std::fs::canonicalize(parent).map_err(|_| ArtifactQuarantineError::DestinationInvalid)?;
-    Ok((parent, safe_os_name(leaf)?))
+    let mut current = fs::open("/", ROOT_FLAGS, Mode::empty())
+        .map_err(|_| ArtifactQuarantineError::DestinationInvalid)?;
+    for component in parent.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                current = fs::openat(&current, name, ROOT_FLAGS, Mode::empty())
+                    .map_err(|_| ArtifactQuarantineError::DestinationInvalid)?;
+            }
+            _ => return Err(ArtifactQuarantineError::DestinationInvalid),
+        }
+    }
+    let stat = fs::fstat(&current).map_err(|_| ArtifactQuarantineError::DestinationInvalid)?;
+    if stat.st_uid != rustix::process::geteuid().as_raw() || stat.st_mode & 0o022 != 0 {
+        return Err(ArtifactQuarantineError::DestinationUntrusted);
+    }
+    Ok((current, leaf))
 }
 
 fn metadata_name(id: &ArtifactQuarantineId) -> Result<CString, ArtifactQuarantineError> {
