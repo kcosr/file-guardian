@@ -6,6 +6,8 @@ pub(crate) mod runner;
 pub(crate) mod sandbox;
 pub mod triage;
 
+use std::path::PathBuf;
+
 use self::protocol::{ClassificationVocabulary, TerminalValidationLimits};
 use self::proxy::{
     ExpectedPiRuntime, PiProxy, PiProxyInput, PiProxyLimits, NATIVE_SEARCH_MAX_RESULTS,
@@ -17,7 +19,7 @@ use self::sandbox::{PiRuntimeSpec, PreparedPiRuntime};
 use self::triage::{
     PiReviewScope, PiStageAttestation, PiTriageCoverage, PiTriageInvocationId, PiTriageLimits,
     PiTriageRequest, PiTriageRequestContext, PiTriageResult, PiTriageVocabulary, PriorFinding,
-    PriorOccurrence,
+    PriorFindingArtifact, PriorOccurrence,
 };
 use crate::analyzers::{
     assess_text_artifact, RequiredTextMatcher, TextApplicabilityError, TextArtifactDisposition,
@@ -27,7 +29,7 @@ use crate::authorization::{
 };
 use crate::domain::{
     AnalyzerCoverage, AnalyzerId, ArtifactManifest, CoverageStatus, Digest, InspectionPhase,
-    NormalizedObservation, RunId,
+    NormalizedObservation, Provenance, RunId,
 };
 use crate::pipeline::{ArtifactAssignment, PriorObservationProjection};
 use crate::processing::{
@@ -41,7 +43,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
 
-const FIXED_TASK: &[u8] = b"Assess every finding in the bounded triage request against the assigned immutable artifacts. Submit exactly one candidate-free terminal triage response.\n";
+const FIXED_TASK: &[u8] = b"Assess every deterministic finding using the exact matched evidence in triage_request and the exact staged repository or directory mounted read-only at /input. For Git-history findings, use the supplied commit/blob/ref provenance and ordinary Git commands against /input. Decide whether each deterministic result is correct or a false positive, then submit exactly one candidate-free terminal triage response.\n";
 
 struct ProxySignalBridge {
     signals: Option<PiRunSignals>,
@@ -219,7 +221,7 @@ impl PiClassifierAnalyzer {
         workspace: Arc<InvocationWorkspace>,
         prior: Arc<PriorObservationProjection>,
     ) -> Result<PiClassifierResult, PiClassifierError> {
-        self.analyze_internal(manifest, assignments, workspace, Some(prior), None)
+        self.analyze_internal(manifest, assignments, workspace, Some(prior), None, None)
             .await
     }
 
@@ -229,9 +231,17 @@ impl PiClassifierAnalyzer {
         assignments: Vec<ArtifactAssignment>,
         workspace: Arc<InvocationWorkspace>,
         request: Arc<PiTriageRequest>,
+        staged_input: Option<PathBuf>,
     ) -> Result<PiClassifierResult, PiClassifierError> {
-        self.analyze_internal(manifest, assignments, workspace, None, Some(request))
-            .await
+        self.analyze_internal(
+            manifest,
+            assignments,
+            workspace,
+            None,
+            Some(request),
+            staged_input,
+        )
+        .await
     }
 
     async fn analyze_internal(
@@ -241,6 +251,7 @@ impl PiClassifierAnalyzer {
         workspace: Arc<InvocationWorkspace>,
         prior: Option<Arc<PriorObservationProjection>>,
         supplied_request: Option<Arc<PiTriageRequest>>,
+        staged_input: Option<PathBuf>,
     ) -> Result<PiClassifierResult, PiClassifierError> {
         let assigned =
             u64::try_from(assignments.len()).map_err(|_| PiClassifierError::PreparationTask)?;
@@ -358,7 +369,7 @@ impl PiClassifierAnalyzer {
             request
         } else {
             let prior = prior.ok_or(PiClassifierError::InvalidAssignment)?;
-            let findings = prior_findings(&prior, InspectionPhase::Initial)?;
+            let findings = prior_findings(&prior, InspectionPhase::Initial, &manifest)?;
             let invocation_digest =
                 Digest::sha256(format!("{}:{}:{}", self.run_id, self.id, manifest.identity));
             let invocation_suffix = invocation_digest.to_string();
@@ -415,7 +426,7 @@ impl PiClassifierAnalyzer {
             thinking: &self.expected_runtime.thinking,
             proxy_socket_path: proxy.endpoint().host_socket_path(),
             proxy_directory_fd: proxy.endpoint().directory_fd(),
-            analyzer_input_view: view.host_path(),
+            analyzer_input_view: staged_input.as_deref().unwrap_or_else(|| view.host_path()),
             proxy_token: &token,
             analyzer_id: self.id.as_str(),
             run_id: self.run_id.as_str(),
@@ -486,6 +497,7 @@ pub(crate) struct PiClassifierResult {
 fn prior_findings(
     prior: &PriorObservationProjection,
     phase: InspectionPhase,
+    manifest: &ArtifactManifest,
 ) -> Result<Vec<PriorFinding>, PiClassifierError> {
     #[derive(serde::Deserialize)]
     struct Projection {
@@ -532,6 +544,14 @@ fn prior_findings(
         })
         .map(
             |(id, analyzer_id, rule_id, artifact_id, category, severity, location)| {
+                let logical_path = match &manifest
+                    .artifact(&artifact_id)
+                    .ok_or(PiClassifierError::InvalidAssignment)?
+                    .provenance
+                {
+                    Provenance::Physical { logical_path } => logical_path.clone(),
+                    Provenance::Derived { member_path, .. } => member_path.clone(),
+                };
                 let finding_id = FindingId::from_suffix(id.as_str())
                     .map_err(|_| PiClassifierError::PreparationTask)?;
                 PriorFinding::new(
@@ -542,6 +562,7 @@ fn prior_findings(
                     analyzer_id.clone(),
                     rule_id.clone(),
                     artifact_id,
+                    PriorFindingArtifact::WorkingTree { logical_path },
                     category,
                     severity,
                     location,
@@ -553,6 +574,7 @@ fn prior_findings(
                         rule_id: rule_id.clone(),
                         verification_state: CredentialVerificationState::NotApplicable,
                         evidence_token: None,
+                        evidence: None,
                     }],
                 )
                 .map_err(|_| PiClassifierError::PreparationTask)
@@ -724,7 +746,6 @@ mod tests {
                 idle_timeout: Duration::from_secs(1),
                 wall_timeout: Duration::from_secs(2),
                 termination_grace: Duration::from_millis(50),
-                memory_bytes: 64 * 1024 * 1024,
                 cpu_seconds: 1,
                 open_files: 32,
                 stdout_bytes: 1024,
@@ -819,6 +840,9 @@ mod tests {
                     AnalyzerId::new("gitleaks").unwrap(),
                     crate::domain::RuleId::new("generic-password").unwrap(),
                     artifact_id,
+                    PriorFindingArtifact::WorkingTree {
+                        logical_path: fixture.manifest.subjects()[0].relative_path.clone(),
+                    },
                     FindingCategory::Credential,
                     Severity::Medium,
                     None,
@@ -829,6 +853,9 @@ mod tests {
                         rule_id: crate::domain::RuleId::new("generic-password").unwrap(),
                         verification_state: CredentialVerificationState::Unverified,
                         evidence_token: Some(Digest::sha256(b"opaque-hmac")),
+                        evidence: crate::analyzers::pi::triage::MatchedEvidence::from_bytes(
+                            b"password = example",
+                        ),
                     }],
                 )
                 .unwrap()],
@@ -911,6 +938,7 @@ mod tests {
                 assignments,
                 Arc::clone(&fixture.workspace),
                 request,
+                None,
             )
             .await
             .unwrap();

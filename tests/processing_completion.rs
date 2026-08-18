@@ -368,7 +368,7 @@ fn cancellation_before_sealing_leaves_the_stage_unapproved() {
 }
 
 #[test]
-fn handoff_sealing_rejects_absolute_and_escaping_preserved_symlinks() {
+fn handoff_sealing_preserves_absolute_and_escaping_symlink_text_without_following() {
     for (suffix, target) in [
         ("absolute-link", "/etc/passwd"),
         ("escape-link", "../outside"),
@@ -390,15 +390,18 @@ fn handoff_sealing_rejects_absolute_and_escaping_preserved_symlinks() {
             cancellation: &fixture.cancellation,
         })
         .unwrap();
-        assert!(matches!(
-            revalidate_and_seal(
-                &lease.paths().stage(),
-                &acquired.entries,
-                acquired.manifest_identity,
-                &fixture.cancellation,
-            ),
-            Err(CompletionError::UnsafeHandoffSymlink)
-        ));
+        let sealed = revalidate_and_seal(
+            &lease.paths().stage(),
+            &acquired.entries,
+            acquired.manifest_identity,
+            &fixture.cancellation,
+        )
+        .unwrap();
+        assert_eq!(sealed.manifest_identity(), acquired.manifest_identity);
+        assert_eq!(
+            fs::read_link(lease.paths().stage().join("unsafe-link")).unwrap(),
+            PathBuf::from(target)
+        );
     }
 }
 

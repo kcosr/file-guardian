@@ -120,10 +120,7 @@ sandbox = "tool-sidecar-bubblewrap-v1"
 # Pi is a normal host process for model transport. Its persistent Bubblewrap
 # tool sidecar is networkless.
 network = "pi_host_sidecar_none"
-runtime_root = "/opt/file-guardian/pi-runtime"
-runtime_manifest = "runtime-manifest.json"
-launcher = "bin/node"
-pi_entrypoint = "lib/pi/dist/cli.js"
+pi_executable = "/usr/local/bin/pi"
 bubblewrap_executable = "/usr/bin/bwrap"
 expected_bubblewrap_version = "0.11.1"
 expected_pi_version = "0.83.0"

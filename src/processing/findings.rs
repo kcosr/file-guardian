@@ -138,6 +138,7 @@ pub struct NormalizedPhaseFindings {
     pub findings: Vec<Finding>,
     pub correlations: Vec<Correlation>,
     pub observation_to_finding: BTreeMap<ObservationId, FindingId>,
+    pub observation_to_occurrence: BTreeMap<ObservationId, OccurrenceId>,
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -244,6 +245,7 @@ pub fn normalize_findings(
     let mut findings = Vec::with_capacity(grouped.len());
     let mut occurrences = Vec::with_capacity(observations.len());
     let mut observation_to_finding = BTreeMap::new();
+    let mut observation_to_occurrence = BTreeMap::new();
     for (finding_key, records) in grouped {
         let first = &records[0].occurrence;
         let finding_id =
@@ -265,7 +267,8 @@ pub fn normalize_findings(
             occurrence_ids,
         )?);
         for record in records {
-            observation_to_finding.insert(record.source_id, finding_id.clone());
+            observation_to_finding.insert(record.source_id.clone(), finding_id.clone());
+            observation_to_occurrence.insert(record.source_id, record.occurrence.id.clone());
             occurrences.push(record.occurrence);
         }
     }
@@ -278,6 +281,7 @@ pub fn normalize_findings(
         findings,
         correlations,
         observation_to_finding,
+        observation_to_occurrence,
     })
 }
 

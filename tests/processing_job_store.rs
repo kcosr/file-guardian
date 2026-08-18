@@ -73,7 +73,6 @@ fn creates_the_exact_private_layout_and_durable_initial_records() {
 
     let expected_directories = [
         "stage",
-        "source-repository",
         "private",
         "private/initial",
         "private/initial/manifest",
@@ -603,7 +602,6 @@ fn all_public_paths_remain_beneath_the_validated_run() {
     let lease = store.create(&run("paths"), lease_identity(), 0).unwrap();
     for path in [
         lease.paths().stage(),
-        lease.paths().source_repository(),
         lease.paths().private_root(),
         lease.paths().initial_root(),
         lease.paths().verification_root(),

@@ -290,35 +290,39 @@ fn processing_outcome(value: Outcome) -> ProcessingOutcome {
 
 fn source_summary(source: &ProcessSource) -> Result<SourceSummary, ReportBuildError> {
     Ok(match source {
-        ProcessSource::Path { input_kind } => SourceSummary::Path {
+        ProcessSource::Path {
+            input_kind,
+            repository,
+        } => SourceSummary::Path {
             input_kind: match input_kind {
                 PathInputKind::File => InputKind::File,
                 PathInputKind::Directory => InputKind::Directory,
             },
-        },
-        ProcessSource::Repo {
-            repository_id,
-            resolved_head,
-            working_tree,
-            bare,
-            history,
-            frozen_refs,
-        } => SourceSummary::Repo {
-            repository_id: digest(*repository_id)?,
-            resolved_head: git_object_id(resolved_head)?,
-            working_tree: *working_tree,
-            bare: *bare,
-            history: history_scope(*history),
-            frozen_refs: frozen_refs
-                .iter()
-                .map(|reference| {
-                    Ok(FrozenRefSummary {
-                        name: reference.name.clone(),
-                        object_id: git_object_id(&reference.object_id)?,
-                        peeled_commit_id: git_object_id(&reference.peeled_commit_id)?,
-                    })
+            repository: repository
+                .as_ref()
+                .map(|repository| {
+                    Ok::<_, ReportBuildError>(
+                        crate::processing::report::DetectedRepositorySummary {
+                            repository_id: digest(repository.repository_id)?,
+                            resolved_head: git_object_id(&repository.resolved_head)?,
+                            history: history_scope(repository.history),
+                            frozen_refs: repository
+                                .frozen_refs
+                                .iter()
+                                .map(|reference| {
+                                    Ok(FrozenRefSummary {
+                                        name: reference.name.clone(),
+                                        object_id: git_object_id(&reference.object_id)?,
+                                        peeled_commit_id: git_object_id(
+                                            &reference.peeled_commit_id,
+                                        )?,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, ReportBuildError>>()?,
+                        },
+                    )
                 })
-                .collect::<Result<Vec<_>, ReportBuildError>>()?,
+                .transpose()?,
         },
         ProcessSource::Git {
             transport,
@@ -827,11 +831,6 @@ fn adjudication_summaries(
                     DomainAdjudicationState::Applied => AdjudicationState::Applied,
                     DomainAdjudicationState::Rejected => AdjudicationState::Rejected,
                 },
-                clearance_rule_id: value
-                    .clearance_rule_id
-                    .as_ref()
-                    .map(|id| safe(id.as_str()))
-                    .transpose()?,
                 reason_code: safe(adjudication_reason(value.reason))?,
             })
         })
@@ -847,12 +846,8 @@ fn adjudication_reason(value: AdjudicationReason) -> &'static str {
         AdjudicationReason::AdvisoryOnly => "advisory_only",
         AdjudicationReason::ClearedFalsePositive => "cleared_false_positive",
         AdjudicationReason::AssessmentNotFalsePositive => "assessment_not_false_positive",
-        AdjudicationReason::ConfidenceTooLow => "confidence_too_low",
-        AdjudicationReason::ReasonCodeMismatch => "reason_code_mismatch",
-        AdjudicationReason::NonClearable => "non_clearable",
         AdjudicationReason::CorrelationNotCleared => "correlation_not_cleared",
         AdjudicationReason::IncompleteRequiredAnalysis => "incomplete_required_analysis",
-        AdjudicationReason::AmbiguousClearanceRule => "ambiguous_clearance_rule",
     }
 }
 

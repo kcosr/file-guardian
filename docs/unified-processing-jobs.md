@@ -10,9 +10,9 @@ Processing report schema: `2`
 
 ## Purpose
 
-File Guardian SHALL process an upload tree, local repository, or remotely
-acquired Git repository through one fail-closed job engine. A job owns a private
-copy of the candidate content, executes a configured pipeline of built-in
+File Guardian SHALL process either a caller directory or an HTTPS/SSH Git
+repository through one fail-closed job engine. A job owns the exact staged
+candidate content, executes a configured pipeline of built-in
 rules, first-party open-source scanner adapters, and optional Pi review,
 optionally removes or quarantines whole files from the owned copy, verifies the
 result from scratch, and emits one durable machine-readable report.
@@ -32,10 +32,40 @@ It returns a sealed stage or opaque stage reference only when the configured
 policy and all required coverage allow it. A separate caller decides where the
 stage is ultimately moved.
 
+### Product and trust model
+
+File Guardian has one acquisition and inspection workflow with exactly two
+source forms. `process path` copies a caller directory exactly into the
+job-owned stage. `process git` clones an HTTPS/SSH remote directly into that
+stage. Both preserve `.git` when it exists. After a path copy, File Guardian
+detects whether the owned stage is a valid Git worktree and, if so, applies the
+same configured Git-aware analysis as a remote clone. There is no separate
+local-repository command, hidden acquisition repository, or stripped
+source-tree projection. Optional Git history is analyzed from the staged
+repository itself.
+
+Pi is a trusted semantic scanner. Deterministic scanners deliberately trade
+context for speed and may report false positives. Pi receives their findings,
+the actual matched evidence, surrounding context, and read-only access to the
+complete staged files and selected historical artifacts. A configured
+authoritative Pi review may confirm or override a deterministic finding. The
+original finding and Pi's assessment both remain in the report.
+
+The sandbox is an accidental-mutation boundary, not a confidentiality or
+adversarial-agent boundary. Pi may read password-bearing candidate content and
+ordinary host files. The host filesystem and candidate stage are mounted
+read-only, while a dedicated scratch directory is writable. Pi uses the normal
+administrator-installed runtime and shared libraries; File Guardian does not
+construct, copy, inspect, or attest a private runtime closure.
+
+Report privacy is a separate boundary. Reports, logs, and durable public state
+do not contain matched passwords or raw file contents even though the trusted
+Pi invocation may inspect them.
+
 This contract evolves the existing schema-v2 `authorize PATH` foundation. It
 preserves immutable capture, canonical artifacts, the generic ordered pipeline,
-safe prior-observation projections, centralized policy, and the existing Pi
-host plus persistent networkless Bubblewrap tool sidecar. It replaces the
+prior-observation projections, centralized policy, and the existing Pi host
+plus persistent Bubblewrap tool sidecar. It replaces the
 caller-owned live transaction with a File Guardian-owned processing job and
 implements the previously reserved external-analyzer, action, verification,
 and `allow_modified` seams.
@@ -51,7 +81,7 @@ The first complete release does not:
 - edit or redact byte ranges inside a file;
 - hydrate Git LFS objects or recursively acquire submodules;
 - let analyzers choose filesystem paths, actions, outcomes, or dispositions;
-- let Pi replace deterministic scanners or make a policy decision directly;
+- run without deterministic scanners when a profile requires them;
 - promise secure erasure when a stage is discarded;
 - inspect dangling Git objects, reflogs, or refs outside the frozen configured
   ref set;
@@ -66,29 +96,33 @@ merely because text analyzers mark them not applicable.
 
 1. Every source is acquired into a freshly and exclusively created private job
    stage. The original source is never scanned-and-mutated in place.
-2. All analyzers inspect immutable captured objects or generated read-only
-   views. They never reopen the mutable stage or the acquisition repository.
+2. Deterministic analyzers inspect immutable captured objects or generated
+   read-only views. Pi receives the exact stage read-only, including `.git`,
+   while the job lease prevents host mutation during analysis.
 3. Required execution, findings, and coverage are independent dimensions.
    Missing tools, malformed output, unsupported versions, timeouts, crashes,
    truncation, or unapproved coverage gaps produce `error`, never an implicit
    clean result.
-4. File Guardian freezes the source scope, artifact assignments, exact tool
-   identities, rules/config identities, and pipeline identity before analysis.
-5. Git scope is enumerated by File Guardian. Individual scanners neither
-   receive `.git` nor reinterpret refs/history.
+4. File Guardian freezes the source scope, artifact assignments, configured
+   tool/version expectations, rules/config identities, and pipeline identity
+   before analysis.
+5. File Guardian freezes Git scope and assigns deterministic history artifacts.
+   Deterministic scanner adapters do not reinterpret refs; trusted Pi may use
+   normal Git commands against the exact staged repository.
 6. Analyzers return observations and coverage only. The policy engine resolves
    them. The action executor alone mutates the owned stage.
-7. Pi is advisory by default. It may clear a narrow deterministic finding only
-   when an explicit profile rule grants that exact authority and every
-   anti-false-allow gate succeeds. The original finding remains in the report.
+7. Pi is advisory by default. An explicit authoritative profile permits its
+   assessment to clear a deterministic finding routed to Pi adjudication. The
+   original finding remains in the report.
 8. `allow_modified` requires at least one journaled stage mutation followed by
    a new immutable capture and a complete rerun of every required analyzer on
    the final manifest.
 9. A retained handoff is bound to the final manifest and report. Post-seal
    mutation invalidates it.
-10. Reports and safe analyzer projections contain no matched secret, raw
-    snippet, native scanner output, model prompt/transcript, credential,
-    acquisition URL, absolute source path, or private analysis path.
+10. Reports contain no matched secret, raw snippet, native scanner output,
+    model prompt/transcript, credential, acquisition URL, absolute source path,
+    or private analysis path. Pi's private request and read-only content tools
+    may contain the evidence required for semantic review.
 11. Cancellation kills and reaps every acquisition, scanner, and Pi child;
     prohibits `allow` and `allow_modified`; records a terminal job state; and
     applies the configured cancellation/error disposition.
@@ -106,13 +140,7 @@ file-guardian [--config FILE] process
     [--profile PROFILE_ID]
     [--request-id ID]
     [--action-mode evaluate|apply]
-    path PATH
-
-file-guardian [--config FILE] process
-    [--profile PROFILE_ID]
-    [--request-id ID]
-    [--action-mode evaluate|apply]
-    repo [--ref REF] PATH
+    path DIRECTORY
 
 file-guardian [--config FILE] process
     [--profile PROFILE_ID]
@@ -133,24 +161,15 @@ file-guardian [--config FILE] job recover
 file-guardian [--config FILE] daemon [--job JOB_ID ...]
 ```
 
-`process path` accepts exactly one literal regular file or directory as an
-ordinary filesystem tree. It does not expand globs, infer Git semantics, or
-permit a profile whose history scope is not `none`. A `.git` entry is ordinary
-payload in this source kind. It copies the source into a job-owned stage and
-does not remove or modify the source.
-
-`process repo` accepts one local Git repository. A non-bare repository can
-provide working-tree and history surfaces. It freezes the repository database
-and working-tree state separately, excludes the Git administrative directory
-or file from the publication stage, and includes tracked modifications,
-tracked deletions, untracked files, and ignored files according to the profile's
-explicit working-tree inclusion policy. It does not follow a linked worktree's
-`.git` indirection into the stage. A bare repository is accepted only by a
-`purpose = "report_only"`, `working_tree = false` profile and never creates or
-hands off a publication stage.
-Local repository discovery, resolved common directory, current HEAD, ref map,
-index identity, and worktree status are captured and revalidated during
-acquisition. The original working tree and object database are never mutated.
+`process path` accepts exactly one literal directory and does not expand globs.
+The directory is copied exactly into a job-owned stage,
+including `.git`, tracked modifications, tracked deletions, untracked files,
+ignored files, and preserved symlink entries. The source is never removed or
+modified. After copying, File Guardian detects Git only from the owned stage.
+If it is a valid Git worktree, File Guardian freezes its current HEAD and
+configured refs and enables the selected history surface. If a profile requires
+history but the stage is not a valid Git worktree, acquisition fails with exit
+`30`.
 
 `process git` accepts only:
 
@@ -162,7 +181,9 @@ It rejects `http`, `file`, local path, `ext`, helper, option-looking, malformed,
 and unknown transports. The configured absolute Git executable is invoked
 directly with an argument vector, never through a shell. The optional ref is a
 bounded validated value that cannot become an option. The resolved commit, not
-the human ref text, becomes the source identity.
+the human ref text, becomes the source identity. The clone is created directly
+in the job stage, and `.git` remains part of the exact inspection and handoff
+candidate.
 
 Configuration selects the Git surfaces and ref set. `--ref` selects the
 materialized HEAD but does not reduce configured history coverage. It must
@@ -247,8 +268,9 @@ Rules:
   `deny`.
 - Evaluate mode returns `deny` when allowing the stage would require mutation.
 - Apply mode performs at most one remediation pass.
-- A new or residual remediable finding during verification is `error`; the
-  engine does not enter a remediation loop.
+- Any non-allow result or operational failure during verification is `error`;
+  the engine does not enter a remediation loop, roll the verified mutation
+  back, or expose a handoff. It quarantines the modified job stage.
 - A required Pi failure is `error`. An advisory Pi failure is a recorded
   degradation and cannot weaken a deterministic blocker.
 - The process prints exactly one compact JSON report plus one newline. Logs and
@@ -266,8 +288,7 @@ jobs/<run-id>/
   resolution-initial.json        # durable resolved evidence before final checks
   resolution-verification.json   # present only after actions
   decision.json                  # private pre-disposition terminal proposal
-  stage/                         # mutable publication candidate until sealed
-  source-repository/             # Git acquisition only; never handed off
+  stage/                         # exact copied directory or direct Git clone
   private/
     initial/{manifest,objects}/
     verification/{manifest,objects}/
@@ -404,14 +425,12 @@ the processing report and instead binds its immutable digest.
 
 ### Local paths
 
-Local acquisition descriptor-copies a literal regular file or directory into
-the private stage. It:
+Local acquisition descriptor-copies one literal directory into the private
+stage. It:
 
-- rejects a root symlink or special file;
-- applies one explicit profile policy to descendant symlinks:
-  `reject` fails acquisition, while `preserve` copies the link entry and target
-  bytes without resolving it; the default is `reject` for ordinary upload
-  profiles;
+- rejects a root symlink, regular-file operand, or special-file operand;
+- preserves every descendant symlink entry and its target bytes exactly without
+  resolving or opening the target;
 - rejects special files, mount crossings, unreadable entries, source
   instability, and configured limit overflow;
 - copies ordinary source hardlinks as independent stage files rather than
@@ -420,13 +439,13 @@ the private stage. It:
 - records a stage manifest after the copy;
 - never exposes the absolute source path in the report.
 
-`preserve` adds a typed `symbolic_link` artifact and stage entry. Capture and
+Every symlink adds a typed `symbolic_link` artifact and stage entry. Capture and
 handoff manifests bind its logical path, entry type, link-target bytes, and
 publication mode; analyzers may inspect the target string as data but no File
-Guardian component follows it. Absolute and escaping targets are preserved as
-untrusted data only when policy explicitly permits them and SHOULD normally
-resolve to a path-hygiene finding. A preserved link never counts as completed
-regular-file content inspection. The stage remains semantically a tree with a
+Guardian component follows it. Absolute and escaping targets remain exact
+staged content and MAY independently produce a path-hygiene finding. A
+preserved link never counts as completed regular-file content inspection. The
+stage remains semantically a tree with a
 link, not a regular file containing the target text.
 
 The source can contain arbitrary bytes. Binary files, archives, core files,
@@ -472,15 +491,12 @@ is an acquisition error. Protected Git configuration is likewise opened,
 hashed, and revalidated. Scanner tool pinning uses the stronger descriptor-
 backed rule described below.
 
-The clone target is `source-repository/`, which never becomes a scanner input
-or handoff payload. File Guardian removes or redacts authenticated remote data
-from retained repository metadata. After refs and objects are materialized,
-File Guardian deletes the private clone's `remote.*.url`, credential-bearing
-config, `FETCH_HEAD`, bounded native diagnostics, and other acquisition-only
-metadata, or deletes the entire source repository when no recovery operation
-needs it. The publication `stage/` is materialized
-with Git plumbing rather than a normal checkout so hooks, filters, submodules,
-and LFS cannot execute implicitly.
+The clone target is the job's `stage/`. File Guardian initializes `.git`,
+fetches the frozen selected refs, materializes the selected HEAD with Git
+plumbing so hooks, filters, submodules, and LFS cannot execute implicitly, and
+retains `.git` for Pi, history review, and final handoff. Before analysis it
+removes credential-bearing remote URLs, `FETCH_HEAD`, native diagnostics, and
+other acquisition-only authentication data from that staged repository.
 
 ### Git surfaces
 
@@ -493,11 +509,12 @@ history = "head"              # none | head | reachable | all_refs
 history_ref_patterns = []
 ```
 
-At least one surface is required.
+`working_tree` must be `true`. History is an optional second dimension; schema
+3 does not support a history-only job with no stage.
 
-- `working_tree`: the deliverable filesystem bytes, including acquired tracked
-  files and any intentionally copied local modifications/untracked files,
-  excluding `.git`.
+- `working_tree`: the publication files in the exact stage. `.git` is retained
+  as staged repository metadata and is available to Pi/Git tools, but ordinary
+  working-tree detector assignments exclude Git administrative internals.
 - `head`: the exact tree referenced by the frozen resolved HEAD commit.
 - `reachable`: every commit reachable from HEAD plus every advertised/local ref
   matching `history_ref_patterns`.
@@ -524,12 +541,9 @@ The configured/CLI checkout ref must match
 `allowed_checkout_ref_patterns`; it chooses resolved HEAD and is always added
 to the history root set. It does not implicitly add unrelated refs.
 
-`reachable` and `all_refs` include the exact HEAD object graph but do not imply
-`working_tree = true`. Every `purpose = "handoff"` profile MUST set
-`working_tree = true`; configuration rejects otherwise. A
-`purpose = "report_only"` history-only job has no available stage, cannot use a
-retain/handoff disposition, and never emits a stage receipt. This prevents an
-unscanned dirty or untracked deliverable from being approved.
+`reachable` and `all_refs` include the exact HEAD object graph in addition to
+the mandatory staged working tree. A `purpose = "report_only"` profile still
+uses the same stage and analyzers but cannot retain or hand off that stage.
 
 Before analysis, File Guardian freezes:
 
@@ -548,9 +562,11 @@ followed.
 File Guardian owns history enumeration through bounded Git plumbing. It lists
 commit/tree/blob provenance, reads blobs through a batch interface, hashes the
 bytes into the existing immutable object store, and emits deterministic
-artifacts. Scanners do not receive `.git`, reclone, run `git log`, or select
-their own ref scope. This guarantees that all analyzers share one frozen source
-interpretation.
+artifacts. Deterministic scanner adapters do not receive `.git`, reclone, run
+`git log`, or select their own ref scope. Trusted Pi also receives this frozen
+scope and may run ordinary Git commands against the same staged `.git`. This
+keeps detector coverage deterministic without hiding repository context from
+semantic review.
 
 Git artifacts extend, rather than weaken, the existing source-neutral domain:
 
@@ -562,17 +578,17 @@ Git artifacts extend, rather than weaken, the existing source-neutral domain:
 - the internal object-store identity used by analyzer views.
 
 Symlink blobs are represented as typed `symbolic_link` entries with their
-link-target bytes and are never followed. Git materialization applies the same
-explicit `reject|preserve` stage policy; `preserve` creates a symlink and the
-extended Snapshotter captures it without traversal. Gitlinks are explicit
+link-target bytes and are never followed. Git materialization creates the exact
+symlink entry and the stage capture records it without traversal. Gitlinks are explicit
 unsupported/submodule coverage. Multiple
 paths/commits may reference one immutable blob; the object bytes are stored
 once while bounded provenance occurrences remain reportable.
 
 Deleting a working-tree file cannot remediate a HEAD or history finding. A
 blocking historical finding remains blocking until a future explicit history
-rewrite exists. A clean source-tree delivery contains no `.git`; it must not be
-described as a clean repository history when required history remains dirty.
+rewrite exists. The staged repository retains `.git`; a clean current worktree
+must not be described as clean repository history when required history remains
+dirty.
 
 ## Immutable capture and assignments
 
@@ -634,16 +650,18 @@ immutable assigned artifacts
   -> built-in deterministic rules
   -> open-source deterministic scanners
   -> normalized/correlated findings
-  -> optional Pi triage using safe prior findings
+  -> optional Pi triage using prior findings and evidence
   -> complete coverage validation
   -> centralized policy
   -> optional actions
   -> fresh full verification pipeline
 ```
 
-Later stages receive only host-produced bounded projections. Raw scanner JSON,
-matched values, snippets, process output, and analyzer scratch never enter
-those projections.
+Later deterministic stages receive host-produced bounded projections. Pi
+receives normalized findings plus the bounded matched evidence and immutable
+content access needed to evaluate them. Raw scanner process output and analyzer
+scratch are not forwarded because they are scanner-specific diagnostics, not
+because Pi is untrusted.
 
 ## External scanner runtime
 
@@ -711,15 +729,11 @@ native protocol interpretation are implementation invariants. A potentially
 blocking scanner cannot be disabled during verification. Configuration rejects
 an artifact kind/source surface the selected adapter does not support.
 
-An executable containing no slash is resolved once against the File Guardian
-startup `PATH`. Empty and relative PATH components are rejected. A path with a
-slash must be absolute. Resolution opens and holds the exact regular executable,
-freezes its file identity, content digest, and supported version, and uses a
-descriptor-backed read-only sandbox bind so PATH replacement cannot change the
-executed object. Initial adapters require a self-contained/static supported
-release binary; an unpinned dynamic runtime closure is rejected. Protected
-scanner configuration is likewise held through verified descriptors. Identity
-is checked again after every invocation. Absence, replacement, or version
+An executable containing no slash is resolved against the File Guardian
+startup `PATH`; a path with a slash must be absolute. File Guardian validates
+the configured supported version before use. Executables use their normal host
+runtime and shared libraries. Protected scanner configuration remains
+administrator-owned and enters the pipeline identity. Absence or version
 mismatch is a configuration/runtime error; File Guardian never downloads a
 tool or changes PATH implicitly.
 
@@ -741,19 +755,19 @@ The generic delegate supervisor provides:
 
 - a generated immutable candidate view, read-only at the OS boundary;
 - private output/scratch outside the stage;
-- a minimal cleared environment;
+- the normal administrator-installed runtime on a read-only host filesystem;
 - disabled network on Linux;
 - bounded wall time, process group, memory/CPU/file descriptors where
   supported, and stdout/stderr/output sizes;
 - cancellation-safe termination and reap;
-- strict parsing of bounded hostile output;
+- strict parsing of bounded scanner output;
 - mapping only to host-assigned artifact IDs and validated relative locations.
 
-This confinement contract is required, not best effort. In the first release,
-external scanner execution is Linux-only and requires the reviewed Bubblewrap
-boundary. Selecting Gitleaks or TruffleHog on macOS or a Linux host without that
-boundary is a typed required-analyzer error; the platform never silently runs
-an unconfined scanner. macOS remains supported for built-in-only processing.
+This accidental-write confinement contract is required, not best effort. In
+the first release, external scanner execution is Linux-only and requires
+Bubblewrap. Selecting Gitleaks or TruffleHog on macOS or a Linux host without
+that boundary is a typed required-analyzer error. macOS remains supported for
+built-in-only processing.
 
 Native exit is never interpreted generically. Each adapter independently
 reports execution status, findings, and coverage. A required process can exit
@@ -857,17 +871,19 @@ as uncertain rather than treating it as the same cleared finding.
 
 ### Authority boundary
 
-Pi remains an analyzer, not the policy engine. It cannot emit an outcome,
-execute an action, choose a disposition, delete a finding, or change coverage.
-It receives normalized safe prior findings and read-only access to assigned
-immutable content through the existing authenticated proxy and persistent
-networkless Bubblewrap sidecar. Bash and other tools execute only inside that
-sidecar; the Pi host process retains model networking and its explicit provider
-credential but has no direct file tools.
+Pi is the trusted semantic analyzer. It does not directly mutate files or emit
+an operating-system action; the host maps its assessment through the selected
+profile so job outcomes and durable actions remain deterministic and auditable.
+In authoritative mode, that mapping deliberately permits Pi to override an
+incorrect deterministic finding.
 
-Repository content and scanner text are untrusted prompt input. The sidecar
-cannot read Git credentials, acquisition environment, private object store,
-host paths, or unassigned artifacts and cannot write the stage.
+Pi receives normalized prior findings, their actual bounded evidence, and
+read-only access to the complete immutable stage and selected Git-history
+artifacts. Its shell runs with the ordinary host filesystem visible read-only
+and a dedicated writable scratch directory. The sandbox prevents accidental
+host or stage modification; it does not conceal candidate passwords, host
+files, the installed runtime, or shared libraries from Pi. The Pi host process
+retains model networking and its configured provider credentials.
 
 Pi phase execution is explicit:
 
@@ -881,9 +897,9 @@ Required Pi participates in phase completeness and fails the job on any
 execution/coverage/protocol failure. Advisory Pi runs after the complete
 required pipeline; its failure is recorded in a bounded `degradations` array,
 does not create a report `issue`, and cannot change required coverage or a
-deterministic resolution. A successful advisory assessment can annotate only
-existing findings. Any profile allowing false-positive clearance requires Pi
-in the applicable initial phase, and in verification whenever actions run.
+deterministic resolution. A successful advisory assessment annotates existing
+findings. Any profile granting authoritative adjudication requires Pi in the
+applicable initial phase, and in verification whenever actions run.
 The profile's `pi_adjudication.required_initial` and
 `required_after_actions` are validation assertions, not overrides: they must
 agree with `analyzers.execution.initial = "required"` and
@@ -900,14 +916,15 @@ The host creates a canonical bounded request containing:
 - resolved working-tree/history surfaces and safe Git provenance;
 - complete prior analyzer status/coverage;
 - `finding_id`, `correlation_id`, occurrence analyzer/version/rule, category,
-  severity, validated logical location, verification state, and job-local
-  evidence token;
+  severity, validated logical location, verification state, the actual bounded
+  matched evidence, and surrounding context;
 - explicit omission/truncation flags;
 - on verification, safe action codes and initial-to-final finding correlation.
 
-It never includes raw scanner output, a secret, snippet, prompt transcript,
-chain of thought, absolute path, URL, credential, environment value, or the
-evidence-token key.
+The private request may contain passwords and snippets because Pi needs that
+evidence to judge the scanner. It does not contain unrelated scanner stdout or
+stderr, host credentials, acquisition URLs, or environment dumps. Those are
+operational diagnostics rather than review evidence.
 
 ### Terminal schema
 
@@ -946,53 +963,27 @@ tool. The conceptual schema is:
 
 Closed classifications are `confirmed`, `likely_true_positive`,
 `likely_false_positive`, `false_positive`, `uncertain`, and
-`unable_to_assess`. Only exact `false_positive` is ever eligible for policy
-clearance. Confidence remains `low|medium|high`; it is not a probability.
+`unable_to_assess`. Only exact `false_positive` clears a routed deterministic
+finding. Confidence remains `low|medium|high`; it is audit metadata, not a host
+threshold.
 Reason codes and recommended actions are closed administrator vocabularies.
 Recommended actions are advisory only.
 
 Every assigned finding appears exactly once. Duplicate, missing, unknown,
 stale, later-stage, wrong-phase, wrong-manifest, wrong-request, invalid-location,
-oversized, or trailing submissions fail the required Pi run. Pi-added candidate
-concerns are not part of triage schema 1; new concern discovery remains an
-ordinary separately configured Pi classification role until a closed candidate
-observation/policy lifecycle is specified.
+oversized, or trailing submissions fail the required Pi run. Pi's whole-stage
+attestation also lets it block a stage when semantic review finds a concern the
+deterministic scanners missed.
 
 The stage attestation vocabulary is
 `no_blocking_concerns_observed|blocking_concerns_observed|unable_to_assert`.
-It describes only the exact assigned snapshot and configured review surface;
-it never claims universal cleanliness.
+In advisory mode it is recorded only. In authoritative mode,
+`blocking_concerns_observed` denies the unchanged stage and
+`unable_to_assert` makes required Pi analysis incomplete. After an action, any
+result other than `no_blocking_concerns_observed` is an error because the
+modified stage was not accepted by its trusted semantic scanner.
 
-Pi emits evidence; the host maps that closed evidence through one configured
-attestation policy:
-
-```toml
-[processing.profiles.pi_adjudication.attestation]
-initial = "advisory" # advisory | deny_on_blocking | require_no_blocking
-post_action = "require_no_blocking"
-```
-
-- `advisory` records every code without changing policy.
-- `deny_on_blocking` maps `blocking_concerns_observed` to a host-generated
-  blocking resolution, while `unable_to_assert` is an annotation when Pi
-  execution and assessment coverage otherwise completed.
-- `require_no_blocking` accepts only `no_blocking_concerns_observed`;
-  `blocking_concerns_observed` maps to deny and `unable_to_assert` maps to a
-  required-analysis error.
-
-`initial = "deny_on_blocking|require_no_blocking"` requires the Pi analyzer's
-initial execution be `required`; `post_action` with either non-advisory value
-requires verification execution be `required` and
-`pi_adjudication.required_after_actions = true`. Advisory Pi execution permits
-only `attestation.initial|post_action = "advisory"`. Validation rejects every
-disagreement.
-
-An initial host-mapped deny returns `deny` on an unchanged stage. After any
-action, either nonaccepted code follows the closed post-mutation table and
-returns error plus whole-job quarantine. Thus Pi never chooses an outcome; it
-returns a code whose deterministic policy mapping is frozen in the profile.
-
-### Policy-controlled false-positive clearance
+### Trusted Pi adjudication
 
 Default mode is advisory:
 
@@ -1002,68 +993,47 @@ analyzer = "pi-triage"
 mode = "advisory"
 ```
 
-An authoritative profile may grant narrow clearance:
+An authoritative profile permits Pi to decide whether deterministic findings
+are correct:
 
 ```toml
 [processing.profiles.pi_adjudication]
 analyzer = "pi-triage"
-mode = "clear_false_positives"
+mode = "authoritative"
 required_initial = true
 required_after_actions = true
-minimum_confidence = "high"
-
-[processing.profiles.pi_adjudication.attestation]
-initial = "deny_on_blocking"
-post_action = "require_no_blocking"
-
-[processing.profiles.pi_adjudication.non_clearable]
-categories = ["private_key"]
-minimum_severity = "critical"
-verification_states = ["verified"]
-hard_block_rules = ["builtin/private-key", "gitleaks/private-key"]
-
-[[processing.profiles.pi_adjudication.clearance_rules]]
-id = "documented-fixture-passwords"
-analyzer = "gitleaks"
-rules = ["generic-password"]
-categories = ["credential"]
-maximum_severity = "medium"
-verification_states = ["unverified"]
-reason_codes = ["documented_test_fixture", "example_placeholder"]
 ```
 
-Clearance requires all of:
+Authoritative adjudication applies when:
 
-1. exactly one explicit clearance rule matches;
-2. classification is `false_positive`, confidence and reason codes satisfy the
-   rule;
-3. finding/request/prior/phase/manifest identities match;
-4. Pi assesses every assigned finding and artifact coverage is complete;
-5. every required deterministic analyzer completed without gaps;
-6. the finding does not match a fixed or configured non-clearable selector;
-7. every blocking occurrence in the correlation group independently qualifies;
-8. sandbox/tool accounting and snapshot stability are complete;
-9. when mutation occurs, a fresh complete deterministic and Pi verification run
-    succeeds on the final manifest.
+1. the profile explicitly selects `mode = "authoritative"`;
+2. the finding is routed through an `adjudicate` policy binding;
+3. the finding/request/phase/manifest identities match;
+4. Pi assessed every assigned finding and completed its assigned artifact
+   review;
+5. every required deterministic analyzer completed without gaps; and
+6. after a mutation, a fresh deterministic and Pi verification run succeeds on
+   the final manifest.
 
-Wildcards, overlapping clearance rules, and clearance of configured
-non-clearable verified credentials, private keys, critical/hard-block rules, or
-incomplete analysis are invalid. Fixed built-in non-clearable categories/rules
-are versioned domain policy and administrator additions may only make the set
-stricter.
+For a routed finding, `false_positive` clears the deterministic blocker.
+`confirmed`, `likely_true_positive`, `likely_false_positive`, `uncertain`, and
+`unable_to_assess` do not clear it. Confidence and reason codes remain useful
+audit information but do not override the trusted classification. There are no
+fixed non-clearable categories, severity gates, private-key exceptions, or
+secondary per-rule clearance allowlists. The ordinary `adjudicate` binding is
+the administrator's explicit scope grant.
 
 An unchanged false-positive-only job needs one complete required initial Pi
 assessment, then final descriptor revalidation and sealing of the identical
 stage; it does not run an artificial verification phase. It may return
-`allow`/`0`. `required_after_actions` and `attestation.post_action`
-apply only when an action committed. Profiles that want a second unmodified
+`allow`/`0`. `required_after_actions` applies only when an action committed.
+Profiles that want a second unmodified
 attestation MAY select a separate required final-review stage explicitly; that
 is a normal second initial-phase stage, not verification.
 
 The report retains the deterministic finding and adds the Pi assessment plus
-an adjudication state `not_requested|advisory|applied|rejected`, the matching
-clearance-rule ID, and a closed application/rejection reason. Pi never makes a
-finding disappear.
+an adjudication state `not_requested|advisory|applied|rejected` and a closed
+application/rejection reason. Pi never makes a finding disappear.
 
 ## Policy and action planning
 
@@ -1083,7 +1053,7 @@ The planner evaluates the complete initial result before mutation:
 
 - any surviving unconditional `deny` suppresses all mutations;
 - only physical files in the owned stage are actionable;
-- history-only and nonphysical findings are not actionable;
+- historical and other nonphysical findings are not actionable;
 - multiple findings on one file coalesce deterministically;
 - `quarantine` dominates `delete`, which dominates `audit`;
 - no analyzer-supplied path is used as an operating-system path.
@@ -1112,14 +1082,15 @@ mutation, and never contains removed bytes.
   fsyncs and verifies the digest, atomically renames the copy, and only then
   removes the source. Failure leaves the source intact.
 
-Before the first action, failure leaves the initial stage unchanged. Once one
-action is durably applied, every action, recapture, analyzer, Pi, policy,
-verification, cleanup, or final non-allow result produces `error`/`30` and a
-mandatory effective whole-job quarantine regardless of the profile's configured
-error disposition. The executor MAY attempt reverse-order rollback to make
-operator recovery easier, but rollback never restores handoff eligibility in
-that job. Any rollback failure or ambiguous journal state is recorded.
-Recovery does not replay uncertain actions automatically.
+Before fresh verification begins, an action failure may reverse applied moves
+only when it can prove restoration of the exact initial manifest. Once all
+actions are fsynced and the fresh verification manifest is durably recorded,
+every recapture, analyzer, Pi, policy, verification, cleanup, or final non-allow
+result produces `error`/`30` and mandatory effective whole-job quarantine,
+regardless of the profile's configured error disposition. From that boundary
+File Guardian preserves the modified stage and does not roll it back or retry
+remediation. Any earlier rollback failure or ambiguous journal state is also
+quarantined. Recovery never replays uncertain actions automatically.
 
 Successful delete transaction trash is descriptor-deleted and fsynced before
 the private decision record can propose `allow_modified`; cleanup failure
@@ -1243,11 +1214,11 @@ inserted, avoiding self-reference.
 
 `source` is exactly one variant:
 
-- path: `{kind:"path", input_kind:"file|directory"}`;
-- local repo: `{kind:"repo", repository_id, resolved_head,
-  working_tree:true|false, bare:true|false, history, frozen_refs:[...]}`;
+- path: `{kind:"path", input_kind:"file|directory", repository:null}` for an
+  ordinary copy, or the same shape with detected
+  `{repository_id,resolved_head,history,frozen_refs}`;
 - remote Git: `{kind:"git", transport:"https|ssh", repository_id,
-  resolved_head, working_tree, history, frozen_refs:[...]}`.
+  resolved_head, history, frozen_refs:[...]}`.
 
 Repository IDs are HMAC-SHA-256 tokens under the random job correlation key,
 not raw locator hashes. Frozen ref rows contain a bounded safe ref token,
@@ -1264,9 +1235,9 @@ null), `configured_disposition`, `effective_disposition`, `handoff_status`,
 `sealed`, `initial_manifest_identity`, `final_manifest_identity`,
 `current_manifest_identity`, and expiry/quarantine opaque IDs where applicable.
 These identities bind only the publication-stage tree and its publication-mode
-semantics. They do not include Git history. A history-only report-only job has
-`stage = null`, including for allow and deny, because it has no publication
-tree. It contains no stage path. Outcome and disposition are independent.
+semantics. They do not include Git history. Every successfully acquired job has
+a stage; report-only purpose changes handoff authority, not acquisition shape.
+Outcome and disposition remain independent.
 
 Each non-null phase contains exactly:
 
@@ -1279,24 +1250,23 @@ correlations[], resolutions[], statistics
 `phase.manifest_identity` binds the complete immutable analysis snapshot: the
 working-tree catalog when selected plus every selected frozen Git history
 surface. It is deliberately independent of the publication-stage identities.
-For `working_tree + history` it therefore differs from the stage identity; for
-history-only processing it remains present while `stage` is null.
+For `working_tree + history` it therefore differs from the stage identity.
 
 Artifact rows contain opaque IDs, kind, raw-byte segment-encoded logical path,
 byte length, publication type/mode, and safe Git provenance; no raw content
-digest. Analyzer rows contain adapter/analyzer ID, basename, version, executable
-digest/opaque identity, rules/config identity, execution status, and coverage,
-but never the canonical absolute executable path. Occurrences retain exact
+digest. Analyzer rows contain adapter/analyzer ID, basename, supported version,
+rules/config identity, execution status, and coverage, but never the canonical
+absolute executable path. Occurrences retain exact
 analyzer/rule provenance. Findings and correlations retain every contributing
 occurrence and job-local evidence token. Resolutions cite the exact policy or
-clearance binding and closed directive/reason.
+adjudication binding and closed directive/reason.
 
 `pi_invocations` contains safe phase, configured/resolved model identity,
-runtime/prompt/tool/protocol identities, execution status, coverage, attestation,
+prompt/tool/protocol identities, execution status, coverage, attestation,
 normalized output digest, and timestamps. `adjudications` contains finding ID,
-assessment, `not_requested|advisory|applied|rejected`, clearance rule when any,
-and a closed application/rejection reason. Neither contains model prose or
-provider request IDs.
+assessment, `not_requested|advisory|applied|rejected`, the authorizing policy
+binding, and a closed application/rejection reason. Neither contains model
+prose or provider request IDs.
 
 `actions` contains action ID, kind, initial subject/finding/binding IDs, planned
 and terminal journal state, and opaque artifact-quarantine ID. It never contains
@@ -1327,8 +1297,8 @@ The report records:
 - acquisition status, bounded duration, Git identity, and typed issues;
 - opaque stage reference, state/disposition, initial/final manifest identities,
   seal state, and availability;
-- scanner opaque executable identity/digest, supported version, rules/config
-  identity, execution status, and coverage;
+- scanner name, supported version, rules/config identity, execution status,
+  and coverage;
 - original occurrences/findings and correlations;
 - Pi invocation identity, safe assessments, attestation, and adjudication gates;
 - planned/applied action codes and opaque quarantine IDs;
@@ -1418,10 +1388,6 @@ history_ref_patterns = []
 allowed_checkout_ref_patterns = ["refs/heads/*", "refs/tags/*"]
 submodules = "reject"
 lfs = "reject_pointer"
-symlinks = "preserve"
-
-[processing.profiles.local]
-symlinks = "reject"
 
 [processing.profiles.completion]
 allow = "retain"
@@ -1431,27 +1397,29 @@ error = "quarantine"
 cancelled = "quarantine"
 ```
 
-`git.delivery` does not exist in schema 3: every handoff stage is a source tree
-without `.git`; history is an analysis surface, not deliverable metadata.
+`git.delivery` does not exist in schema 3: every handoff candidate is the exact
+stage. A copied repository and a remote clone both retain sanitized `.git`;
+history scope controls required analysis rather than changing the delivered
+tree.
 
 Analyzer and pipeline definitions retain the current ordered stage model,
-selectors, prior projection, content applicability, Pi runtime, and sidecar
-contracts. External analyzers switch from generic parse-ready executables to
+selectors, prior projection, content applicability, and Pi sandbox contract.
+External analyzers switch from generic parse-ready executables to
 closed first-party adapter kinds. Policy bindings become a strict tagged shape
 for ordinary directive resolution versus Pi adjudication.
 
-All analyzer executable identities, Git scope, ref set, Git acquisition
-options, protected configs, Pi model/runtime/prompt/vocabulary, policy bindings,
-clearance rules, and action/disposition authority enter the appropriate source,
-pipeline, or policy identity.
+All analyzer/version expectations, Git scope, ref set, Git acquisition options,
+protected configs, Pi model/prompt/vocabulary, policy bindings, and
+action/disposition authority enter the appropriate source, pipeline, or policy
+identity.
 
-Strict validation covers the complete matrix of source kind, purpose,
-working-tree flag, history mode, ref patterns, checkout ref, adapter scope, Pi
-phase execution, action authority, and completion disposition. Path sources
-require history none; handoff profiles require working tree; report-only
-profiles prohibit available/retain handoff; reachable requires matching history
-patterns; other modes forbid them; and every selected history surface has at
-least one required capable analyzer.
+Strict validation covers the complete matrix of source kind, purpose, history
+mode, ref patterns, checkout ref, adapter scope, Pi phase execution, action
+authority, and completion disposition. Every profile requires a staged working
+tree; path sources require history none; report-only profiles prohibit
+available/retain handoff; reachable requires matching history patterns; other
+modes forbid them; and every selected history surface has at least one required
+capable analyzer.
 
 ## Daemon behavior
 
@@ -1472,12 +1440,13 @@ run_on_start = false
 overlap = "reject" # reject | queue_one
 
 [daemon.jobs.source]
-kind = "path" # path | repo | git
+kind = "path" # path | git
 path = "/srv/incoming/batch"
 ```
 
-The `repo` variant permits `path` plus optional `ref`; the `git` variant permits
-`remote` plus optional `ref`; fields belonging to another variant are rejected.
+The `path` variant may auto-detect Git after exact staging; the `git` variant
+permits `remote` plus optional `ref`. Fields belonging to another variant are
+rejected.
 Startup compiles every job/profile and preflights every required tool. Runs of
 the same job follow `overlap`: `reject` records a bounded daemon scheduling
 event and starts no processing run; `queue_one` retains at most one pending run
@@ -1529,7 +1498,7 @@ Commit: `Acquire local and Git sources into owned stages`
 - Replace `Unsupported(External)` with the common first-party scanner
   supervisor and closed adapter trait.
 - Add read-only/networkless execution, strict structured completion, process
-  bounds, cancellation, hostile-output parsing, and privacy redaction.
+  bounds, cancellation, bounded scanner-output parsing, and report redaction.
 - Add a reusable Rust fake-scanner test support binary covering process and
   protocol failure matrices.
 
@@ -1537,7 +1506,7 @@ Commit: `Run confined deterministic scanner delegates`
 
 ### Phase 4 — Gitleaks and TruffleHog adapters
 
-- Implement PATH discovery, version/digest pinning, protected configuration,
+- Implement PATH discovery, supported-version validation, protected configuration,
   exact commands, native exit semantics, parsers, normalization, and coverage.
 - Add checked-in File Guardian and scanner templates.
 - Add offline native-output fixtures and opt-in live scripts.
@@ -1546,11 +1515,12 @@ Commit: `Add Gitleaks and TruffleHog scanner adapters`
 
 ### Phase 5 — Pi finding triage
 
-- Add stable occurrence/finding/correlation IDs and safe prior-finding DTO.
+- Add stable occurrence/finding/correlation IDs and the private prior-finding
+  DTO with bounded evidence.
 - Replace the Pi classifier terminal role with strict triage/attestation.
-- Implement advisory and explicit narrow clearance policies.
+- Implement advisory and explicit authoritative adjudication.
 - Preserve the existing Pi host and persistent Bubblewrap tool-sidecar
-  architecture.
+  architecture while using the normal read-only host runtime.
 
 Commit: `Let Pi assess deterministic findings safely`
 
@@ -1577,7 +1547,7 @@ Commit: `Finalize stage disposition and verified handoff`
 - Update README, requirements, implementation contract, examples, and release
   packaging.
 - Add upload, local repository, HTTPS, SSH, working-tree, HEAD, reachable/all
-  refs, scanner, Pi advisory/clearance, action, and disposition templates.
+  refs, scanner, Pi advisory/authoritative, action, and disposition templates.
 - Create deterministic local Git repositories and exercise the release binary.
 - Run opt-in live Gitleaks/TruffleHog and Pi acceptance with synthetic values.
 
@@ -1625,15 +1595,15 @@ selecting Linux-only Pi/sandbox behavior fails closed with a typed issue.
 - `working_tree`, `head`, `reachable`, and `all_refs` produce distinct expected
   artifact/provenance sets. A history finding cannot be cleared by deleting the
   current file.
-- Local `repo PATH` proves `.git` never enters the stage while dirty tracked,
-  deleted, untracked, ignored, HEAD, and configured history surfaces remain
-  distinguishable.
+- Local `process path` over a Git worktree proves `.git`, dirty tracked,
+  deleted, untracked, and ignored content are copied exactly while HEAD and
+  configured history surfaces remain distinguishable.
 - Validation matrix covers every history mode with empty/nonempty exact/glob
   patterns, zero/multiple matches, checkout ref allowed/forbidden, annotated
   tags, symbolic HEAD, advertised-ref movement, and remote-to-private namespace
   mapping.
-- Every handoff-capable profile without working-tree coverage is rejected at
-  compile time; a history-only report job can never produce a handoff reference.
+- Every profile without working-tree coverage is rejected at compile time;
+  report-only purpose cannot produce a handoff reference.
 
 ### External scanners
 
@@ -1655,25 +1625,24 @@ selecting Linux-only Pi/sandbox behavior fails closed with a typed issue.
 - Strict parser rejects duplicate/foreign/stale/later-stage IDs, wrong digests,
   missing findings, invalid confidence/reasons, duplicate cycle, oversized
   output, and trailing submission.
-- Advisory Pi cannot clear a fake password. An explicit clearance profile may
-  clear only the documented fixture rule with exact high-confidence reason;
-  the original finding remains visible.
-- Verified credential, private key, critical/hard-block rule, correlated
-  ineligible occurrence, incomplete deterministic scan, prompt injection,
-  uncertain result, and Pi failure never false-allow.
+- Advisory Pi cannot clear a fake password. An explicit authoritative profile
+  clears a routed deterministic finding when trusted Pi classifies it
+  `false_positive`; the original finding remains visible.
+- The authoritative matrix covers ordinary passwords, private keys, verified
+  credentials, and high-severity findings without fixed host-side exceptions.
+  Incomplete deterministic scanning, an incomplete Pi run, and any assessment
+  other than exact `false_positive` do not clear a finding.
 - After action, stale initial Pi output is rejected and a fresh final manifest
   assessment/attestation is required.
 - Advisory Pi timeout/malformed output can coexist with allow only through one
   valid degradation row, complete required coverage, and no Pi-dependent
-  clearance; the same failure is error when Pi is required.
-- Initial attestation matrix covers all three policy values and terminal codes:
-  advisory only annotates; deny-on-blocking maps blocking to unchanged
-  deny/`20`; require-no-blocking accepts only no-blocking and maps
-  unable-to-assert to error. Post-action nonaccepted codes always follow the
-  mandatory error/quarantine table.
-- Configuration rejects every non-advisory initial/post-action attestation paired
-  with advisory/disabled Pi execution, missing required phase assertions, or
-  conflicting execution settings.
+  override; the same failure is error when Pi is required.
+- Initial attestation is advisory in advisory mode. In authoritative mode,
+  no-blocking permits policy evaluation, blocking denies the unchanged stage,
+  and unable-to-assert is incomplete required analysis. Post-action
+  nonaccepted codes follow the mandatory error/quarantine table.
+- Configuration requires the authoritative Pi analyzer in the initial phase
+  and again after actions; advisory mode does not gain override authority.
 
 ### Actions, disposition, and handoff
 
@@ -1707,9 +1676,10 @@ selecting Linux-only Pi/sandbox behavior fails closed with a typed issue.
   target never appear in the public report/stdout/logs.
 - A low-entropy fake password cannot be recovered by comparing a plain digest
   in the report; job-local evidence tokens do not correlate across jobs.
-- Retained stages expose none of the private objects, analyzer views, raw
-  scanner outputs, Pi scratch, proxy state, source repository, credentials, or
-  artifact quarantine.
+- Retained stages expose none of the private immutable objects, analyzer views,
+  raw scanner outputs, Pi scratch, proxy state, acquisition credentials, or
+  artifact quarantine. A staged repository intentionally retains its own
+  sanitized `.git` metadata.
 
 ### Live acceptance
 
@@ -1732,9 +1702,11 @@ asserts:
 
 - built-ins plus real Gitleaks and TruffleHog produce normalized findings;
 - default advisory Pi leaves the documented example blocked;
-- an explicit clearance profile may clear only that example while the realistic
-  fixture remains denied;
+- an explicit authoritative profile lets Pi adjudicate both fixtures, preserving
+  each original finding and applying Pi's assessment to the outcome;
 - HEAD and reachable/all-ref scopes differ as specified;
+- authenticated smart-HTTPS and SSH-agent acquisition both retain the exact
+  staged clone, including a usable `.git`, through verified handoff;
 - delete/quarantine followed by a full rescan can yield `allow_modified`;
 - reports contain no synthetic values, credentials, URLs, or private paths;
 - every child, sidecar, workspace, and stage follows its configured terminal
@@ -1752,9 +1724,9 @@ The work is complete when:
 2. Working-tree, HEAD, reachable, and all-ref scope choices are source-owned,
    frozen, reported, and demonstrated by deterministic repositories.
 3. Built-ins, Gitleaks, TruffleHog, and optional Pi run through immutable
-   assignments with complete explicit coverage and safe prior context.
-4. Policy-controlled Pi false-positive adjudication preserves original
-   evidence and cannot override incomplete or protected deterministic findings.
+   assignments with complete explicit coverage and actual review evidence.
+4. Authoritative Pi false-positive adjudication preserves original evidence
+   and cannot override incomplete deterministic or Pi analysis.
 5. Authorized whole-file delete/quarantine is journaled, identity-checked, and
    followed by a complete fresh pipeline.
 6. All four exits and every configured disposition satisfy schema-2 report and
@@ -1763,207 +1735,3 @@ The work is complete when:
    release, and macOS non-Pi gates pass.
 8. Major milestones are committed and the final Claude Fable 5 Keel iterative
    code review reports clean after all accepted findings are incorporated.
-
-## Correspondence
-
-### Integrated subagent contract and security review
-
-The initial integrated draft was reviewed independently against `f3872c3` for
-public-contract implementability and adversarial false-allow paths. The revision
-accepted the material findings:
-
-- added a distinct local `repo PATH` source and prohibited Git scope on ordinary
-  path sources;
-- made working-tree coverage mandatory for every handoff profile and defined
-  report-only history jobs;
-- specified exact checkout/history ref matching, fetch namespaces, movement
-  detection, and history roots;
-- removed the meaningless Git delivery option and made every repo/Git handoff a
-  `.git`-free source tree;
-- separated outcome, disposition, and handoff state and replaced provisional
-  public reporting with a private decision/disposition/final-report protocol;
-- defined immutable processing reports separately from mutable job/receipt
-  status;
-- specified descendant/Git symlink artifacts, publication modes, and full
-  handoff revalidation;
-- replaced generic external commands with exact closed Gitleaks/TruffleHog
-  adapters, descriptor-pinned binaries, reviewed whole-view coverage, and a
-  Linux-required sandbox;
-- defined advisory Pi degradation, authoritative phase requirements,
-  unmodified false-positive clearance, non-clearable selectors, and removed
-  unowned candidate-concern semantics from triage v1;
-- made every post-mutation non-allow an error with mandatory whole-job
-  quarantine and gave artifact quarantine an explicit lifecycle;
-- added capacity admission, report-size bounds, cooperative cancellation,
-  daemon source variants, auxiliary command contracts, and the corresponding
-  acceptance matrices.
-
-No review item was deferred as a compatibility bridge.
-
-### 2026-08-18T02:36:45.822Z - Reviewer: claude-fable-5
-
-Reviewed the complete specification at `f3872c3` for implementability,
-internal consistency, false-allow resistance, lifecycle durability, Git scope
-correctness, scanner coverage, Pi adjudication authority, remediation
-verification, report privacy, and test completeness. The fail-closed
-architecture, clearance gate stack, post-mutation error-plus-quarantine rule,
-and private-decision/disposition/publication ordering are sound. Changes
-requested. No item below asks for a compatibility alias or dual parser; each
-asks for one exact closed contract.
-
-1. Evidence-token input material is undefined. Findings bind an HMAC-SHA-256
-   evidence token claimed to prevent offline guessing of low-entropy secrets,
-   which implies the token is derived from the matched value, but the Gitleaks
-   adapter runs with `--redact=100`, so no matched value reaches the parser.
-   Specify exactly what bytes each adapter feeds the HMAC, how Gitleaks
-   findings obtain them (or withdraw the anti-guessing claim for that adapter),
-   and how cross-scanner correlation and initial-to-final finding correlation
-   are computed when one contributor supplies no content.
-2. The Git-surfaces example sets `history = "head"` with nonempty
-   `history_ref_patterns`, which the rule stated shortly after forbids. Also
-   define whether "forbidden" means the key must be absent or must be the
-   empty array shown in the schema-3 profile example for `none`.
-3. The TruffleHog analyzer example contains `verification_mode = "disabled"`
-   next to `verification = "required"`. If it is native credential
-   verification control, rename and define it in the closed field set; if it
-   is stray, delete it. Unify phase-execution placement (scanners use
-   top-level `initial`/`verification`, Pi uses `[analyzers.execution]`), and
-   state whether `pi_adjudication.required_initial`/`required_after_actions`
-   must agree with the analyzer execution config or override it.
-4. `process repo` "accepts one local non-bare Git working tree", yet the same
-   paragraph accepts bare repositories under `report_only`, and the report
-   `source` repo variant hard-codes `working_tree:true`. Restate the command
-   contract and the repo source variant so the bare/report-only case is
-   representable.
-5. Stage-attestation policy semantics are unspecified per phase and mode.
-   Define the effect of `blocking_concerns_observed` and `unable_to_assert`
-   from a required initial-phase Pi run — deny, error, or annotation — and
-   reconcile that with the non-goal that Pi never makes a policy decision
-   directly.
-6. `stage handoff` is excluded from the auxiliary-command exit/stdout contract
-   (exit `0`/`20`/`30`/`2`, one strict JSON result). Specify its exit codes,
-   whether the receipt is the single stdout object, and its persisted
-   operation-ID idempotence rule.
-7. Destination-parent trust for `stage handoff` and `artifact recover` is
-   unspecified. Copy mode verifies a temporary sibling and then renames it
-   inside a caller-chosen parent; specify no-follow resolution of the
-   destination path and required parent ownership constraints, or state the
-   trust assumption explicitly.
-8. Exit and report behavior for operational failure before a run identity
-   exists (configuration parse or root-validation failure) is undefined; only
-   syntax exit `2` and post-identity exit `30` are specified.
-9. Revalidation and sealing for the unmodified `allow` path appear only inside
-   the Pi clearance discussion; the execution state machine and the
-   decision-ordering protocol never place them. Anchor sealing to an exact
-   state for every allow path.
-10. Daemon gaps: the overlap policy is referenced but has no configuration
-    field; `daemon --job JOB_ID` selection semantics are undefined; and the
-    acceptance matrix has no daemon rows (scheduling, overlap, `run_on_start`,
-    startup preflight failure).
-11. `--request-id` enters the public report but has no charset/length bounds
-    and no stated semantics (correlation-only versus idempotence key).
-12. `default_unbound_observation` appears only in the example profile; define
-    its value set and its interaction with the requirement that a profile maps
-    every normalized finding.
-13. With `include = ["**"]` and analyzer `max_file_bytes` far below capture
-    `max_file_bytes`, any sufficiently large text file makes coverage
-    incomplete and the whole job an error. If that is intended, state it as
-    the fixed rule and add an acceptance row; if not, specify the explicit
-    approved size-exclusion contract.
-
-### 2026-08-18T02:44:25.094Z - Reviewer: claude-fable-5
-
-Re-reviewed the complete revised specification. All 13 findings from the
-previous entry are verifiably incorporated: host-derived HMAC evidence windows
-with structural correlation fallback; empty-array ref-pattern semantics with a
-corrected example; the renamed `credential_verification` field and unified
-`[analyzers.execution]` placement with adjudication-flag agreement rules; the
-representable bare report-only repository contract and `bare`/`working_tree`
-source fields; host-mapped attestation policy; the handoff JSON/exit/idempotent
-receipt contract; descriptor-safe trusted destination parents; pre-config
-in-memory run identities with `persistence.status`; the `revalidating_final`
-and `sealing` states with recovery; complete daemon overlap/selection/
-run-on-start contracts and acceptance; bounded `--request-id`; total
-`default_unbound_observation`; and the explicit oversized-text coverage rule
-with its acceptance row. The design remains fail-closed and internally
-coherent. Three residual items, all narrower than the prior round:
-
-1. The attestation-policy keys overlap the adjudication booleans. The example
-   `initial_attestation`/`post_action_attestation` snippet has no TOML table
-   header anchoring where the keys live, and `post_action_attestation =
-   "require_no_blocking"` coexists with the boolean
-   `require_post_action_attestation = true` with no stated reconciliation
-   (e.g. bool true with enum `advisory`). Also unstated: whether
-   `deny_on_blocking`/`require_no_blocking` require the corresponding
-   `[analyzers.execution]` phase to be `required`, since an advisory-phase Pi
-   run "can annotate only existing findings" and must not create a
-   host-generated blocking resolution. Anchor the keys to their exact table,
-   collapse or validate the bool/enum pair, and add the execution-mode
-   agreement rule to the validation matrix.
-2. The handoff idempotence contract references "a caller-supplied or generated
-   operation ID", and mutating auxiliary commands are idempotent by persisted
-   operation ID, but no command in the grammar exposes an operation-ID flag or
-   bounds its caller-supplied form. Add the flag (with request-id-style
-   charset/length bounds) to the command contract or state that operation IDs
-   are always host-generated.
-3. Recovery of a stale `revalidating_final`/`sealing` job says exact equality
-   "may resume sealing/decision", but the private decision record does not
-   exist until `preparing_decision` and the spec does not require a durable
-   resolution snapshot before those states. State which durable record makes
-   resume permissible, or require that recovery of those states without one
-   produces error under the existing no-synthesized-allow rule.
-
-### 2026-08-18T02:47:35.538Z - Reviewer: claude-fable-5
-
-Re-reviewed the revised specification. All three residual findings are
-incorporated as described: the attestation policy is anchored at
-`[processing.profiles.pi_adjudication.attestation]` with the overlapping
-boolean removed and exact validation rules tying non-advisory `initial` and
-`post_action` values to required Pi phase execution and
-`required_after_actions`; auxiliary operation IDs are exclusively host-derived
-from command kind, run/quarantine identity, mode, and descriptor-resolved
-destination identity, with exact-retry identical-receipt semantics and
-inapplicable/`20` for a different destination/mode against a handed-off stage;
-and fsynced canonical resolution snapshots binding manifest, identities,
-coverage, resolutions/adjudications, proposed phase result, and committed
-action state now gate `revalidating_final`/`sealing`, with recovery resuming
-only from a valid allow snapshot plus exact recapture equality and never
-reconstructing an allow from analyzer files. The design content is now
-internally consistent and fail-closed across all reviewed dimensions. Two
-editorial/completeness items remain:
-
-1. The operation-ID edit left a dangling fragment in the auxiliary-command
-   paragraph: "Mutating commands are idempotent by persisted operation ID.
-   `job" is followed by "The caller never supplies that ID." and the sentence
-   "`job inspect` returns mutable job status..." resumes later, so the stray
-   backticked `job` token orphans the sentence. Delete the fragment so the
-   paragraph reads cleanly.
-2. The Pi acceptance matrix predates the attestation policy and resolution
-   snapshots and has no rows exercising them. Add acceptance rows for:
-   `deny_on_blocking` mapping `blocking_concerns_observed` to `deny`/`20` on
-   an unchanged stage; `require_no_blocking` mapping `unable_to_assert` to a
-   required-analysis error; validation rejecting each attestation/execution
-   disagreement; and recovery resuming `revalidating_final`/`sealing` only
-   from a valid snapshot while a missing/corrupt/mismatched snapshot produces
-   error.
-
-### 2026-08-18T02:49:42.518Z - Reviewer: claude-fable-5
-
-Re-reviewed the revised specification. Both cycle-3 residuals are verifiably
-fixed: the auxiliary-command contract paragraph reads cleanly with the
-exclusively host-derived operation-ID sentence intact and no dangling
-fragment, and the acceptance matrix now contains exact rows for the initial
-attestation matrix across all three policy values and terminal codes, the
-mandatory post-action error/quarantine mapping for nonaccepted codes,
-configuration rejection of every attestation/execution disagreement, and
-snapshot-gated recovery of final revalidation/sealing including missing,
-truncated, corrupt, wrong-identity, and non-allow snapshot error paths.
-
-Across four review cycles the specification has converged from thirteen
-findings to zero. The contract is internally consistent, fail-closed on every
-reviewed false-allow path, durable across the specified crash/recovery
-boundaries, exact about Git scope and scanner coverage, strict about Pi
-authority and adjudication, private in its report surface, and covered by the
-acceptance matrix, with no compatibility aliases or transitional dual parsers
-anywhere in the contract. No findings remain. The specification is ready for
-Phase 0 completion and implementation.

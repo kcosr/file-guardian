@@ -14,7 +14,8 @@
 # Optional:
 #   REMEDIATE_PROFILE: apply whole-file action -> allow_modified and retain
 #   PI_ADVISORY_PROFILE: fixture false positive -> deny with advisory row
-#   PI_CLEARANCE_PROFILE: exact fixture clearance -> allow with applied row
+#   PI_AUTHORITATIVE_PROFILE: trusted Pi override -> allow only for the
+#                             explicitly documented fixture; unmarked match -> deny
 #   HTTPS_REMOTE / SSH_REMOTE: disposable clones of the history fixture -> deny
 
 set -euo pipefail
@@ -87,16 +88,21 @@ install -d -m 0700 "$FIXTURES" "$RESULTS" "$HANDOFFS"
 # These are public documentation/test values, not live credentials. Configured
 # acceptance rules should recognize them without credential verification.
 SYNTHETIC_AWS='AKIAIOSFODNN7EXAMPLE'
-SYNTHETIC_GITHUB='ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij'
-FALSE_POSITIVE='correct-horse-battery-staple-only-a-fixture'
+printf -v SYNTHETIC_GITHUB '%s_%s%s' ghp ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghij
+printf -v SYNTHETIC_SLACK '%s-%s-%s' xoxb 65677559833 9613778673399u
+PI_SYNTHETIC='FG_LIVE_SECRET_0123456789abcdefghijklmn'
 
 mkdir "$FIXTURES/clean-tree" "$FIXTURES/blocked-tree" \
-  "$FIXTURES/false-positive-tree" "$FIXTURES/remediation-tree"
+  "$FIXTURES/false-positive-tree" "$FIXTURES/pi-blocking-tree" \
+  "$FIXTURES/remediation-tree"
 printf 'This fixture contains no credential.\n' >"$FIXTURES/clean-tree/README.txt"
-printf 'AWS_ACCESS_KEY_ID=%s\n' "$SYNTHETIC_AWS" \
+printf 'slack token = %s\n' "$SYNTHETIC_SLACK" \
   >"$FIXTURES/blocked-tree/synthetic-credential.txt"
-printf 'FILE_GUARDIAN_TEST_PASSWORD=%s\n' "$FALSE_POSITIVE" \
+printf '# FILE_GUARDIAN_DOCUMENTED_SYNTHETIC_FIXTURE\nEXAMPLE_TOKEN=%s\n' \
+  "$PI_SYNTHETIC" \
   >"$FIXTURES/false-positive-tree/example.env"
+printf 'PRODUCTION_SERVICE_TOKEN=%s\n' "$PI_SYNTHETIC" \
+  >"$FIXTURES/pi-blocking-tree/application.env"
 cp "$FIXTURES/clean-tree/README.txt" "$FIXTURES/remediation-tree/README.txt"
 printf 'GITHUB_TOKEN=%s\n' "$SYNTHETIC_GITHUB" \
   >"$FIXTURES/remediation-tree/synthetic-credential.txt"
@@ -129,7 +135,7 @@ git_commit() {
 HISTORY_REPO=$FIXTURES/history-repo
 git_init "$HISTORY_REPO"
 printf 'public fixture\n' >"$HISTORY_REPO/README.txt"
-printf 'AWS_ACCESS_KEY_ID=%s\n' "$SYNTHETIC_AWS" \
+printf 'SLACK_BOT_TOKEN=%s\n' "$SYNTHETIC_SLACK" \
   >"$HISTORY_REPO/deleted-secret.env"
 git -C "$HISTORY_REPO" add README.txt deleted-secret.env
 git_commit "$HISTORY_REPO" '2026-01-01T00:00:00+00:00' 'add synthetic history fixture'
@@ -143,7 +149,7 @@ printf 'public fixture\n' >"$BRANCH_REPO/README.txt"
 git -C "$BRANCH_REPO" add README.txt
 git_commit "$BRANCH_REPO" '2026-02-01T00:00:00+00:00' 'add clean main fixture'
 git -C "$BRANCH_REPO" switch -q -c synthetic-side-ref
-printf 'GITHUB_TOKEN=%s\n' "$SYNTHETIC_GITHUB" \
+printf 'SLACK_BOT_TOKEN=%s\n' "$SYNTHETIC_SLACK" \
   >"$BRANCH_REPO/side-secret.env"
 git -C "$BRANCH_REPO" add side-secret.env
 git_commit "$BRANCH_REPO" '2026-02-02T00:00:00+00:00' 'add side-ref fixture'
@@ -177,7 +183,9 @@ assert_private() {
   local stdout_file=$1
   local stderr_file=$2
   local value
-  for value in "$SYNTHETIC_AWS" "$SYNTHETIC_GITHUB" "$FALSE_POSITIVE" "$ROOT"; do
+  for value in \
+    "$SYNTHETIC_AWS" "$SYNTHETIC_GITHUB" "$SYNTHETIC_SLACK" \
+    "$PI_SYNTHETIC" "$ROOT"; do
     if grep -Fq -- "$value" "$stdout_file" "$stderr_file"; then
       die "private canary leaked in $(basename "$stdout_file")"
     fi
@@ -229,15 +237,15 @@ jq -e --arg gitleaks "$GITLEAKS_ID" --arg trufflehog "$TRUFFLEHOG_ID" '
   die 'blocked fixture was not found by both completed scanner adapters'
 
 run_process history-head 0 \
-  process --profile "$HEAD_PROFILE" repo --ref refs/heads/main "$HISTORY_REPO"
+  process --profile "$HEAD_PROFILE" path "$HISTORY_REPO"
 run_process history-reachable 20 \
-  process --profile "$REACHABLE_PROFILE" repo --ref refs/heads/main "$HISTORY_REPO"
+  process --profile "$REACHABLE_PROFILE" path "$HISTORY_REPO"
 run_process branch-head 0 \
-  process --profile "$HEAD_PROFILE" repo --ref refs/heads/main "$BRANCH_REPO"
+  process --profile "$HEAD_PROFILE" path "$BRANCH_REPO"
 run_process branch-reachable 0 \
-  process --profile "$REACHABLE_PROFILE" repo --ref refs/heads/main "$BRANCH_REPO"
+  process --profile "$REACHABLE_PROFILE" path "$BRANCH_REPO"
 run_process branch-all-refs 20 \
-  process --profile "$ALL_REFS_PROFILE" repo --ref refs/heads/main "$BRANCH_REPO"
+  process --profile "$ALL_REFS_PROFILE" path "$BRANCH_REPO"
 
 [[ $(tree_digest "$HISTORY_REPO") == "$HISTORY_BEFORE" ]] || \
   die 'history repository was modified'
@@ -296,16 +304,27 @@ if [[ -n ${FG_ACCEPTANCE_PI_ADVISORY_PROFILE:-} ]]; then
     "$RESULTS/pi-advisory.json" >/dev/null || die 'Pi advisory row is absent'
 fi
 
-if [[ -n ${FG_ACCEPTANCE_PI_CLEARANCE_PROFILE:-} ]]; then
-  run_process pi-clearance 0 \
-    process --profile "$FG_ACCEPTANCE_PI_CLEARANCE_PROFILE" \
+if [[ -n ${FG_ACCEPTANCE_PI_AUTHORITATIVE_PROFILE:-} ]]; then
+  run_process pi-authoritative 0 \
+    process --profile "$FG_ACCEPTANCE_PI_AUTHORITATIVE_PROFILE" \
     path "$FIXTURES/false-positive-tree"
   jq -e '
     (.phases.initial.findings | length) > 0 and
     any(.phases.initial.resolutions[]; .state == "cleared") and
     any(.adjudications[]; .state == "applied")
   ' \
-    "$RESULTS/pi-clearance.json" >/dev/null || die 'Pi clearance was not narrowly applied'
+    "$RESULTS/pi-authoritative.json" >/dev/null || die 'authoritative Pi override was not applied'
+
+  run_process pi-authoritative-blocking 20 \
+    process --profile "$FG_ACCEPTANCE_PI_AUTHORITATIVE_PROFILE" \
+    path "$FIXTURES/pi-blocking-tree"
+  jq -e '
+    (.phases.initial.findings | length) > 0 and
+    any(.phases.initial.resolutions[]; .state == "active") and
+    any(.adjudications[];
+      .state == "rejected" and .assessment != "false_positive")
+  ' "$RESULTS/pi-authoritative-blocking.json" >/dev/null || \
+    die 'authoritative Pi incorrectly cleared the unmarked credential fixture'
 fi
 
 if [[ -n ${FG_ACCEPTANCE_HTTPS_REMOTE:-} ]]; then

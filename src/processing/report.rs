@@ -215,14 +215,8 @@ pub struct FrozenRefSummary {
 pub enum SourceSummary {
     Path {
         input_kind: InputKind,
-    },
-    Repo {
-        repository_id: Sha256Digest,
-        resolved_head: GitObjectId,
-        working_tree: bool,
-        bare: bool,
-        history: HistoryScope,
-        frozen_refs: Vec<FrozenRefSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<DetectedRepositorySummary>,
     },
     Git {
         transport: GitTransport,
@@ -234,34 +228,47 @@ pub enum SourceSummary {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectedRepositorySummary {
+    pub repository_id: Sha256Digest,
+    pub resolved_head: GitObjectId,
+    pub history: HistoryScope,
+    pub frozen_refs: Vec<FrozenRefSummary>,
+}
+
 impl SourceSummary {
     pub(crate) fn has_working_tree(&self) -> bool {
         match self {
             Self::Path { .. } => true,
-            Self::Repo { working_tree, .. } | Self::Git { working_tree, .. } => *working_tree,
+            Self::Git { working_tree, .. } => *working_tree,
         }
     }
 
     fn validate(&self) -> Result<(), ReportError> {
         let (head, working_tree, history, refs) = match self {
-            Self::Path { .. } => return Ok(()),
-            Self::Repo {
+            Self::Path {
+                repository: None, ..
+            } => return Ok(()),
+            Self::Path {
+                repository: Some(repository),
+                ..
+            } => (
+                &repository.resolved_head,
+                true,
+                &repository.history,
+                &repository.frozen_refs,
+            ),
+            Self::Git {
                 resolved_head,
                 working_tree,
                 history,
                 frozen_refs,
                 ..
-            }
-            | Self::Git {
-                resolved_head,
-                working_tree,
-                history,
-                frozen_refs,
-                ..
-            } => (resolved_head, working_tree, history, frozen_refs),
+            } => (resolved_head, *working_tree, history, frozen_refs),
         };
         head.validate()?;
-        if !*working_tree && *history == HistoryScope::None {
+        if !working_tree && *history == HistoryScope::None {
             return Err(ReportError::EmptySourceScope);
         }
         validate_sorted_unique(refs, |row| &row.name)?;
@@ -820,7 +827,6 @@ pub struct AdjudicationSummary {
     pub phase: InspectionPhase,
     pub assessment: PiAssessment,
     pub state: AdjudicationState,
-    pub clearance_rule_id: Option<SafeId>,
     pub reason_code: SafeId,
 }
 
@@ -1103,6 +1109,7 @@ impl ProcessingReport {
                     || !self.actions.is_empty()
                     || !self.issues.is_empty()
                     || !initial.permits()
+                    || self.pi_blocks(InspectionPhase::Initial)
                 {
                     return Err(ReportError::AllowInvariant);
                 }
@@ -1132,7 +1139,9 @@ impl ProcessingReport {
                 if self.phases.verification.is_some()
                     || committed != 0
                     || !self.issues.is_empty()
-                    || (!initial.blocks() && !initial.requires_action())
+                    || (!initial.blocks()
+                        && !initial.requires_action()
+                        && !self.pi_blocks(InspectionPhase::Initial))
                 {
                     return Err(ReportError::DenyInvariant);
                 }
@@ -1220,6 +1229,14 @@ impl ProcessingReport {
             return Err(ReportError::StageIdentityMismatch);
         }
         Ok(())
+    }
+
+    fn pi_blocks(&self, phase: InspectionPhase) -> bool {
+        self.pi_invocations.iter().any(|invocation| {
+            invocation.phase == phase
+                && invocation.status == ExecutionStatus::Complete
+                && invocation.attestation == Some(Attestation::BlockingConcernsObserved)
+        })
     }
 }
 

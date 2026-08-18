@@ -45,9 +45,7 @@ pub enum ProcessingDomainError {
     DuplicateCollectionValue { field: &'static str },
     #[error("terminal outcome, disposition, and handoff state are inconsistent")]
     InvalidTerminalState,
-    #[error(
-        "an applied adjudication requires an exact false-positive assessment and clearance rule"
-    )]
+    #[error("an applied adjudication requires an exact false-positive assessment")]
     InvalidAppliedAdjudication,
     #[error("an action record is inconsistent with its action kind")]
     InvalidAction,
@@ -132,7 +130,6 @@ processing_id!(
     "aq_",
     "artifact quarantine identifier"
 );
-processing_id!(ClearanceRuleId, "clear_", "clearance rule identifier");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -316,14 +313,8 @@ impl<'de> Deserialize<'de> for GitRefSnapshot {
 pub enum ProcessSource {
     Path {
         input_kind: PathInputKind,
-    },
-    Repo {
-        repository_id: Digest,
-        resolved_head: GitObjectId,
-        working_tree: bool,
-        bare: bool,
-        history: GitHistoryScope,
-        frozen_refs: Vec<GitRefSnapshot>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository: Option<DetectedGitRepository>,
     },
     Git {
         transport: GitTransport,
@@ -335,29 +326,40 @@ pub enum ProcessSource {
     },
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DetectedGitRepository {
+    pub repository_id: Digest,
+    pub resolved_head: GitObjectId,
+    pub history: GitHistoryScope,
+    pub frozen_refs: Vec<GitRefSnapshot>,
+}
+
 impl ProcessSource {
     pub fn path(input_kind: PathInputKind) -> Self {
-        Self::Path { input_kind }
+        Self::Path {
+            input_kind,
+            repository: None,
+        }
     }
 
-    pub fn repo(
+    pub fn path_repository(
+        input_kind: PathInputKind,
         repository_id: Digest,
         resolved_head: GitObjectId,
-        working_tree: bool,
-        bare: bool,
         history: GitHistoryScope,
         mut frozen_refs: Vec<GitRefSnapshot>,
     ) -> Result<Self, ProcessingDomainError> {
-        validate_scope(working_tree, history)?;
         validate_ref_algorithms(&resolved_head, &frozen_refs)?;
         canonicalize_unique(&mut frozen_refs, "frozen_refs")?;
-        Ok(Self::Repo {
-            repository_id,
-            resolved_head,
-            working_tree,
-            bare,
-            history,
-            frozen_refs,
+        Ok(Self::Path {
+            input_kind,
+            repository: Some(DetectedGitRepository {
+                repository_id,
+                resolved_head,
+                history,
+                frozen_refs,
+            }),
         })
     }
 
@@ -385,14 +387,16 @@ impl ProcessSource {
     pub const fn working_tree(&self) -> bool {
         match self {
             Self::Path { .. } => true,
-            Self::Repo { working_tree, .. } | Self::Git { working_tree, .. } => *working_tree,
+            Self::Git { working_tree, .. } => *working_tree,
         }
     }
 
-    pub const fn history(&self) -> GitHistoryScope {
+    pub fn history(&self) -> GitHistoryScope {
         match self {
-            Self::Path { .. } => GitHistoryScope::None,
-            Self::Repo { history, .. } | Self::Git { history, .. } => *history,
+            Self::Path { repository, .. } => repository
+                .as_ref()
+                .map_or(GitHistoryScope::None, |repository| repository.history),
+            Self::Git { history, .. } => *history,
         }
     }
 }
@@ -407,14 +411,8 @@ impl<'de> Deserialize<'de> for ProcessSource {
         enum Wire {
             Path {
                 input_kind: PathInputKind,
-            },
-            Repo {
-                repository_id: Digest,
-                resolved_head: GitObjectId,
-                working_tree: bool,
-                bare: bool,
-                history: GitHistoryScope,
-                frozen_refs: Vec<GitRefSnapshot>,
+                #[serde(default)]
+                repository: Option<DetectedGitRepository>,
             },
             Git {
                 transport: GitTransport,
@@ -426,21 +424,19 @@ impl<'de> Deserialize<'de> for ProcessSource {
             },
         }
         match Wire::deserialize(deserializer)? {
-            Wire::Path { input_kind } => Ok(Self::path(input_kind)),
-            Wire::Repo {
-                repository_id,
-                resolved_head,
-                working_tree,
-                bare,
-                history,
-                frozen_refs,
-            } => Self::repo(
-                repository_id,
-                resolved_head,
-                working_tree,
-                bare,
-                history,
-                frozen_refs,
+            Wire::Path {
+                input_kind,
+                repository: None,
+            } => Ok(Self::path(input_kind)),
+            Wire::Path {
+                input_kind,
+                repository: Some(repository),
+            } => Self::path_repository(
+                input_kind,
+                repository.repository_id,
+                repository.resolved_head,
+                repository.history,
+                repository.frozen_refs,
             ),
             Wire::Git {
                 transport,
@@ -476,21 +472,6 @@ impl ProcessSubject {
     ) -> Result<Self, ProcessingDomainError> {
         if purpose == ProcessPurpose::Handoff && !source.working_tree() {
             return Err(ProcessingDomainError::HandoffWithoutWorkingTree);
-        }
-        if let ProcessSource::Repo {
-            bare,
-            working_tree,
-            history,
-            ..
-        } = &source
-        {
-            if *bare
-                && (purpose != ProcessPurpose::ReportOnly
-                    || *working_tree
-                    || !history.includes_history())
-            {
-                return Err(ProcessingDomainError::InvalidBareRepository);
-            }
         }
         Ok(Self { purpose, source })
     }
@@ -914,12 +895,8 @@ pub enum AdjudicationReason {
     AdvisoryOnly,
     ClearedFalsePositive,
     AssessmentNotFalsePositive,
-    ConfidenceTooLow,
-    ReasonCodeMismatch,
-    NonClearable,
     CorrelationNotCleared,
     IncompleteRequiredAnalysis,
-    AmbiguousClearanceRule,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -930,7 +907,6 @@ pub struct Adjudication {
     pub finding_id: FindingId,
     pub assessment: Option<PiFindingAssessment>,
     pub state: AdjudicationState,
-    pub clearance_rule_id: Option<ClearanceRuleId>,
     pub reason: AdjudicationReason,
 }
 
@@ -942,14 +918,12 @@ impl Adjudication {
         finding_id: FindingId,
         assessment: Option<PiFindingAssessment>,
         state: AdjudicationState,
-        clearance_rule_id: Option<ClearanceRuleId>,
         reason: AdjudicationReason,
     ) -> Result<Self, ProcessingDomainError> {
         if state == AdjudicationState::Applied
             && (!assessment.as_ref().is_some_and(|value| {
                 value.classification == PiFindingClassification::FalsePositive
-            }) || clearance_rule_id.is_none()
-                || reason != AdjudicationReason::ClearedFalsePositive)
+            }) || reason != AdjudicationReason::ClearedFalsePositive)
         {
             return Err(ProcessingDomainError::InvalidAppliedAdjudication);
         }
@@ -959,7 +933,6 @@ impl Adjudication {
             finding_id,
             assessment,
             state,
-            clearance_rule_id,
             reason,
         })
     }
@@ -978,7 +951,6 @@ impl<'de> Deserialize<'de> for Adjudication {
             finding_id: FindingId,
             assessment: Option<PiFindingAssessment>,
             state: AdjudicationState,
-            clearance_rule_id: Option<ClearanceRuleId>,
             reason: AdjudicationReason,
         }
         let wire = Wire::deserialize(deserializer)?;
@@ -988,7 +960,6 @@ impl<'de> Deserialize<'de> for Adjudication {
             wire.finding_id,
             wire.assessment,
             wire.state,
-            wire.clearance_rule_id,
             wire.reason,
         )
         .map_err(serde::de::Error::custom)
@@ -1151,18 +1122,16 @@ mod tests {
     }
 
     #[test]
-    fn handoff_requires_a_working_tree_and_bare_repos_are_report_only() {
-        let source = ProcessSource::repo(
+    fn handoff_requires_a_working_tree() {
+        let source = ProcessSource::path_repository(
+            PathInputKind::Directory,
             Digest::sha256(b"repo"),
             oid('a'),
-            false,
-            true,
             GitHistoryScope::AllRefs,
             Vec::new(),
         )
         .unwrap();
-        assert!(ProcessSubject::new(ProcessPurpose::Handoff, source.clone()).is_err());
-        assert!(ProcessSubject::new(ProcessPurpose::ReportOnly, source).is_ok());
+        assert!(ProcessSubject::new(ProcessPurpose::Handoff, source).is_ok());
 
         let empty_scope = ProcessSource::git(
             GitTransport::Ssh,
@@ -1266,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn applied_adjudication_requires_exact_clearance_evidence() {
+    fn applied_adjudication_requires_exact_false_positive_assessment() {
         let assessment = PiFindingAssessment {
             classification: PiFindingClassification::FalsePositive,
             confidence: ConfiguredConfidence::High,
@@ -1280,7 +1249,6 @@ mod tests {
             FindingId::from_suffix("1").unwrap(),
             Some(assessment),
             AdjudicationState::Applied,
-            Some(ClearanceRuleId::from_suffix("fixture").unwrap()),
             AdjudicationReason::ClearedFalsePositive,
         )
         .is_ok());
@@ -1290,7 +1258,6 @@ mod tests {
             FindingId::from_suffix("1").unwrap(),
             None,
             AdjudicationState::Applied,
-            None,
             AdjudicationReason::ClearedFalsePositive,
         )
         .is_err());

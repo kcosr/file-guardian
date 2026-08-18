@@ -730,6 +730,53 @@ fn recovery_never_rolls_back_a_committed_transaction() {
 }
 
 #[test]
+fn recovery_preserves_a_modified_stage_once_fresh_verification_has_started() {
+    let fixture = Fixture::new(&[("target.txt", b"original")]);
+    let plan = plan(&fixture, &[("target", "target.txt", ActionKind::Delete)]);
+    execute_actions(request(
+        &fixture,
+        &plan,
+        &Default::default(),
+        &NoActionFaults,
+    ))
+    .unwrap();
+    let verification_manifest = stage_manifest(&fixture.stage).unwrap();
+    let mut writer = ActionJournalWriter::open_append(&fixture.journal).unwrap();
+    writer
+        .append_and_sync(&JournalEvent::VerificationStarted {
+            manifest_identity: verification_manifest,
+        })
+        .unwrap();
+    drop(writer);
+
+    let recovered = recover_actions(ActionRecoveryRequest {
+        stage_root: &fixture.stage,
+        trash_root: &fixture.trash,
+        artifact_quarantine_root: &fixture.quarantine,
+        journal_path: &fixture.journal,
+        plan: &plan,
+        manifest_prover: &EXACT_MANIFEST_PROVER,
+        faults: &NoActionFaults,
+    })
+    .unwrap();
+    assert_eq!(
+        recovered,
+        RecoveredActionTransaction::VerificationStagePreserved {
+            manifest_identity: verification_manifest,
+        }
+    );
+    assert!(!fixture.stage.join("target.txt").exists());
+    assert_eq!(
+        fs::read(fixture.trash.join(plan.actions[0].id.as_str())).unwrap(),
+        b"original"
+    );
+    assert_eq!(
+        fs::read(fixture.source.join("target.txt")).unwrap(),
+        b"original"
+    );
+}
+
+#[test]
 fn cleanup_requires_the_matching_committed_plan_and_is_retryable_after_unlink() {
     let fixture = Fixture::new(&[("target.txt", b"original")]);
     let plan = plan(&fixture, &[("target", "target.txt", ActionKind::Delete)]);

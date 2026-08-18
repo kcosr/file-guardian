@@ -33,7 +33,7 @@ const child = spawn(
 		runner.pathname,
 		input,
 		work,
-		"/usr",
+		"/usr/bin:/bin",
 	],
 	{ env: {}, stdio: ["pipe", "pipe", "pipe"] },
 );

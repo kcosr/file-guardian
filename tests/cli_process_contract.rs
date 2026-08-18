@@ -4,8 +4,8 @@ use clap::Parser;
 use file_guardian::cli::{
     ActionMode, Args, ArtifactArgs, ArtifactCommand, ArtifactDiscardArgs, ArtifactInspectArgs,
     ArtifactRecoverArgs, Command, DaemonArgs, HandoffMode, JobArgs, JobCommand, JobInspectArgs,
-    ProcessArgs, ProcessGitArgs, ProcessPathArgs, ProcessRepoArgs, ProcessSource, StageArgs,
-    StageCommand, StageDiscardArgs, StageHandoffArgs,
+    ProcessArgs, ProcessGitArgs, ProcessPathArgs, ProcessSource, StageArgs, StageCommand,
+    StageDiscardArgs, StageHandoffArgs,
 };
 
 #[test]
@@ -34,30 +34,6 @@ fn parses_each_processing_source_with_the_common_options() {
             action_mode: Some(ActionMode::Apply),
             source: ProcessSource::Path(ProcessPathArgs {
                 path: PathBuf::from("/incoming/upload"),
-            }),
-        })
-    );
-
-    let repo = Args::try_parse_from([
-        "file-guardian",
-        "process",
-        "--action-mode",
-        "evaluate",
-        "repo",
-        "--ref",
-        "release/v2",
-        "/work/repo",
-    ])
-    .unwrap();
-    assert_eq!(
-        repo.command,
-        Command::Process(ProcessArgs {
-            profile: None,
-            request_id: None,
-            action_mode: Some(ActionMode::Evaluate),
-            source: ProcessSource::Repo(ProcessRepoArgs {
-                checkout_ref: Some("release/v2".to_string()),
-                path: PathBuf::from("/work/repo"),
             }),
         })
     );

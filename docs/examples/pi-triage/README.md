@@ -6,7 +6,9 @@
 
 The response is bound to one invocation, inspection phase, sealed manifest,
 canonical request, and prior-finding projection. Every assigned finding must
-appear exactly once. It contains only closed classifications, confidence,
-reason codes, finding identities, advisory action codes, attestation, and
-coverage. It cannot contain scanner output, matched content, snippets,
-candidate findings, paths, prose rationale, prompts, or credentials.
+appear exactly once. The private request given to trusted Pi includes the exact
+matched evidence and staged path or Git commit/blob/ref provenance needed to
+judge each deterministic finding. This terminal response contains only closed
+classifications, confidence, reason codes, finding identities, advisory action
+codes, attestation, and coverage; it cannot echo evidence, scanner output,
+paths, prose rationale, prompts, or credentials.

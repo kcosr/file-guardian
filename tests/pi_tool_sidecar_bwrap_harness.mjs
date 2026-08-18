@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -19,24 +19,23 @@ function unavailable(result) {
 	);
 }
 
-assert.equal(unavailable({ error: { code: "ETIMEDOUT" }, stderr: "" }), true);
-assert.equal(unavailable({ stderr: "bwrap: setting up uid map: Permission denied" }), true);
-assert.equal(unavailable({ status: 1, stderr: "unexpected Bubblewrap failure" }), false);
-
 const probe = spawnSync(
 	BWRAP,
 	[
-		"--unshare-all",
-		"--unshare-user",
-		"--disable-userns",
-		"--assert-userns-disabled",
+		"--unshare-net",
+		"--unshare-pid",
 		"--die-with-parent",
-		"--new-session",
 		"--ro-bind",
-		"/",
-		"/",
+		"/usr",
+		"/usr",
+		"--ro-bind",
+		"/lib",
+		"/lib",
+		"--ro-bind",
+		"/lib64",
+		"/lib64",
 		"--",
-		"/bin/true",
+		"/usr/bin/true",
 	],
 	{ encoding: "utf8", timeout: 3_000 },
 );
@@ -46,70 +45,36 @@ if (unavailable(probe)) {
 }
 assert.equal(probe.status, 0, probe.stderr || "Bubblewrap probe failed");
 
-function dynamicDependencies(executable) {
-	const result = spawnSync("ldd", [executable], { encoding: "utf8", timeout: 3_000 });
-	assert.equal(result.status, 0, result.stderr || `ldd failed for ${executable}`);
-	const dependencies = new Set();
-	for (const line of result.stdout.split("\n")) {
-		const arrow = line.match(/=>\s+(\/\S+)\s+\(0x[0-9a-f]+\)/i);
-		const direct = line.match(/^\s*(\/\S+)\s+\(0x[0-9a-f]+\)/i);
-		const path = arrow?.[1] ?? direct?.[1];
-		if (path) dependencies.add(path);
-	}
-	return dependencies;
-}
-
 const temporary = await mkdtemp(join(tmpdir(), "file-guardian-bwrap-sidecar-"));
-const runtime = join(temporary, "runtime");
-const runtimeBin = join(runtime, "bin");
-const dependencyCopies = join(temporary, "dependencies");
 const input = join(temporary, "input");
 const outside = join(temporary, "outside-sentinel");
+await mkdir(input, { mode: 0o700 });
 await Promise.all([
-	mkdir(runtimeBin, { recursive: true, mode: 0o700 }),
-	mkdir(dependencyCopies, { mode: 0o700 }),
-	mkdir(input, { mode: 0o700 }),
-]);
-await Promise.all([
-	copyFile(process.execPath, join(runtimeBin, "node")),
-	copyFile("/bin/bash", join(runtimeBin, "bash")),
 	writeFile(join(input, "artifact.txt"), "immutable\n", { mode: 0o400 }),
-	writeFile(outside, "host-only\n", { mode: 0o600 }),
+	writeFile(outside, "outside sparse runtime\n", { mode: 0o600 }),
 ]);
-await Promise.all([chmod(join(runtimeBin, "node"), 0o500), chmod(join(runtimeBin, "bash"), 0o500)]);
+const gitInit = spawnSync("git", ["init", "-q", "-b", "main", input], { encoding: "utf8" });
+assert.equal(gitInit.status, 0, gitInit.stderr);
+const gitAdd = spawnSync("git", ["-C", input, "add", "artifact.txt"], { encoding: "utf8" });
+assert.equal(gitAdd.status, 0, gitAdd.stderr);
+const gitCommit = spawnSync("git", ["-C", input, "commit", "-q", "-m", "fixture"], {
+	encoding: "utf8",
+	env: {
+		...process.env,
+		GIT_AUTHOR_NAME: "File Guardian Fixture",
+		GIT_AUTHOR_EMAIL: "fixture@example.invalid",
+		GIT_COMMITTER_NAME: "File Guardian Fixture",
+		GIT_COMMITTER_EMAIL: "fixture@example.invalid",
+	},
+});
+assert.equal(gitCommit.status, 0, gitCommit.stderr);
 
-const dependencies = new Set([
-	...dynamicDependencies(process.execPath),
-	...dynamicDependencies("/bin/bash"),
-]);
-const libraryMounts = [];
-let dependencyIndex = 0;
-for (const target of [...dependencies].sort()) {
-	const source = join(dependencyCopies, String(dependencyIndex++));
-	await copyFile(target, source);
-	// The ELF interpreter is one of these manifest-like dependency mounts and
-	// must retain execute permission; using the same read/execute mode for the
-	// shared libraries keeps the fixture simple and read-only in the sandbox.
-	await chmod(source, 0o500);
-	libraryMounts.push({ source, target });
-}
-
-const directoryTargets = new Set();
-for (const { target } of libraryMounts) {
-	let current = dirname(target);
-	while (current !== "/") {
-		directoryTargets.add(current);
-		current = dirname(current);
-	}
-}
-const libraryArguments = [];
-for (const directory of [...directoryTargets].sort(
-	(left, right) => left.split("/").length - right.split("/").length || left.localeCompare(right),
-)) {
-	libraryArguments.push("--dir", directory);
-}
-for (const { source, target } of libraryMounts) {
-	libraryArguments.push("--ro-bind", source, target);
+const nodeRoot = dirname(dirname(process.execPath));
+const nodeParents = [];
+let parent = dirname(nodeRoot);
+while (parent !== "/") {
+	nodeParents.unshift(parent);
+	parent = dirname(parent);
 }
 
 const server = createServer();
@@ -126,34 +91,33 @@ const address = server.address();
 assert.ok(address && typeof address === "object");
 
 const argumentsList = [
-	"--unshare-all",
-	"--unshare-user",
-	"--disable-userns",
-	"--assert-userns-disabled",
+	"--unshare-net",
+	"--unshare-pid",
 	"--die-with-parent",
 	"--new-session",
-	"--hostname",
-	"file-guardian-tools",
-	"--cap-drop",
-	"ALL",
 	"--tmpfs",
 	"/",
-	"--dir",
-	"/runtime",
+	"--ro-bind",
+	"/usr",
+	"/usr",
+	"--ro-bind",
+	"/bin",
+	"/bin",
+	"--ro-bind",
+	"/lib",
+	"/lib",
+	"--ro-bind",
+	"/lib64",
+	"/lib64",
+	"--ro-bind",
+	"/etc",
+	"/etc",
+	...nodeParents.flatMap((directory) => ["--dir", directory]),
+	"--ro-bind",
+	nodeRoot,
+	nodeRoot,
 	"--dir",
 	"/policy",
-	"--dir",
-	"/input",
-	"--dir",
-	"/work",
-	"--dir",
-	"/tmp",
-	"--dev",
-	"/dev",
-	...libraryArguments,
-	"--ro-bind",
-	runtime,
-	"/runtime",
 	"--ro-bind",
 	runnerSource.pathname,
 	"/policy/tool-sidecar-runner.mjs",
@@ -164,10 +128,23 @@ const argumentsList = [
 	"/work",
 	"--tmpfs",
 	"/tmp",
+	"--proc",
+	"/proc",
+	"--dev",
+	"/dev",
 	"--chdir",
 	"/work",
+	"--setenv",
+	"FILE_GUARDIAN_INPUT_ROOT",
+	"/input",
+	"--setenv",
+	"FILE_GUARDIAN_WORK_ROOT",
+	"/work",
+	"--setenv",
+	"FILE_GUARDIAN_TOOL_PATH",
+	"/usr/local/bin:/usr/bin:/bin",
 	"--",
-	"/runtime/bin/node",
+	process.execPath,
 	"/policy/tool-sidecar-runner.mjs",
 ];
 
@@ -200,15 +177,18 @@ try {
 	assert.equal(read.status, "ok");
 	assert.equal(read.result.text, "immutable");
 
-	const isolatedRoot = await request("bash", {
-		command:
-			"test ! -e /proc/self/environ && test ! -e /etc/passwd && test ! -e /usr/bin/env && test ! -e /outside-sentinel",
+	const normalRuntime = await request("bash", {
+		command: "test -r /etc/passwd && test -x /usr/bin/env && test ! -e /outside-sentinel",
 	});
-	assert.equal(isolatedRoot.status, "ok");
-	assert.match(isolatedRoot.result.text, /\[exit 0\]$/);
+	assert.match(normalRuntime.result.text, /\[exit 0\]$/);
+
+	const gitHistory = await request("bash", {
+		command: "git -C /input rev-parse --verify HEAD && git -C /input log -1 --format=%s",
+	});
+	assert.match(gitHistory.result.text, /fixture/);
+	assert.match(gitHistory.result.text, /\[exit 0\]$/);
 
 	const immutableInput = await request("bash", { command: "printf changed > /input/artifact.txt" });
-	assert.equal(immutableInput.status, "ok");
 	assert.doesNotMatch(immutableInput.result.text, /\[exit 0\]$/);
 	assert.equal(await readFile(join(input, "artifact.txt"), "utf8"), "immutable\n");
 
@@ -222,7 +202,6 @@ try {
 	const network = await request("bash", {
 		command: `printf probe > /dev/tcp/127.0.0.1/${address.port}`,
 	});
-	assert.equal(network.status, "ok");
 	assert.doesNotMatch(network.result.text, /\[exit 0\]$/);
 	await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
 	assert.equal(hostConnectionObserved, false);

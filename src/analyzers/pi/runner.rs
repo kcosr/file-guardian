@@ -23,7 +23,6 @@ pub(crate) struct PiRunLimits {
     pub idle_timeout: Duration,
     pub wall_timeout: Duration,
     pub termination_grace: Duration,
-    pub memory_bytes: u64,
     pub cpu_seconds: u64,
     pub open_files: u64,
     pub stdout_bytes: u64,
@@ -36,7 +35,6 @@ impl PiRunLimits {
             && !self.idle_timeout.is_zero()
             && !self.wall_timeout.is_zero()
             && !self.termination_grace.is_zero()
-            && self.memory_bytes > 0
             && self.cpu_seconds > 0
             && self.open_files > 0
             && self.stdout_bytes > 0
@@ -512,7 +510,6 @@ fn kill_group(raw_pid: u32, signal: rustix::process::Signal) {
 #[cfg(unix)]
 fn install_child_limits(limits: &PiRunLimits, inherited_proxy_fd: RawFd) -> std::io::Result<()> {
     for (resource, value) in [
-        (rustix::process::Resource::As, limits.memory_bytes),
         (rustix::process::Resource::Cpu, limits.cpu_seconds),
         (rustix::process::Resource::Nofile, limits.open_files),
         (rustix::process::Resource::Core, 0),
@@ -637,7 +634,6 @@ mod tests {
             idle_timeout: Duration::from_secs(2),
             wall_timeout: Duration::from_secs(3),
             termination_grace: Duration::from_millis(50),
-            memory_bytes: 256 * 1024 * 1024,
             cpu_seconds: 2,
             open_files: 64,
             stdout_bytes: 64,

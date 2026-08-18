@@ -36,7 +36,6 @@ pub struct ScannerRunLimits {
     pub wall_timeout: Duration,
     pub termination_grace: Duration,
     pub max_output_bytes: u64,
-    pub memory_bytes: u64,
     pub cpu_seconds: u64,
     pub open_files: u64,
 }
@@ -46,7 +45,6 @@ impl ScannerRunLimits {
         !self.wall_timeout.is_zero()
             && !self.termination_grace.is_zero()
             && self.max_output_bytes > 0
-            && self.memory_bytes > 0
             && self.cpu_seconds > 0
             && self.open_files > 0
     }
@@ -345,7 +343,6 @@ impl ExternalScannerRunner {
             wall_timeout: limits.wall_timeout.min(Duration::from_secs(2)),
             termination_grace: limits.termination_grace,
             max_output_bytes: limits.max_output_bytes.min(128),
-            memory_bytes: limits.memory_bytes,
             cpu_seconds: limits.cpu_seconds.min(2),
             open_files: limits.open_files,
         };
@@ -620,7 +617,6 @@ fn kill_group(raw_pid: u32, signal: rustix::process::Signal) {
 #[cfg(unix)]
 fn install_child_limits(limits: &ScannerRunLimits, inherited_fds: &[RawFd]) -> io::Result<()> {
     for (resource, value) in [
-        (rustix::process::Resource::As, limits.memory_bytes),
         (rustix::process::Resource::Cpu, limits.cpu_seconds),
         (rustix::process::Resource::Nofile, limits.open_files),
         (rustix::process::Resource::Fsize, limits.max_output_bytes),
@@ -751,7 +747,6 @@ mod tests {
             wall_timeout: Duration::from_secs(2),
             termination_grace: Duration::from_millis(50),
             max_output_bytes: 1024,
-            memory_bytes: 128 * 1024 * 1024,
             cpu_seconds: 2,
             open_files: 64,
         }

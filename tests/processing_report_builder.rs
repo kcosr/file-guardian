@@ -12,10 +12,10 @@ use file_guardian::processing::config::{
     AnalyzerKind, AnalyzerLimits, AnalyzerSelection, BuiltinRulesConfig, CaptureLimits,
     CompletionDisposition as ConfigCompletionDisposition,
     CompletionPolicy as ConfigCompletionPolicy, ContentApplicability, DaemonConfig,
-    ExternalScannerRuntimeConfig, GitPolicy, HistoryScope, JobsConfig, LfsPolicy, LocalPolicy,
-    PhaseExecution, PipelineConfig, PipelineStage, PriorLimits, PriorObservations,
-    ProcessingConfig, ProcessingConfigFile, ProcessingProfile, ProfilePurpose, RetentionConfig,
-    SourceScope, StageExecution, SubmodulePolicy, SymlinkPolicy, UnboundObservation,
+    ExternalScannerRuntimeConfig, GitPolicy, HistoryScope, JobsConfig, LfsPolicy, PhaseExecution,
+    PipelineConfig, PipelineStage, PriorLimits, PriorObservations, ProcessingConfig,
+    ProcessingConfigFile, ProcessingProfile, ProfilePurpose, RetentionConfig, SourceScope,
+    StageExecution, SubmodulePolicy, UnboundObservation,
 };
 use file_guardian::processing::domain::{
     ActionId, ActionJournalState, ActionKind, ActionRecord, Disposition, Finding, FindingId,
@@ -104,10 +104,6 @@ fn runtime() -> file_guardian::processing::runtime::CompiledProcessingRuntime {
                     allowed_checkout_ref_patterns: vec!["refs/heads/*".into()],
                     submodules: SubmodulePolicy::Reject,
                     lfs: LfsPolicy::RejectPointer,
-                    symlinks: SymlinkPolicy::Reject,
-                },
-                local: LocalPolicy {
-                    symlinks: SymlinkPolicy::Reject,
                 },
                 completion: ConfigCompletionPolicy {
                     allow: ConfigCompletionDisposition::Retain,
@@ -281,6 +277,8 @@ fn phase(phase: InspectionPhase, directive: Option<PolicyDirective>) -> PhaseFix
             findings,
             correlations: Vec::new(),
             observation_to_finding: BTreeMap::new(),
+            observation_to_occurrence: BTreeMap::new(),
+            evidence: Vec::new(),
             coverage: vec![AnalyzerCoverage::new(
                 analyzer.clone(),
                 phase,
@@ -477,67 +475,6 @@ fn assembles_allow_and_deny_without_private_source_material() {
     );
     assert_eq!(deny_report.outcome, ProcessingOutcome::Deny);
     assert_eq!(deny_report.exit_code, 20);
-}
-
-#[test]
-fn history_only_report_builder_omits_the_publication_stage() {
-    let runtime = runtime();
-    let acquisition = acquisition();
-    let initial = phase(InspectionPhase::Initial, None);
-    let stage_manifest = Digest::sha256(b"unused publication stage");
-    let completion = completion(Outcome::Allow, stage_manifest, stage_manifest);
-    let source: ProcessSource = serde_json::from_value(serde_json::json!({
-        "kind": "repo",
-        "repository_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "resolved_head": "sha1:2222222222222222222222222222222222222222",
-        "working_tree": false,
-        "bare": true,
-        "history": "head",
-        "frozen_refs": [{
-            "name": {"segments": [
-                {"encoding": "utf8", "value": "refs"},
-                {"encoding": "utf8", "value": "heads"},
-                {"encoding": "utf8", "value": "main"}
-            ]},
-            "object_id": "sha1:2222222222222222222222222222222222222222",
-            "peeled_commit_id": "sha1:2222222222222222222222222222222222222222"
-        }]
-    }))
-    .unwrap();
-    let report = build_processing_report(ProcessingReportBuildInput {
-        run_id: &runtime.run_id,
-        request_id: None,
-        runtime: Some(&runtime),
-        source: Some(&source),
-        acquisition: Some(&acquisition),
-        initial: Some(PhaseReportInput {
-            result: &initial.result,
-            manifest_identity: initial.snapshot_identity,
-            artifacts: &initial.catalog,
-            artifact_metadata: &initial.metadata,
-            policy: &initial.policy,
-            analyzer_duration_ms: &initial.durations,
-            duration_ms: 3,
-        }),
-        verification: None,
-        completion: Some(&completion),
-        pi_invocations: Vec::new(),
-        adjudications: &[],
-        actions: &[],
-        issues: &[],
-        degradations: &[],
-        started_at: timestamp("2026-08-17T12:00:00+00:00"),
-        finished_at: timestamp("2026-08-17T12:00:02+00:00"),
-        duration_ms: 2_000,
-        persistence_status: PersistenceStatus::Durable,
-        omission_reason: None,
-    })
-    .unwrap();
-    assert!(report.stage.is_none());
-    assert_eq!(
-        report.phases.initial.unwrap().manifest_identity.as_str(),
-        initial.snapshot_identity.to_string()
-    );
 }
 
 #[test]

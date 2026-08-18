@@ -1,7 +1,11 @@
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use file_guardian::processing::config::ProcessingConfigFile;
 use file_guardian::processing::report::{
@@ -14,6 +18,9 @@ struct Fixture {
     config: PathBuf,
     input: PathBuf,
     reports: PathBuf,
+    quarantine: PathBuf,
+    artifact_quarantine: PathBuf,
+    scanner_path: Option<OsString>,
 }
 
 impl Fixture {
@@ -23,6 +30,16 @@ impl Fixture {
 
     fn applying(filename: &str, contents: &[u8]) -> Self {
         Self::with_profile(filename, contents, true, false)
+    }
+
+    fn quarantining(filename: &str, contents: &[u8]) -> Self {
+        let fixture = Self::with_profile(filename, contents, true, false);
+        let config = fs::read_to_string(&fixture.config)
+            .unwrap()
+            .replace("directive = \"delete\"", "directive = \"quarantine\"");
+        ProcessingConfigFile::parse(&config).unwrap();
+        fs::write(&fixture.config, config).unwrap();
+        fixture
     }
 
     fn with_git_history(filename: &str, contents: &[u8]) -> Self {
@@ -48,7 +65,7 @@ impl Fixture {
             &reports,
             &quarantine,
             &artifact_quarantine,
-            &rules,
+            AnalyzerFixture::Builtin { rules: &rules },
             apply,
             git_history,
         );
@@ -59,26 +76,96 @@ impl Fixture {
             config,
             input,
             reports,
+            quarantine,
+            artifact_quarantine,
+            scanner_path: None,
+        }
+    }
+
+    fn failing_verification() -> Self {
+        let temporary = tempfile::tempdir().unwrap();
+        let jobs = private_dir(temporary.path(), "jobs");
+        let reports = private_dir(temporary.path(), "reports");
+        let quarantine = private_dir(temporary.path(), "quarantine");
+        let artifact_quarantine = private_dir(temporary.path(), "artifact-quarantine");
+        let input = temporary.path().join("private-input");
+        fs::create_dir(&input).unwrap();
+        fs::write(
+            input.join("delete.txt"),
+            b"password = \"FG_INITIAL_PRIVATE_PASSWORD\"\n",
+        )
+        .unwrap();
+        fs::write(input.join("keep.txt"), b"ordinary retained fixture\n").unwrap();
+
+        let scanner_bin = private_dir(temporary.path(), "scanner-bin");
+        let scanner = scanner_bin.join("gitleaks");
+        fs::write(
+            &scanner,
+            br#"#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '%s\n' 'gitleaks version 8.25.1'
+  exit 0
+fi
+if [ -e /input/delete.txt ]; then
+  file=delete.txt
+else
+  file=keep.txt
+fi
+printf '[{"RuleID":"generic-password","StartLine":1,"EndLine":1,"StartColumn":1,"EndColumn":8,"File":"%s","SymlinkFile":"","Commit":"","Tags":["password"],"Secret":"REDACTED"}]' "$file" > /output/findings.json
+exit 42
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&scanner, fs::Permissions::from_mode(0o700)).unwrap();
+        let scanner_config = temporary.path().join("gitleaks.toml");
+        let scanner_ignore = temporary.path().join("gitleaks.ignore");
+        fs::write(&scanner_config, b"[extend]\nuseDefault = true\n").unwrap();
+        fs::write(&scanner_ignore, b"# intentionally empty fixture\n").unwrap();
+
+        let config = temporary.path().join("config.toml");
+        let config_contents = config_text(
+            &jobs,
+            &reports,
+            &quarantine,
+            &artifact_quarantine,
+            AnalyzerFixture::Gitleaks {
+                config: &scanner_config,
+                ignore: &scanner_ignore,
+            },
+            true,
+            false,
+        )
+        .replacen("error = \"quarantine\"", "error = \"discard\"", 1);
+        ProcessingConfigFile::parse(&config_contents).unwrap();
+        fs::write(&config, config_contents).unwrap();
+        let mut scanner_path = scanner_bin.into_os_string();
+        scanner_path.push(OsStr::new(":"));
+        scanner_path.push(std::env::var_os("PATH").unwrap_or_default());
+        Self {
+            _temporary: temporary,
+            config,
+            input,
+            reports,
+            quarantine,
+            artifact_quarantine,
+            scanner_path: Some(scanner_path),
         }
     }
 
     fn process_path(&self, request_id: Option<&str>) -> Output {
+        self.process_path_operand(request_id, &self.input)
+    }
+
+    fn process_path_operand(&self, request_id: Option<&str>, path: &Path) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_file-guardian"));
         command.arg("--config").arg(&self.config).arg("process");
         if let Some(request_id) = request_id {
             command.args(["--request-id", request_id]);
         }
-        command.arg("path").arg(&self.input).output().unwrap()
-    }
-
-    fn process_repo(&self) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_file-guardian"))
-            .arg("--config")
-            .arg(&self.config)
-            .args(["process", "repo"])
-            .arg(&self.input)
-            .output()
-            .unwrap()
+        if let Some(path) = &self.scanner_path {
+            command.env("PATH", path);
+        }
+        command.arg("path").arg(path).output().unwrap()
     }
 
     fn handoff_copy(&self, run_id: &str, destination: &Path) -> Output {
@@ -88,6 +175,15 @@ impl Fixture {
             .args(["stage", "handoff", run_id, "--destination"])
             .arg(destination)
             .args(["--mode", "copy"])
+            .output()
+            .unwrap()
+    }
+
+    fn artifact_command(&self, arguments: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_file-guardian"))
+            .arg("--config")
+            .arg(&self.config)
+            .args(arguments)
             .output()
             .unwrap()
     }
@@ -140,7 +236,7 @@ fn config_text(
     reports: &Path,
     quarantine: &Path,
     artifact_quarantine: &Path,
-    rules: &Path,
+    analyzer: AnalyzerFixture<'_>,
     apply: bool,
     git_history: bool,
 ) -> String {
@@ -159,18 +255,78 @@ fn config_text(
         "[\"physical_file\"]"
     };
     let inline_bindings = if apply { "" } else { "bindings = []\n" };
+    let (analyzer_id, rule_id, analyzer_block) = match analyzer {
+        AnalyzerFixture::Builtin { rules } => (
+            "rules",
+            "hardcoded-password",
+            format!(
+                r#"[[analyzers]]
+id = "rules"
+kind = "builtin_rules"
+rule_files = ["{}"]
+max_content_bytes = 1048576
+
+[analyzers.execution]
+initial = "required"
+verification = "required"
+
+[analyzers.selection]
+include = ["**"]
+exclude = []
+artifact_kinds = {artifact_kinds}
+
+[analyzers.limits]
+max_findings = 100
+"#,
+                rules.display()
+            ),
+        ),
+        AnalyzerFixture::Gitleaks { config, ignore } => (
+            "gitleaks",
+            "gitleaks:generic-password-32645174dcf4eebe",
+            format!(
+                r#"[[analyzers]]
+id = "gitleaks"
+kind = "gitleaks"
+executable = "gitleaks"
+version_requirement = ">=8.19,<9"
+config_file = "{}"
+ignore_file = "{}"
+
+[analyzers.execution]
+initial = "required"
+verification = "required"
+
+[analyzers.selection]
+include = ["**"]
+exclude = []
+artifact_kinds = ["physical_file"]
+
+[analyzers.limits]
+wall_timeout_secs = 10
+max_file_bytes = 1048576
+max_output_bytes = 1048576
+max_findings = 100
+"#,
+                config.display(),
+                ignore.display()
+            ),
+        ),
+    };
     let binding_tables = if apply {
-        r#"
+        format!(
+            r#"
 [[processing.profiles.bindings]]
-id = "delete-hardcoded-password"
+id = "delete-scanner-finding"
 priority = 100
 directive = "delete"
 
 [processing.profiles.bindings.selector]
-rule = "hardcoded-password"
+rule = "{rule_id}"
 "#
+        )
     } else {
-        ""
+        String::new()
     };
     format!(
         r#"schema_version = "3"
@@ -233,10 +389,6 @@ history_ref_patterns = {history_ref_patterns}
 allowed_checkout_ref_patterns = ["refs/heads/*", "refs/tags/*"]
 submodules = "reject"
 lfs = "reject_pointer"
-symlinks = "preserve"
-
-[processing.profiles.local]
-symlinks = "reject"
 
 [processing.profiles.completion]
 allow = "{completion}"
@@ -251,32 +403,20 @@ id = "builtins"
 
 [[pipelines.stages]]
 id = "rules"
-analyzers = ["rules"]
+analyzers = ["{analyzer_id}"]
 
-[[analyzers]]
-id = "rules"
-kind = "builtin_rules"
-rule_files = ["{}"]
-max_content_bytes = 1048576
-
-[analyzers.execution]
-initial = "required"
-verification = "required"
-
-[analyzers.selection]
-include = ["**"]
-exclude = []
-artifact_kinds = {artifact_kinds}
-
-[analyzers.limits]
-max_findings = 100
+{analyzer_block}
 "#,
         jobs.display(),
         reports.display(),
         quarantine.display(),
         artifact_quarantine.display(),
-        rules.display(),
     )
+}
+
+enum AnalyzerFixture<'a> {
+    Builtin { rules: &'a Path },
+    Gitleaks { config: &'a Path, ignore: &'a Path },
 }
 
 fn report(output: &Output) -> ProcessingReport {
@@ -375,6 +515,21 @@ fn missing_path_returns_one_durable_error_report() {
 }
 
 #[test]
+fn path_source_rejects_a_single_file_instead_of_inventing_a_third_shape() {
+    let fixture = Fixture::new("placeholder.txt", b"directory fixture\n");
+    let standalone = fixture._temporary.path().join("standalone.txt");
+    fs::write(&standalone, b"single file\n").unwrap();
+
+    let output = fixture.process_path_operand(Some("single-file"), &standalone);
+
+    assert_eq!(output.status.code(), Some(30));
+    let report = report(&output);
+    assert_eq!(report.outcome, ProcessingOutcome::Error);
+    assert_eq!(report.exit_code, 30);
+    assert_eq!(fs::read(&standalone).unwrap(), b"single file\n");
+}
+
+#[test]
 fn apply_delete_modifies_only_the_owned_stage_and_returns_allow_modified() {
     let contents = b"password = \"FG_PRIVATE_RUNTIME_PASSWORD\"\n";
     let fixture = Fixture::applying("settings.txt", contents);
@@ -422,13 +577,141 @@ fn apply_delete_modifies_only_the_owned_stage_and_returns_allow_modified() {
 }
 
 #[test]
+fn failed_second_pipeline_run_quarantines_the_modified_stage_without_handoff_or_rollback() {
+    let fixture = Fixture::failing_verification();
+    let original_delete = fs::read(fixture.input.join("delete.txt")).unwrap();
+    let original_keep = fs::read(fixture.input.join("keep.txt")).unwrap();
+
+    let output = fixture.process_path(Some("verification-failure"));
+
+    assert_eq!(
+        output.status.code(),
+        Some(30),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_private(&output, &fixture, &original_delete);
+    let report = report(&output);
+    assert_eq!(report.outcome, ProcessingOutcome::Error);
+    assert_eq!(report.exit_code, 30);
+    assert!(report.modified, "{report:#?}");
+    assert!(report.phases.initial.as_ref().unwrap().required_complete());
+    assert!(report
+        .phases
+        .verification
+        .as_ref()
+        .unwrap()
+        .required_complete());
+    assert_eq!(report.actions.len(), 1);
+    assert_eq!(report.actions[0].kind, ActionKind::Delete);
+    assert_eq!(report.actions[0].state, ActionState::Committed);
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.code.as_str() == "verification_failed"));
+    let stage = report.stage.as_ref().unwrap();
+    assert_eq!(stage.configured_disposition, ConfiguredDisposition::Discard);
+    assert_eq!(
+        stage.effective_disposition,
+        EffectiveDisposition::Quarantined
+    );
+    assert_eq!(stage.handoff_status, HandoffStatus::Unavailable);
+    assert!(stage.reference.is_none());
+
+    assert_eq!(
+        fs::read(fixture.input.join("delete.txt")).unwrap(),
+        original_delete
+    );
+    assert_eq!(
+        fs::read(fixture.input.join("keep.txt")).unwrap(),
+        original_keep
+    );
+    let quarantined_stage = fixture
+        .quarantine
+        .join(report.run_id.as_str())
+        .join("stage");
+    assert!(!quarantined_stage.join("delete.txt").exists());
+    assert_eq!(
+        fs::read(quarantined_stage.join("keep.txt")).unwrap(),
+        original_keep
+    );
+}
+
+#[test]
+fn artifact_quarantine_can_be_inspected_recovered_and_idempotently_discarded() {
+    let contents = b"password = \"FG_PRIVATE_QUARANTINE_PASSWORD\"\n";
+    let fixture = Fixture::quarantining("quarantine.txt", contents);
+    fs::write(fixture.input.join("keep.txt"), b"retained fixture\n").unwrap();
+
+    let output = fixture.process_path(Some("artifact-quarantine"));
+    assert_eq!(output.status.code(), Some(10));
+    let report = report(&output);
+    assert_eq!(report.outcome, ProcessingOutcome::AllowModified);
+    let quarantine_id = report.actions[0]
+        .artifact_quarantine_id
+        .as_ref()
+        .unwrap()
+        .as_str();
+    assert!(fixture.artifact_quarantine.join(quarantine_id).is_file());
+    assert_eq!(
+        fs::read(fixture.input.join("quarantine.txt")).unwrap(),
+        contents
+    );
+
+    let inspect =
+        fixture.artifact_command(&["artifact", "inspect", report.run_id.as_str(), quarantine_id]);
+    assert_eq!(inspect.status.code(), Some(0));
+    assert!(!inspect
+        .stdout
+        .windows(contents.len())
+        .any(|window| window == contents));
+
+    let destination = fixture._temporary.path().join("recovered.txt");
+    let recover = fixture.artifact_command(&[
+        "artifact",
+        "recover",
+        report.run_id.as_str(),
+        quarantine_id,
+        "--destination",
+        destination.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        recover.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&recover.stdout)
+    );
+    assert_eq!(fs::read(&destination).unwrap(), contents);
+    let repeated_recover = fixture.artifact_command(&[
+        "artifact",
+        "recover",
+        report.run_id.as_str(),
+        quarantine_id,
+        "--destination",
+        destination.to_str().unwrap(),
+    ]);
+    assert_eq!(repeated_recover.status.code(), Some(20));
+
+    let discard =
+        fixture.artifact_command(&["artifact", "discard", report.run_id.as_str(), quarantine_id]);
+    assert_eq!(discard.status.code(), Some(0));
+    assert!(!fixture.artifact_quarantine.join(quarantine_id).exists());
+    let repeated_discard =
+        fixture.artifact_command(&["artifact", "discard", report.run_id.as_str(), quarantine_id]);
+    assert_eq!(repeated_discard.status.code(), Some(0));
+    let inspect_after =
+        fixture.artifact_command(&["artifact", "inspect", report.run_id.as_str(), quarantine_id]);
+    assert_eq!(inspect_after.status.code(), Some(20));
+}
+
+#[test]
 fn clean_local_repository_uses_the_same_pipeline_without_mutating_git_state() {
     let contents = b"repository fixture\n";
     let fixture = Fixture::new("README.md", contents);
     fixture.initialize_git_repository();
     let head_before = fs::read(fixture.input.join(".git/HEAD")).unwrap();
 
-    let output = fixture.process_repo();
+    let output = fixture.process_path(None);
 
     assert_eq!(
         output.status.code(),
@@ -441,11 +724,10 @@ fn clean_local_repository_uses_the_same_pipeline_without_mutating_git_state() {
     assert_eq!(report.outcome, ProcessingOutcome::Allow);
     assert!(matches!(
         report.source,
-        Some(SourceSummary::Repo {
-            working_tree: true,
-            history: file_guardian::processing::report::HistoryScope::None,
+        Some(SourceSummary::Path {
+            repository: Some(ref repository),
             ..
-        })
+        }) if repository.history == file_guardian::processing::report::HistoryScope::None
     ));
     assert_eq!(
         fs::read(fixture.input.join(".git/HEAD")).unwrap(),
@@ -464,7 +746,7 @@ fn reachable_history_profile_finds_a_secret_removed_from_the_working_tree() {
     fixture.commit_all("remove historical secret");
     let head_before = fs::read(fixture.input.join(".git/HEAD")).unwrap();
 
-    let output = fixture.process_repo();
+    let output = fixture.process_path(None);
 
     assert_eq!(
         output.status.code(),
@@ -477,11 +759,10 @@ fn reachable_history_profile_finds_a_secret_removed_from_the_working_tree() {
     assert_eq!(report.outcome, ProcessingOutcome::Deny);
     assert!(matches!(
         report.source,
-        Some(SourceSummary::Repo {
-            working_tree: true,
-            history: file_guardian::processing::report::HistoryScope::Reachable,
+        Some(SourceSummary::Path {
+            repository: Some(ref repository),
             ..
-        })
+        }) if repository.history == file_guardian::processing::report::HistoryScope::Reachable
     ));
     assert!(report
         .phases
@@ -497,5 +778,78 @@ fn reachable_history_profile_finds_a_secret_removed_from_the_working_tree() {
     assert_eq!(
         fs::read(fixture.input.join(".git/HEAD")).unwrap(),
         head_before
+    );
+}
+
+#[test]
+fn daemon_run_on_start_submits_the_same_owned_stage_workflow_and_stops_cleanly() {
+    let contents = b"daemon upload fixture\n";
+    let fixture = Fixture::new("upload.txt", contents);
+    let mut config = fs::read_to_string(&fixture.config).unwrap();
+    config.push_str(&format!(
+        r#"
+[[daemon.jobs]]
+id = "incoming-upload"
+enabled = true
+profile = "review"
+schedule = "0 0 0 1 1 *"
+run_on_start = true
+overlap = "reject"
+
+[daemon.jobs.source]
+kind = "path"
+path = "{}"
+"#,
+        fixture.input.display()
+    ));
+    ProcessingConfigFile::parse(&config).unwrap();
+    fs::write(&fixture.config, config).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_file-guardian"))
+        .arg("--config")
+        .arg(&fixture.config)
+        .args(["daemon", "--job", "incoming-upload"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (line_tx, line_rx) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        let result = BufReader::new(stdout).read_line(&mut line);
+        let _ = line_tx.send((result, line));
+    });
+    let (read, line) = match line_rx.recv_timeout(Duration::from_secs(15)) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = child.kill();
+            panic!("daemon did not produce its run-on-start report: {error}");
+        }
+    };
+    assert!(read.unwrap() > 0);
+    let report: ProcessingReport = serde_json::from_str(&line).unwrap();
+    assert_eq!(report.outcome, ProcessingOutcome::Allow);
+    assert_eq!(
+        report.request_id.unwrap().as_str(),
+        "daemon:incoming-upload"
+    );
+    assert_eq!(
+        fs::read(fixture.input.join("upload.txt")).unwrap(),
+        contents
+    );
+
+    let signal = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signal.success());
+    let output = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

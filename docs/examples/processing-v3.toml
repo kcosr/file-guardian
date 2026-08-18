@@ -59,10 +59,6 @@ history_ref_patterns = []
 allowed_checkout_ref_patterns = ["refs/heads/*", "refs/tags/*"]
 submodules = "reject"
 lfs = "reject_pointer"
-symlinks = "preserve"
-
-[processing.profiles.local]
-symlinks = "reject"
 
 [processing.profiles.completion]
 allow = "retain"
@@ -96,10 +92,6 @@ history_ref_patterns = ["refs/heads/*", "refs/tags/release-*"]
 allowed_checkout_ref_patterns = ["refs/heads/*", "refs/tags/*"]
 submodules = "reject"
 lfs = "reject_pointer"
-symlinks = "preserve"
-
-[processing.profiles.local]
-symlinks = "reject"
 
 [processing.profiles.completion]
 allow = "discard"

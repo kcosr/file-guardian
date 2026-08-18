@@ -3,6 +3,7 @@
 pub mod acquisition;
 pub mod actions;
 pub mod adjudication;
+pub mod artifact;
 pub mod builtin_backend;
 pub mod catalog;
 pub mod completion;

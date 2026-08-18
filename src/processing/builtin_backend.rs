@@ -1,5 +1,6 @@
 //! Schema-3 adapter for the in-process deterministic rules analyzer.
 
+use std::io::Read;
 use std::sync::Arc;
 
 use crate::analyzers::ArtifactReadError;
@@ -7,12 +8,16 @@ use crate::analyzers::{
     BuiltinAssignmentDisposition, BuiltinProcessingAssignment, BuiltinProcessingError,
     BuiltinProcessingReader, BuiltinRulesAnalyzer,
 };
-use crate::domain::ArtifactId;
+use crate::domain::{ArtifactId, Digest, NormalizedObservation};
 use crate::processing::executor::{
     AnalyzerBackendError, AnalyzerBackendOutput, AnalyzerInvocation, AssignmentDisposition,
-    AssignmentOutcome, BackendFuture, BuiltinProcessingBackend,
+    AssignmentOutcome, BackendFuture, BackendObservationEvidence, BuiltinProcessingBackend,
+    ProcessingAssignment,
 };
-use crate::processing::external_backend::{ProcessingArtifactReadError, ProcessingArtifactReader};
+use crate::processing::external_backend::{
+    canonical_evidence_window, ProcessingArtifactReadError, ProcessingArtifactReader,
+};
+use crate::processing::CredentialVerificationState;
 
 /// Executes deterministic rules only against the immutable captured object
 /// manifest and reader. The live source and mutable stage are never consulted.
@@ -53,6 +58,11 @@ where
             let result = runtime
                 .analyze_processing(invocation.phase, &assignments, &reader)
                 .map_err(map_processing_error)?;
+            let evidence = observation_evidence(
+                self.reader.as_ref(),
+                &invocation.assignments,
+                &result.observations,
+            )?;
 
             let assignments = invocation
                 .assignments
@@ -79,12 +89,59 @@ where
             Ok(AnalyzerBackendOutput {
                 assignments,
                 observations: result.observations,
-                evidence: Vec::new(),
+                evidence,
                 scanner_version: None,
                 pi_analysis: None,
             })
         })
     }
+}
+
+fn observation_evidence<R: ProcessingArtifactReader>(
+    reader: &R,
+    assignments: &[ProcessingAssignment],
+    observations: &[NormalizedObservation],
+) -> Result<Vec<BackendObservationEvidence>, AnalyzerBackendError> {
+    let mut evidence = Vec::new();
+    for observation in observations {
+        let NormalizedObservation::Finding(finding) = observation else {
+            continue;
+        };
+        let Some(location) = finding.location.as_ref() else {
+            continue;
+        };
+        let assignment = assignments
+            .iter()
+            .find(|assignment| assignment.artifact_id == finding.artifact_id)
+            .ok_or(AnalyzerBackendError::InvalidOutput)?;
+        let mut stream = reader
+            .open(&assignment.artifact_id)
+            .map_err(|_| AnalyzerBackendError::Unavailable)?;
+        let limit = assignment
+            .byte_len
+            .checked_add(1)
+            .ok_or(AnalyzerBackendError::InvalidOutput)?;
+        let mut bytes = Vec::new();
+        stream
+            .by_ref()
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(|_| AnalyzerBackendError::Unavailable)?;
+        if u64::try_from(bytes.len()).ok() != Some(assignment.byte_len)
+            || Digest::sha256(&bytes) != assignment.content_digest
+        {
+            return Err(AnalyzerBackendError::InvalidOutput);
+        }
+        let canonical_window = canonical_evidence_window(&bytes, location)
+            .ok_or(AnalyzerBackendError::InvalidOutput)?;
+        evidence.push(BackendObservationEvidence {
+            observation_id: finding.id.clone(),
+            canonical_window,
+            verification_state: CredentialVerificationState::Unverified,
+        });
+    }
+    evidence.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    Ok(evidence)
 }
 
 struct ProcessingReader<'a, R>(&'a R);
@@ -251,7 +308,9 @@ mod tests {
                 findings: Vec::new(),
                 correlations: Vec::new(),
                 observation_to_finding: BTreeMap::new(),
+                observation_to_occurrence: BTreeMap::new(),
             }),
+            prior_evidence: Arc::from([]),
             prior_coverage: Arc::from([]),
         };
         (analyzer, Arc::new(reader), invocation)
@@ -274,6 +333,11 @@ mod tests {
             AssignmentDisposition::Completed
         );
         assert_eq!(result.observations.len(), 2);
+        assert_eq!(result.evidence.len(), 2);
+        assert!(result
+            .evidence
+            .iter()
+            .all(|evidence| evidence.canonical_window == b"needle needle"));
     }
 
     #[tokio::test]

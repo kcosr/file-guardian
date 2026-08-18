@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
 use globset::Glob;
 use serde::{Deserialize, Serialize};
@@ -360,7 +361,6 @@ pub struct ProcessingProfile {
     pub bindings: Vec<ProcessingPolicyBinding>,
     pub source_scope: SourceScope,
     pub git: GitPolicy,
-    pub local: LocalPolicy,
     pub completion: CompletionPolicy,
     #[serde(default)]
     pub pi_adjudication: Option<PiAdjudication>,
@@ -372,15 +372,8 @@ impl ProcessingProfile {
         validate_id("processing.profiles.pipeline", &self.pipeline)?;
         self.source_scope.validate(&self.id)?;
         self.git.validate(&self.id)?;
-        self.local.validate(&self.id)?;
         self.completion.validate(self)?;
         validate_policy_bindings(self)?;
-        if self.purpose == ProfilePurpose::Handoff && !self.source_scope.working_tree {
-            return invalid(format!(
-                "handoff profile '{}' must select working_tree",
-                self.id
-            ));
-        }
         if let Some(pi) = &self.pi_adjudication {
             pi.validate(self)?;
         }
@@ -480,10 +473,10 @@ fn validate_policy_bindings(profile: &ProcessingProfile) -> Result<(), Processin
             && !profile
                 .pi_adjudication
                 .as_ref()
-                .is_some_and(|policy| policy.mode == PiAdjudicationMode::ClearFalsePositives)
+                .is_some_and(|policy| policy.mode == PiAdjudicationMode::Authoritative)
         {
             return invalid(format!(
-                "profile '{}' adjudicate binding '{}' requires clear_false_positives Pi adjudication",
+                "profile '{}' adjudicate binding '{}' requires authoritative Pi adjudication",
                 profile.id, binding.id
             ));
         }
@@ -533,8 +526,10 @@ pub struct SourceScope {
 
 impl SourceScope {
     fn validate(&self, profile: &str) -> Result<(), ProcessingConfigError> {
-        if !self.working_tree && self.history == HistoryScope::None {
-            return invalid(format!("profile '{profile}' selects no source surface"));
+        if !self.working_tree {
+            return invalid(format!(
+                "profile '{profile}' must select the staged working tree"
+            ));
         }
         match self.history {
             HistoryScope::Reachable if self.history_ref_patterns.is_empty() => {
@@ -576,7 +571,6 @@ pub struct GitPolicy {
     pub allowed_checkout_ref_patterns: Vec<String>,
     pub submodules: SubmodulePolicy,
     pub lfs: LfsPolicy,
-    pub symlinks: SymlinkPolicy,
 }
 
 impl GitPolicy {
@@ -614,18 +608,6 @@ pub enum LfsPolicy {
 pub enum SymlinkPolicy {
     Reject,
     Preserve,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalPolicy {
-    pub symlinks: SymlinkPolicy,
-}
-
-impl LocalPolicy {
-    fn validate(&self, _profile: &str) -> Result<(), ProcessingConfigError> {
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -670,75 +652,24 @@ pub struct PiAdjudication {
     pub required_initial: bool,
     #[serde(default)]
     pub required_after_actions: bool,
-    #[serde(default)]
-    pub minimum_confidence: Option<Confidence>,
-    #[serde(default)]
-    pub attestation: PiAttestationPolicy,
-    #[serde(default)]
-    pub non_clearable: NonClearable,
-    #[serde(default)]
-    pub clearance_rules: Vec<ClearanceRule>,
 }
 
 impl PiAdjudication {
     fn validate(&self, profile: &ProcessingProfile) -> Result<(), ProcessingConfigError> {
         validate_id("pi_adjudication.analyzer", &self.analyzer)?;
-        self.non_clearable.validate()?;
-        unique(
-            "pi_adjudication.clearance_rules",
-            &self.clearance_rules,
-            |v| &v.id,
-        )?;
-        for rule in &self.clearance_rules {
-            rule.validate()?;
-        }
-        for (index, left) in self.clearance_rules.iter().enumerate() {
-            for right in self.clearance_rules.iter().skip(index + 1) {
-                if left.overlaps(right) {
-                    return invalid(format!(
-                        "Pi clearance rules '{}' and '{}' overlap",
-                        left.id, right.id
-                    ));
-                }
-            }
-        }
-
-        if self.attestation.initial != AttestationRequirement::Advisory && !self.required_initial {
-            return invalid("non-advisory initial Pi attestation requires required_initial = true");
-        }
-        if self.attestation.post_action != AttestationRequirement::Advisory
-            && !self.required_after_actions
-        {
-            return invalid(
-                "non-advisory post_action Pi attestation requires required_after_actions = true",
-            );
-        }
-
         match self.mode {
             PiAdjudicationMode::Advisory => {
-                if self.minimum_confidence.is_some()
-                    || !self.clearance_rules.is_empty()
-                    || self.required_initial
-                    || self.required_after_actions
-                    || self.attestation != PiAttestationPolicy::default()
-                {
-                    return invalid(
-                        "advisory Pi adjudication cannot configure clearance or required attestation",
-                    );
+                if self.required_initial || self.required_after_actions {
+                    return invalid("advisory Pi adjudication cannot require phase completion");
                 }
             }
-            PiAdjudicationMode::ClearFalsePositives => {
-                if !self.required_initial
-                    || self.minimum_confidence.is_none()
-                    || self.clearance_rules.is_empty()
-                {
-                    return invalid(
-                        "clear_false_positives requires required_initial, minimum_confidence, and clearance_rules",
-                    );
+            PiAdjudicationMode::Authoritative => {
+                if !self.required_initial {
+                    return invalid("authoritative Pi adjudication requires required_initial");
                 }
                 if profile.action_mode == ActionMode::Apply && !self.required_after_actions {
                     return invalid(
-                        "apply profile with false-positive clearance requires required_after_actions",
+                        "apply profile with authoritative Pi adjudication requires required_after_actions",
                     );
                 }
             }
@@ -763,16 +694,6 @@ impl PiAdjudication {
                 profile.id
             ));
         }
-        if (execution.initial == PhaseExecution::Advisory
-            && self.attestation.initial != AttestationRequirement::Advisory)
-            || (execution.verification == PhaseExecution::Advisory
-                && self.attestation.post_action != AttestationRequirement::Advisory)
-        {
-            return invalid(format!(
-                "profile '{}' advisory Pi execution permits only advisory attestation",
-                profile.id
-            ));
-        }
         Ok(())
     }
 }
@@ -781,139 +702,7 @@ impl PiAdjudication {
 #[serde(rename_all = "snake_case")]
 pub enum PiAdjudicationMode {
     Advisory,
-    ClearFalsePositives,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Confidence {
-    Low,
-    Medium,
-    High,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PiAttestationPolicy {
-    pub initial: AttestationRequirement,
-    pub post_action: AttestationRequirement,
-}
-
-impl Default for PiAttestationPolicy {
-    fn default() -> Self {
-        Self {
-            initial: AttestationRequirement::Advisory,
-            post_action: AttestationRequirement::Advisory,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttestationRequirement {
-    Advisory,
-    DenyOnBlocking,
-    RequireNoBlocking,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct NonClearable {
-    #[serde(default)]
-    pub categories: Vec<String>,
-    #[serde(default)]
-    pub minimum_severity: Option<Severity>,
-    #[serde(default)]
-    pub verification_states: Vec<VerificationState>,
-    #[serde(default)]
-    pub hard_block_rules: Vec<String>,
-}
-
-impl NonClearable {
-    fn validate(&self) -> Result<(), ProcessingConfigError> {
-        validate_unique_ids("pi_adjudication.non_clearable.categories", &self.categories)?;
-        validate_unique_ids(
-            "pi_adjudication.non_clearable.hard_block_rules",
-            &self.hard_block_rules,
-        )?;
-        unique_values(
-            "pi_adjudication.non_clearable.verification_states",
-            &self.verification_states,
-        )
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClearanceRule {
-    pub id: String,
-    pub analyzer: String,
-    pub rules: Vec<String>,
-    pub categories: Vec<String>,
-    pub maximum_severity: Severity,
-    pub verification_states: Vec<VerificationState>,
-    pub reason_codes: Vec<String>,
-}
-
-impl ClearanceRule {
-    fn validate(&self) -> Result<(), ProcessingConfigError> {
-        validate_id("clearance_rules.id", &self.id)?;
-        validate_id("clearance_rules.analyzer", &self.analyzer)?;
-        for (name, values) in [
-            ("rules", &self.rules),
-            ("categories", &self.categories),
-            ("reason_codes", &self.reason_codes),
-        ] {
-            if values.is_empty() {
-                return invalid(format!(
-                    "clearance rule '{}' {name} must not be empty",
-                    self.id
-                ));
-            }
-            validate_unique_ids(&format!("clearance rule '{}' {name}", self.id), values)?;
-            if values.iter().any(|value| contains_glob(value)) {
-                return invalid(format!(
-                    "clearance rule '{}' {name} must contain exact values, not wildcards",
-                    self.id
-                ));
-            }
-        }
-        if self.verification_states.is_empty() {
-            return invalid(format!(
-                "clearance rule '{}' verification_states must not be empty",
-                self.id
-            ));
-        }
-        unique_values(
-            &format!("clearance rule '{}' verification_states", self.id),
-            &self.verification_states,
-        )
-    }
-
-    fn overlaps(&self, other: &Self) -> bool {
-        self.analyzer == other.analyzer
-            && intersects(&self.rules, &other.rules)
-            && intersects(&self.categories, &other.categories)
-            && intersects(&self.reason_codes, &other.reason_codes)
-            && intersects(&self.verification_states, &other.verification_states)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Severity {
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VerificationState {
-    Unverified,
-    Verified,
-    VerificationError,
+    Authoritative,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1143,7 +932,7 @@ pub struct PiClassifierConfig {
 impl PiClassifierConfig {
     fn validate(&self, id: &str) -> Result<(), ProcessingConfigError> {
         for (name, path) in [
-            ("runtime_root", &self.pi.runtime_root),
+            ("pi_executable", &self.pi.pi_executable),
             ("bubblewrap_executable", &self.pi.bubblewrap_executable),
             ("instruction_file", &self.pi.instruction_file),
             ("trusted_extension", &self.pi.trusted_extension),
@@ -1151,19 +940,6 @@ impl PiClassifierConfig {
             ("isolated_agent_dir", &self.pi.isolated_agent_dir),
         ] {
             validate_absolute_normalized(&format!("Pi analyzer '{id}' {name}"), path)?;
-        }
-        for (name, path) in [
-            ("runtime_manifest", &self.pi.runtime_manifest),
-            ("launcher", &self.pi.launcher),
-            ("pi_entrypoint", &self.pi.pi_entrypoint),
-        ] {
-            validate_normalized_relative(&format!("Pi analyzer '{id}' {name}"), path)?;
-        }
-        if self.pi.runtime_manifest == self.pi.launcher
-            || self.pi.runtime_manifest == self.pi.pi_entrypoint
-            || self.pi.launcher == self.pi.pi_entrypoint
-        {
-            return invalid(format!("Pi analyzer '{id}' runtime paths must be distinct"));
         }
         if self.pi.expected_bubblewrap_version.trim().is_empty()
             || self.pi.expected_pi_version.trim().is_empty()
@@ -1373,7 +1149,6 @@ pub struct AnalyzerLimits {
     pub idle_timeout_secs: Option<u64>,
     pub wall_timeout_secs: Option<u64>,
     pub termination_grace_secs: Option<u64>,
-    pub memory_bytes: Option<u64>,
     pub cpu_time_secs: Option<u64>,
     pub max_open_files: Option<u64>,
     pub max_stdout_bytes: Option<u64>,
@@ -1412,15 +1187,20 @@ impl AnalyzerLimits {
                 return invalid(format!("scanner analyzer '{id}' requires limits.{name}"));
             }
         }
-        if self.max_tool_calls.is_some()
-            || self.max_bytes_read.is_some()
-            || self.max_read_bytes_per_call.is_some()
-            || self.max_search_bytes_per_call.is_some()
-            || self.max_search_calls.is_some()
-            || self.max_search_results.is_some()
-        {
+        if self.named_values().into_iter().any(|(name, value)| {
+            !matches!(
+                name,
+                "wall_timeout_secs"
+                    | "termination_grace_secs"
+                    | "cpu_time_secs"
+                    | "max_open_files"
+                    | "max_file_bytes"
+                    | "max_output_bytes"
+                    | "max_findings"
+            ) && value.is_some()
+        }) {
             return invalid(format!(
-                "scanner analyzer '{id}' cannot configure Pi tool limits"
+                "scanner analyzer '{id}' configures a limit that is not enforced by the scanner runtime"
             ));
         }
         Ok(())
@@ -1473,17 +1253,16 @@ impl AnalyzerLimits {
         Ok(())
     }
 
-    fn values(&self) -> [Option<u64>; 22] {
+    fn values(&self) -> [Option<u64>; 21] {
         self.named_values().map(|(_, value)| value)
     }
 
-    fn named_values(&self) -> [(&'static str, Option<u64>); 22] {
+    fn named_values(&self) -> [(&'static str, Option<u64>); 21] {
         [
             ("startup_timeout_secs", self.startup_timeout_secs),
             ("idle_timeout_secs", self.idle_timeout_secs),
             ("wall_timeout_secs", self.wall_timeout_secs),
             ("termination_grace_secs", self.termination_grace_secs),
-            ("memory_bytes", self.memory_bytes),
             ("cpu_time_secs", self.cpu_time_secs),
             ("max_open_files", self.max_open_files),
             ("max_stdout_bytes", self.max_stdout_bytes),
@@ -1562,19 +1341,15 @@ impl DaemonJob {
         {
             return invalid(format!("daemon job '{}' has an invalid schedule", self.id));
         }
+        cron::Schedule::from_str(&self.schedule).map_err(|_| {
+            ProcessingConfigError::Invalid(format!(
+                "daemon job '{}' has an invalid schedule",
+                self.id
+            ))
+        })?;
         self.source.validate(&self.id)?;
         match &self.source {
-            DaemonSource::Path { .. } if profile.source_scope.history != HistoryScope::None => {
-                return invalid(format!(
-                    "path daemon job '{}' requires a profile with history = 'none'",
-                    self.id
-                ));
-            }
-            DaemonSource::Repo {
-                reference: Some(reference),
-                ..
-            }
-            | DaemonSource::Git {
+            DaemonSource::Git {
                 reference: Some(reference),
                 ..
             } if !matches_any_glob(reference, &profile.git.allowed_checkout_ref_patterns) => {
@@ -1606,11 +1381,6 @@ pub enum DaemonSource {
     Path {
         path: PathBuf,
     },
-    Repo {
-        path: PathBuf,
-        #[serde(default)]
-        reference: Option<String>,
-    },
     Git {
         remote: String,
         #[serde(default)]
@@ -1621,21 +1391,17 @@ pub enum DaemonSource {
 impl DaemonSource {
     fn validate(&self, job: &str) -> Result<(), ProcessingConfigError> {
         match self {
-            Self::Path { path } | Self::Repo { path, .. } => {
+            Self::Path { path } => {
                 validate_absolute_normalized(&format!("daemon job '{job}' path"), path)?;
             }
             Self::Git { remote, .. } => validate_remote(remote)?,
         }
-        match self {
-            Self::Repo {
-                reference: Some(reference),
-                ..
-            }
-            | Self::Git {
-                reference: Some(reference),
-                ..
-            } => validate_ref(reference)?,
-            _ => {}
+        if let Self::Git {
+            reference: Some(reference),
+            ..
+        } = self
+        {
+            validate_ref(reference)?;
         }
         Ok(())
     }
@@ -1710,24 +1476,6 @@ fn validate_absolute_normalized(name: &str, path: &Path) -> Result<(), Processin
     Ok(())
 }
 
-fn validate_normalized_relative(name: &str, path: &Path) -> Result<(), ProcessingConfigError> {
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::RootDir
-                    | Component::CurDir
-                    | Component::ParentDir
-                    | Component::Prefix(_)
-            )
-        })
-    {
-        return invalid(format!("{name} must be a normalized relative path"));
-    }
-    Ok(())
-}
-
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
@@ -1789,16 +1537,6 @@ fn unique_values<T: Ord>(name: &str, values: &[T]) -> Result<(), ProcessingConfi
         return invalid(format!("{name} contains duplicate values"));
     }
     Ok(())
-}
-
-fn intersects<T: Ord>(left: &[T], right: &[T]) -> bool {
-    left.iter().any(|value| right.contains(value))
-}
-
-fn contains_glob(value: &str) -> bool {
-    value
-        .bytes()
-        .any(|v| matches!(v, b'*' | b'?' | b'[' | b']'))
 }
 
 fn validate_executable(id: &str, executable: &str) -> Result<(), ProcessingConfigError> {
@@ -1927,10 +1665,7 @@ scope = "tree"
 platform = "linux"
 sandbox = "tool-sidecar-bubblewrap-v1"
 network = "pi_host_sidecar_none"
-runtime_root = "/opt/file-guardian/pi-runtime"
-runtime_manifest = "runtime-manifest.json"
-launcher = "bin/node"
-pi_entrypoint = "lib/pi/dist/cli.js"
+pi_executable = "/usr/local/bin/pi"
 bubblewrap_executable = "/usr/bin/bwrap"
 expected_bubblewrap_version = "0.11.1"
 expected_pi_version = "0.83.0"
@@ -1971,7 +1706,6 @@ startup_timeout_secs = 20
 idle_timeout_secs = 30
 wall_timeout_secs = 180
 termination_grace_secs = 5
-memory_bytes = 1073741824
 cpu_time_secs = 120
 max_open_files = 64
 max_stdout_bytes = 1048576
@@ -2039,13 +1773,13 @@ max_view_depth = 64
     }
 
     #[test]
-    fn validates_purpose_completion_and_daemon_source_matrix() {
+    fn validates_path_git_detection_purpose_completion_and_daemon_source_matrix() {
         let history_path_job = EXAMPLE.replacen(
             "\nprofile = \"upload\"\n",
             "\nprofile = \"repository-review\"\n",
             1,
         );
-        assert!(ProcessingConfigFile::parse(&history_path_job).is_err());
+        assert!(ProcessingConfigFile::parse(&history_path_job).is_ok());
 
         let retained_report_only = EXAMPLE.replacen(
             "allow = \"discard\"\nallow_modified = \"discard\"",
@@ -2119,6 +1853,13 @@ max_view_depth = 64
             ProcessingConfigFile::parse(&online_verification),
             Err(ProcessingConfigError::Parse(_))
         ));
+
+        let unenforced_memory_limit = EXAMPLE.replacen(
+            "max_findings = 10000",
+            "max_findings = 10000\nmemory_bytes = 536870912",
+            1,
+        );
+        assert!(ProcessingConfigFile::parse(&unenforced_memory_limit).is_err());
     }
 
     #[test]
@@ -2169,10 +1910,6 @@ required_text_include = ["**/*.rs"]
             mode: PiAdjudicationMode::Advisory,
             required_initial: false,
             required_after_actions: false,
-            minimum_confidence: None,
-            attestation: PiAttestationPolicy::default(),
-            non_clearable: NonClearable::default(),
-            clearance_rules: Vec::new(),
         });
         assert!(config.validate().is_err());
 
@@ -2195,16 +1932,12 @@ required_text_include = ["**/*.rs"]
     }
 
     #[test]
-    fn validates_pi_adjudication_and_attestation_matrix() {
+    fn validates_pi_adjudication_authority_matrix() {
         let advisory = PiAdjudication {
             analyzer: "pi-triage".into(),
             mode: PiAdjudicationMode::Advisory,
             required_initial: false,
             required_after_actions: false,
-            minimum_confidence: None,
-            attestation: PiAttestationPolicy::default(),
-            non_clearable: NonClearable::default(),
-            clearance_rules: Vec::new(),
         };
         let mut profile = ProcessingConfigFile::parse(EXAMPLE)
             .unwrap()
@@ -2214,29 +1947,15 @@ required_text_include = ["**/*.rs"]
         assert!(advisory.validate(&profile).is_ok());
 
         let mut authoritative = advisory;
-        authoritative.mode = PiAdjudicationMode::ClearFalsePositives;
+        authoritative.mode = PiAdjudicationMode::Authoritative;
         authoritative.required_initial = true;
-        authoritative.minimum_confidence = Some(Confidence::High);
-        authoritative.clearance_rules.push(ClearanceRule {
-            id: "documented-fixtures".into(),
-            analyzer: "gitleaks".into(),
-            rules: vec!["generic-password".into()],
-            categories: vec!["credential".into()],
-            maximum_severity: Severity::Medium,
-            verification_states: vec![VerificationState::Unverified],
-            reason_codes: vec!["documented_test_fixture".into()],
-        });
         assert!(authoritative.validate(&profile).is_err());
         authoritative.required_after_actions = true;
-        authoritative.attestation = PiAttestationPolicy {
-            initial: AttestationRequirement::DenyOnBlocking,
-            post_action: AttestationRequirement::RequireNoBlocking,
-        };
         assert!(authoritative.validate(&profile).is_ok());
 
         profile.action_mode = ActionMode::Evaluate;
         authoritative.required_after_actions = false;
-        assert!(authoritative.validate(&profile).is_err());
+        assert!(authoritative.validate(&profile).is_ok());
     }
 
     #[test]

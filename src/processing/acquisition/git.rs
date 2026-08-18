@@ -29,8 +29,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::domain::{Digest, LogicalPath, PathSegment};
 use crate::processing::acquisition::local::{
-    acquire_local_repository_working_tree, verify_owned_materialized_directory, AcquiredEntry,
-    AcquiredEntryKind, AcquisitionCancellation, LocalAcquisitionRequest, LocalAcquisitionResult,
+    capture_owned_stage, AcquisitionCancellation, LocalAcquisitionResult,
     LocalAcquisitionStatistics,
 };
 use crate::processing::config::{CaptureLimits, SymlinkPolicy};
@@ -900,13 +899,6 @@ pub struct FrozenGitRepository {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AcquiredLocalRepository {
-    pub repository: FrozenGitRepository,
-    pub working_tree: Option<LocalAcquisitionResult>,
-    pub summary: GitAcquisitionSummary,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcquiredRemoteRepository {
     pub repository: FrozenGitRepository,
     pub working_tree: LocalAcquisitionResult,
@@ -928,89 +920,34 @@ pub struct GitAcquisitionSummary {
     pub working_tree_statistics: Option<LocalAcquisitionStatistics>,
 }
 
-/// Freezes local repository history and descriptor-captures its publication
-/// working tree. The capture includes dirty tracked, untracked, and ignored
-/// bytes, excludes every `.git` entry, and is bracketed by immutable Git
-/// enumeration so moving refs/object state fail closed.
-#[allow(clippy::too_many_arguments)]
-pub async fn acquire_local_repository_source(
-    runner: &GitCommandRunner,
-    repository: &Path,
-    request: &GitEnumerationRequest,
-    include_working_tree: bool,
-    stage: &Path,
-    jobs_root: &Path,
-    capture_limits: &CaptureLimits,
-    symlinks: SymlinkPolicy,
-    cancellation: &AcquisitionCancellation,
-) -> Result<AcquiredLocalRepository, GitAcquisitionError> {
-    let frozen = enumerate_local_repository(runner, repository, request).await?;
-    if include_working_tree && frozen.bare {
-        return Err(GitAcquisitionError::BareWorkingTree);
-    }
-    let working_tree = if include_working_tree {
-        Some(
-            acquire_local_repository_working_tree(LocalAcquisitionRequest {
-                source: repository,
-                stage,
-                jobs_root,
-                limits: capture_limits,
-                symlinks,
-                cancellation,
-            })
-            .map_err(|error| match error {
-                crate::processing::acquisition::local::LocalAcquisitionError::Cancelled => {
-                    GitAcquisitionError::Cancelled
-                }
-                _ => GitAcquisitionError::WorkingTreeCapture,
-            })?,
-        )
-    } else {
-        None
-    };
-    let revalidated = enumerate_local_repository(runner, repository, request).await?;
-    if revalidated != frozen {
-        return Err(GitAcquisitionError::RepositoryMoved);
-    }
-    let summary = acquisition_summary(None, &frozen, working_tree.as_ref())?;
-    Ok(AcquiredLocalRepository {
-        repository: frozen,
-        working_tree,
-        summary,
-    })
-}
-
-/// Acquires a validated remote into a private, short-lived bare repository,
-/// freezes the requested ref scope, and publishes only the frozen HEAD tree.
-/// The source repository (including all Git metadata) is removed before this
-/// function returns success and is best-effort removed on every error path.
-#[allow(clippy::too_many_arguments)]
+/// Acquires a validated remote directly into the job-owned stage. The stage is
+/// the only clone: its `.git` directory is retained for Pi and Git-aware
+/// analyzers, while the working tree is materialized without running hooks or
+/// repository-controlled filters.
 pub async fn acquire_remote_repository_source(
     runner: &GitCommandRunner,
     locator: &RemoteLocator,
     request: &GitEnumerationRequest,
-    source_repository: &Path,
     stage: &Path,
-    preserve_symlinks: bool,
+    capture_limits: &CaptureLimits,
+    symlinks: SymlinkPolicy,
+    cancellation: &AcquisitionCancellation,
 ) -> Result<AcquiredRemoteRepository, GitAcquisitionError> {
     request.validate()?;
-    let jobs_root = validate_remote_job_paths(source_repository, stage)?;
-    let mut cleanup = RemoteRepositoryCleanup::new(source_repository);
-    let result = acquire_remote_repository_inner(
+    let jobs_root = validate_remote_stage(stage)?;
+    let git_directory = stage.join(".git");
+    acquire_remote_repository_inner(
         runner,
         locator,
         request,
-        source_repository,
+        &git_directory,
         stage,
-        preserve_symlinks,
+        capture_limits,
+        symlinks,
+        cancellation,
         &jobs_root,
     )
-    .await;
-    // Cleanup has precedence over the acquisition result: callers must never
-    // receive an apparently ordinary acquisition failure while private Git
-    // metadata may still remain on disk.
-    cleanup.remove()?;
-    result
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1020,7 +957,9 @@ async fn acquire_remote_repository_inner(
     request: &GitEnumerationRequest,
     source_repository: &Path,
     stage: &Path,
-    preserve_symlinks: bool,
+    capture_limits: &CaptureLimits,
+    symlinks: SymlinkPolicy,
+    cancellation: &AcquisitionCancellation,
     jobs_root: &Path,
 ) -> Result<AcquiredRemoteRepository, GitAcquisitionError> {
     let advertisement =
@@ -1038,15 +977,28 @@ async fn acquire_remote_repository_inner(
         .map_err(|_| GitAcquisitionError::InvalidDestination)?;
     install_frozen_remote_refs(runner, source_repository, &fetched, &selection.checkout_ref)
         .await?;
+    run_repo(runner, source_repository, &["config", "core.bare", "false"]).await?;
+    run_repo(
+        runner,
+        source_repository,
+        &["config", "core.worktree", ".."],
+    )
+    .await?;
 
     let mut local_request = request.clone();
     local_request.checkout_ref = Some(logical_ref_name(&selection.checkout_ref)?);
-    let repository = enumerate_local_repository(runner, source_repository, &local_request).await?;
+    let repository = enumerate_local_repository(runner, stage, &local_request).await?;
     validate_frozen_remote_result(&repository, &advertisement, &selection, request)?;
-    materialize_frozen_head(&repository, stage, preserve_symlinks)?;
-    let expected = publication_entries_from_head(&repository.head_tree)?;
-    let working_tree = verify_owned_materialized_directory(stage, jobs_root, expected)
-        .map_err(|_| GitAcquisitionError::WorkingTreeCapture)?;
+    materialize_frozen_head(&repository, stage, symlinks == SymlinkPolicy::Preserve)?;
+    let working_tree = capture_owned_stage(
+        stage,
+        jobs_root,
+        crate::processing::PathInputKind::Directory,
+        capture_limits,
+        symlinks,
+        cancellation,
+    )
+    .map_err(|_| GitAcquisitionError::WorkingTreeCapture)?;
     let summary = acquisition_summary(
         Some(advertisement.transport),
         &repository,
@@ -1250,61 +1202,12 @@ fn validate_frozen_remote_result(
     Ok(())
 }
 
-fn publication_entries_from_head(
-    head: &[FrozenGitHeadEntry],
-) -> Result<Vec<AcquiredEntry>, GitAcquisitionError> {
-    let mut directories = BTreeSet::new();
-    for entry in head {
-        let segments = entry.path.segments();
-        for length in 1..segments.len() {
-            directories.insert(
-                LogicalPath::new(segments[..length].to_vec())
-                    .map_err(|_| GitAcquisitionError::UnsafePath)?,
-            );
-        }
-    }
-    let mut entries = directories
-        .into_iter()
-        .map(|logical_path| AcquiredEntry {
-            logical_path,
-            kind: AcquiredEntryKind::Directory,
-            byte_len: 0,
-            content_digest: Digest::sha256([]),
-            publication_mode: 0o755,
-        })
-        .collect::<Vec<_>>();
-    for entry in head {
-        let (kind, publication_mode) = match entry.mode {
-            GitBlobMode::Regular => (AcquiredEntryKind::RegularFile, 0o644),
-            GitBlobMode::Executable => (AcquiredEntryKind::RegularFile, 0o755),
-            GitBlobMode::SymbolicLink => (AcquiredEntryKind::SymbolicLink, 0o777),
-        };
-        entries.push(AcquiredEntry {
-            logical_path: entry.path.clone(),
-            kind,
-            byte_len: u64::try_from(entry.bytes.len())
-                .map_err(|_| GitAcquisitionError::GitByteLimit)?,
-            content_digest: Digest::sha256(&entry.bytes),
-            publication_mode,
-        });
-    }
-    entries.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
-    Ok(entries)
-}
-
 fn logical_ref_name(path: &LogicalPath) -> Result<String, GitAcquisitionError> {
     utf8_logical_ref(path)
 }
 
-fn validate_remote_job_paths(
-    source_repository: &Path,
-    stage: &Path,
-) -> Result<PathBuf, GitAcquisitionError> {
-    if !source_repository.is_absolute()
-        || !stage.is_absolute()
-        || fs::symlink_metadata(source_repository).is_ok()
-        || source_repository.parent() != stage.parent()
-    {
+fn validate_remote_stage(stage: &Path) -> Result<PathBuf, GitAcquisitionError> {
+    if !stage.is_absolute() || fs::symlink_metadata(stage.join(".git")).is_ok() {
         return Err(GitAcquisitionError::InvalidDestination);
     }
     let jobs_root = stage
@@ -1330,33 +1233,6 @@ fn validate_remote_job_paths(
         return Err(GitAcquisitionError::InvalidDestination);
     }
     Ok(jobs_root)
-}
-
-struct RemoteRepositoryCleanup<'a> {
-    path: &'a Path,
-    armed: bool,
-}
-
-impl<'a> RemoteRepositoryCleanup<'a> {
-    fn new(path: &'a Path) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn remove(&mut self) -> Result<(), GitAcquisitionError> {
-        if fs::symlink_metadata(self.path).is_ok() {
-            fs::remove_dir_all(self.path).map_err(|_| GitAcquisitionError::RepositoryCleanup)?;
-        }
-        self.armed = false;
-        Ok(())
-    }
-}
-
-impl Drop for RemoteRepositoryCleanup<'_> {
-    fn drop(&mut self) {
-        if self.armed && fs::symlink_metadata(self.path).is_ok() {
-            let _ = fs::remove_dir_all(self.path);
-        }
-    }
 }
 
 /// Freezes and enumerates one local repository using plumbing only. It never
@@ -1914,9 +1790,9 @@ fn is_lfs_pointer(bytes: &[u8]) -> bool {
         && bytes.windows(5).any(|window| window == b"oid s")
 }
 
-/// Materializes exactly the frozen HEAD tree without `.git`, hooks, filters,
-/// submodules, or LFS. The destination must be an existing empty private
-/// directory. Symbolic links require explicit opt-in and are never followed.
+/// Materializes exactly the frozen HEAD tree beside an existing `.git`
+/// directory, without invoking checkout hooks or repository-controlled
+/// filters. Symbolic links require explicit opt-in and are never followed.
 pub fn materialize_frozen_head(
     frozen: &FrozenGitRepository,
     destination: &Path,
@@ -1924,11 +1800,20 @@ pub fn materialize_frozen_head(
 ) -> Result<(), GitAcquisitionError> {
     let metadata =
         fs::symlink_metadata(destination).map_err(|_| GitAcquisitionError::InvalidDestination)?;
-    if !metadata.file_type().is_dir()
-        || fs::read_dir(destination)
-            .map_err(|_| GitAcquisitionError::InvalidDestination)?
-            .next()
-            .is_some()
+    if !metadata.file_type().is_dir() {
+        return Err(GitAcquisitionError::InvalidDestination);
+    }
+    let existing = fs::read_dir(destination)
+        .map_err(|_| GitAcquisitionError::InvalidDestination)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| GitAcquisitionError::InvalidDestination)?;
+    if existing.len() > 1
+        || existing
+            .first()
+            .is_some_and(|entry| entry.file_name() != OsStr::new(".git"))
+        || existing.first().is_some_and(|entry| {
+            fs::symlink_metadata(entry.path()).map_or(true, |metadata| !metadata.is_dir())
+        })
     {
         return Err(GitAcquisitionError::InvalidDestination);
     }
@@ -1950,9 +1835,6 @@ pub fn materialize_frozen_head(
             if !preserve_symlinks {
                 return Err(GitAcquisitionError::SymbolicLink);
             }
-            if !symlink_target_stays_within_root(&entry.path, &entry.bytes) {
-                return Err(GitAcquisitionError::SymbolicLink);
-            }
             symlink(OsString::from_vec(entry.bytes.clone()), &target)
                 .map_err(|_| GitAcquisitionError::Materialization)?;
         } else {
@@ -1967,22 +1849,6 @@ pub fn materialize_frozen_head(
         }
     }
     Ok(())
-}
-
-fn symlink_target_stays_within_root(path: &LogicalPath, target: &[u8]) -> bool {
-    if target.is_empty() || target.starts_with(b"/") || target.contains(&0) {
-        return false;
-    }
-    let mut depth = path.segments().len().saturating_sub(1);
-    for segment in target.split(|byte| *byte == b'/') {
-        match segment {
-            b"" | b"." => {}
-            b".." if depth == 0 => return false,
-            b".." => depth -= 1,
-            _ => depth = depth.saturating_add(1),
-        }
-    }
-    true
 }
 
 fn create_private_directories(root: &Path, target: &Path) -> Result<(), GitAcquisitionError> {

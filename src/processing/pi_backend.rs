@@ -18,16 +18,16 @@ use crate::analyzers::pi::proxy::{ExpectedPiRuntime, PiProxyLimits};
 use crate::analyzers::pi::runner::{PiRunError, PiRunLimits};
 use crate::analyzers::pi::sandbox::{PiRuntimeSpec, PI_RUNTIME_CONTEXT_MODE};
 use crate::analyzers::pi::triage::{
-    PiReviewScope, PiTriageInvocationId, PiTriageLimits, PiTriageRequest, PiTriageRequestContext,
-    PriorFinding, PriorOccurrence,
+    MatchedEvidence, PiReviewScope, PiTriageInvocationId, PiTriageLimits, PiTriageRequest,
+    PiTriageRequestContext, PriorFinding, PriorFindingArtifact, PriorOccurrence,
 };
 use crate::analyzers::pi::{PiClassifierAnalyzer, PiClassifierError, PiClassifierSpec};
 use crate::analyzers::{assess_text_artifact, RequiredTextMatcher, TextArtifactDisposition};
 use crate::authorization::{AnalyzerViewLimits, AnalyzerViewQuota, InvocationWorkspace};
 use crate::domain::{
     Artifact, ArtifactId, ArtifactKind, ArtifactManifest, ClassificationCode, ConfiguredConfidence,
-    CoverageStatus, Digest, PhysicalSubject, Provenance, ReasonCode, RunId, SourceFileType,
-    SourceIdentity, SubjectId,
+    CoverageStatus, Digest, LogicalPath, PathSegment, PhysicalSubject, Provenance, ReasonCode,
+    RunId, SourceFileType, SourceIdentity, SubjectId,
 };
 use crate::pipeline::ArtifactAssignment;
 use crate::processing::executor::{
@@ -46,6 +46,7 @@ pub struct PiProcessingContext {
     pub run_id: RunId,
     pub pipeline_identity: Digest,
     pub policy_identity: Digest,
+    pub stage_root: PathBuf,
 }
 
 /// Executes schema-3 Pi stages through the existing confined Pi runtime.
@@ -87,6 +88,12 @@ impl ConfinedPiProcessingBackend {
         }
         let private_root = fs::canonicalize(private_root)
             .map_err(|_| PiProcessingBackendError::PrivateWorkspace)?;
+        if !context.stage_root.is_absolute()
+            || !fs::symlink_metadata(&context.stage_root)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            return Err(PiProcessingBackendError::PrivateWorkspace);
+        }
         Ok(Self {
             private_root,
             reader,
@@ -127,12 +134,18 @@ impl ConfinedPiProcessingBackend {
             .iter()
             .zip(invocation.assignments.iter())
             .filter_map(|(outcome, assignment)| {
-                (outcome.disposition == AssignmentDisposition::Completed)
-                    .then_some(assignment.artifact_id.clone())
+                (outcome.disposition == AssignmentDisposition::Completed).then_some(assignment)
             })
-            .collect::<BTreeSet<_>>();
+            .map(|assignment| {
+                Ok((
+                    assignment.artifact_id.clone(),
+                    prior_finding_artifact(assignment)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, AnalyzerBackendError>>()?;
         let prior_findings = project_prior_findings(
             &invocation.prior_findings,
+            &invocation.prior_evidence,
             &applicable_artifacts,
             invocation.phase,
         )?;
@@ -170,6 +183,7 @@ impl ConfinedPiProcessingBackend {
                 prepared.assignments,
                 Arc::clone(&prepared.workspace),
                 Arc::clone(&request),
+                Some(self.context.stage_root.clone()),
             )
             .await
             .map_err(map_pi_error)?;
@@ -260,6 +274,7 @@ fn materialize_pi(
         InvocationWorkspace::create(&request.root, &request.run_id)
             .map_err(|_| MaterializePiError::Workspace)?,
     );
+    let history_namespace = history_namespace(&request.assignments)?;
     let mut subjects = Vec::with_capacity(request.assignments.len());
     let mut artifacts = Vec::with_capacity(request.assignments.len());
     for (index, assignment) in request.assignments.iter().enumerate() {
@@ -284,9 +299,18 @@ fn materialize_pi(
         .to_string();
         let subject_id = SubjectId::from_suffix(&suffix["sha256:".len()..])
             .map_err(|_| MaterializePiError::Artifact)?;
+        let presentation_path = match &assignment.surface {
+            ProcessingArtifactSurface::WorkingTree => assignment.logical_path.clone(),
+            ProcessingArtifactSurface::GitHistory { .. } => LogicalPath::new(vec![
+                history_namespace.clone(),
+                PathSegment::utf8(assignment.artifact_id.as_str())
+                    .map_err(|_| MaterializePiError::Artifact)?,
+            ])
+            .map_err(|_| MaterializePiError::Artifact)?,
+        };
         let subject = PhysicalSubject {
             id: subject_id.clone(),
-            relative_path: assignment.logical_path.clone(),
+            relative_path: presentation_path.clone(),
             source_identity: SourceIdentity {
                 device: 0,
                 inode: u64::try_from(index).map_err(|_| MaterializePiError::Artifact)? + 1,
@@ -308,7 +332,7 @@ fn materialize_pi(
             byte_len: stored.byte_len,
             content_digest: stored.digest,
             provenance: Provenance::Physical {
-                logical_path: assignment.logical_path.clone(),
+                logical_path: presentation_path,
             },
         });
         subjects.push(subject);
@@ -353,6 +377,26 @@ fn materialize_pi(
     })
 }
 
+fn history_namespace(
+    assignments: &[ProcessingAssignment],
+) -> Result<PathSegment, MaterializePiError> {
+    let working_roots = assignments
+        .iter()
+        .filter_map(|assignment| match &assignment.surface {
+            ProcessingArtifactSurface::WorkingTree => assignment.logical_path.segments().first(),
+            ProcessingArtifactSurface::GitHistory { .. } => None,
+        })
+        .map(PathSegment::as_slice)
+        .collect::<BTreeSet<_>>();
+    for suffix in 0..=assignments.len() {
+        let value = format!(".file-guardian-git-history-{suffix}");
+        if !working_roots.contains(value.as_bytes()) {
+            return PathSegment::utf8(value).map_err(|_| MaterializePiError::Artifact);
+        }
+    }
+    Err(MaterializePiError::Artifact)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MaterializePiError {
     Workspace,
@@ -361,7 +405,8 @@ enum MaterializePiError {
 
 fn project_prior_findings(
     prior: &NormalizedPhaseFindings,
-    assigned_artifacts: &BTreeSet<ArtifactId>,
+    prior_evidence: &[crate::processing::executor::BackendObservationEvidence],
+    assigned_artifacts: &BTreeMap<ArtifactId, PriorFindingArtifact>,
     phase: crate::domain::InspectionPhase,
 ) -> Result<Vec<PriorFinding>, AnalyzerBackendError> {
     let mut occurrences = BTreeMap::new();
@@ -384,16 +429,35 @@ fn project_prior_findings(
             }
         }
     }
+    let mut evidence_by_occurrence = BTreeMap::new();
+    for evidence in prior_evidence {
+        let occurrence_id = prior
+            .observation_to_occurrence
+            .get(&evidence.observation_id)
+            .ok_or(AnalyzerBackendError::InvalidOutput)?;
+        let encoded = MatchedEvidence::from_bytes(&evidence.canonical_window)
+            .ok_or(AnalyzerBackendError::InvalidOutput)?;
+        if evidence_by_occurrence
+            .insert(occurrence_id.clone(), encoded)
+            .is_some()
+        {
+            return Err(AnalyzerBackendError::InvalidOutput);
+        }
+    }
     prior
         .findings
         .iter()
-        .filter(|finding| assigned_artifacts.contains(&finding.artifact_id))
+        .filter(|finding| assigned_artifacts.contains_key(&finding.artifact_id))
         .map(|finding| {
             if finding.phase != phase {
                 return Err(AnalyzerBackendError::InvalidOutput);
             }
             let correlation_id = correlations
                 .get(&finding.id)
+                .cloned()
+                .ok_or(AnalyzerBackendError::InvalidOutput)?;
+            let artifact = assigned_artifacts
+                .get(&finding.artifact_id)
                 .cloned()
                 .ok_or(AnalyzerBackendError::InvalidOutput)?;
             let prior_occurrences = finding
@@ -416,6 +480,7 @@ fn project_prior_findings(
                         rule_id: occurrence.rule_id.clone(),
                         verification_state: occurrence.verification_state,
                         evidence_token: occurrence.evidence_token,
+                        evidence: evidence_by_occurrence.get(&occurrence.id).cloned(),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -426,6 +491,7 @@ fn project_prior_findings(
                 finding.analyzer_id.clone(),
                 finding.rule_id.clone(),
                 finding.artifact_id.clone(),
+                artifact,
                 finding.category,
                 finding.severity,
                 finding.location.clone(),
@@ -435,6 +501,26 @@ fn project_prior_findings(
             .map_err(|_| AnalyzerBackendError::InvalidOutput)
         })
         .collect()
+}
+
+fn prior_finding_artifact(
+    assignment: &ProcessingAssignment,
+) -> Result<PriorFindingArtifact, AnalyzerBackendError> {
+    match &assignment.surface {
+        ProcessingArtifactSurface::WorkingTree => Ok(PriorFindingArtifact::WorkingTree {
+            logical_path: assignment.logical_path.clone(),
+        }),
+        ProcessingArtifactSurface::GitHistory {
+            repository_identity,
+            history_scope,
+            provenance,
+        } => Ok(PriorFindingArtifact::GitHistory {
+            logical_path: assignment.logical_path.clone(),
+            repository_identity: *repository_identity,
+            history_scope: *history_scope,
+            provenance: provenance.clone(),
+        }),
+    }
 }
 
 fn validate_assignment_surfaces(
@@ -597,10 +683,7 @@ fn compile_analyzer(
         runtime: PiRuntimeSpec {
             bubblewrap_executable: pi.bubblewrap_executable.clone(),
             expected_bubblewrap_version: pi.expected_bubblewrap_version.clone(),
-            runtime_root: pi.runtime_root.clone(),
-            runtime_manifest: pi.runtime_root.join(&pi.runtime_manifest),
-            launcher: pi.launcher.clone(),
-            pi_entrypoint: pi.pi_entrypoint.clone(),
+            pi_executable: pi.pi_executable.clone(),
             expected_pi_version: pi.expected_pi_version.clone(),
             instruction_file: pi.instruction_file.clone(),
             trusted_extension: pi.trusted_extension.clone(),
@@ -635,7 +718,6 @@ fn compile_analyzer(
             idle_timeout: Duration::from_secs(runtime.limits.idle_timeout_secs),
             wall_timeout: Duration::from_secs(runtime.limits.wall_timeout_secs),
             termination_grace: Duration::from_secs(runtime.limits.termination_grace_secs),
-            memory_bytes: runtime.limits.memory_bytes,
             cpu_seconds: runtime.limits.cpu_time_secs,
             open_files: runtime.limits.max_open_files,
             stdout_bytes: runtime.limits.max_stdout_bytes,
@@ -814,6 +896,92 @@ mod tests {
     }
 
     #[test]
+    fn history_revisions_with_the_same_path_materialize_distinctly_and_keep_git_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let same_path = path("same.txt");
+        let history = |id: &str, bytes: &[u8], blob: &str, commit: &str| {
+            let provenance = crate::processing::GitProvenance::new(
+                blob.parse().unwrap(),
+                crate::processing::GitBlobMode::Regular,
+                vec![crate::processing::GitBlobOccurrence {
+                    commit_id: commit.parse().unwrap(),
+                    path: same_path.clone(),
+                    refs: vec![LogicalPath::new(vec![
+                        PathSegment::utf8("refs").unwrap(),
+                        PathSegment::utf8("heads").unwrap(),
+                        PathSegment::utf8("main").unwrap(),
+                    ])
+                    .unwrap()],
+                }],
+            )
+            .unwrap();
+            let mut assignment = assignment(
+                id,
+                bytes,
+                ProcessingArtifactSurface::GitHistory {
+                    repository_identity: Digest::sha256(b"repository"),
+                    history_scope: GitHistoryScope::Reachable,
+                    provenance,
+                },
+            );
+            assignment.logical_path = same_path.clone();
+            assignment
+        };
+        let first = history(
+            "revision-a",
+            b"first",
+            "sha1:1111111111111111111111111111111111111111",
+            "sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let second = history(
+            "revision-b",
+            b"second",
+            "sha1:2222222222222222222222222222222222222222",
+            "sha1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        let reader = Arc::new(MemoryReader(BTreeMap::from([
+            (first.artifact_id.clone(), b"first".to_vec()),
+            (second.artifact_id.clone(), b"second".to_vec()),
+        ])));
+        let prepared = materialize_pi(MaterializePiRequest {
+            root: temp.path().to_path_buf(),
+            run_id: RunId::from_suffix("history-revisions").unwrap(),
+            reader,
+            assignments: vec![first.clone(), second.clone()].into(),
+            required_text: RequiredTextMatcher::default(),
+            max_text_bytes: 1024,
+        })
+        .unwrap();
+        assert_ne!(
+            prepared.manifest.subjects()[0].relative_path,
+            prepared.manifest.subjects()[1].relative_path
+        );
+        assert!(prepared.manifest.subjects().iter().all(|subject| subject
+            .relative_path
+            .segments()[0]
+            .as_slice()
+            .starts_with(b".file-guardian-git-history-")));
+
+        let locator = prior_finding_artifact(&first).unwrap();
+        let PriorFindingArtifact::GitHistory {
+            logical_path,
+            history_scope,
+            provenance,
+            ..
+        } = locator
+        else {
+            panic!("history assignment lost its Git locator");
+        };
+        assert_eq!(logical_path, same_path);
+        assert_eq!(history_scope, GitHistoryScope::Reachable);
+        assert_eq!(
+            provenance.occurrences[0].commit_id.to_string(),
+            "sha1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+    }
+
+    #[test]
     fn prior_projection_excludes_findings_outside_exact_assigned_view() {
         let assigned = assignment("assigned", b"x", ProcessingArtifactSurface::WorkingTree);
         let foreign = assignment("foreign", b"x", ProcessingArtifactSurface::WorkingTree);
@@ -877,21 +1045,70 @@ mod tests {
                 crate::processing::Correlation::new(
                     CorrelationId::from_suffix("foreign").unwrap(),
                     InspectionPhase::Initial,
-                    vec![foreign_finding.id],
-                    foreign_finding.occurrence_ids,
+                    vec![foreign_finding.id.clone()],
+                    foreign_finding.occurrence_ids.clone(),
                 )
                 .unwrap(),
             ],
-            observation_to_finding: BTreeMap::new(),
+            observation_to_finding: BTreeMap::from([
+                (
+                    crate::domain::ObservationId::new("obs_assigned").unwrap(),
+                    assigned_finding.id.clone(),
+                ),
+                (
+                    crate::domain::ObservationId::new("obs_foreign").unwrap(),
+                    foreign_finding.id.clone(),
+                ),
+            ]),
+            observation_to_occurrence: BTreeMap::from([
+                (
+                    crate::domain::ObservationId::new("obs_assigned").unwrap(),
+                    OccurrenceId::from_suffix("assigned").unwrap(),
+                ),
+                (
+                    crate::domain::ObservationId::new("obs_foreign").unwrap(),
+                    OccurrenceId::from_suffix("foreign").unwrap(),
+                ),
+            ]),
         };
+        let evidence = vec![
+            crate::processing::executor::BackendObservationEvidence {
+                observation_id: crate::domain::ObservationId::new("obs_assigned").unwrap(),
+                canonical_window: b"password = example".to_vec(),
+                verification_state: crate::processing::CredentialVerificationState::Unverified,
+            },
+            crate::processing::executor::BackendObservationEvidence {
+                observation_id: crate::domain::ObservationId::new("obs_foreign").unwrap(),
+                canonical_window: b"password = foreign".to_vec(),
+                verification_state: crate::processing::CredentialVerificationState::Unverified,
+            },
+        ];
         let projected = project_prior_findings(
             &prior,
-            &BTreeSet::from([assigned.artifact_id.clone()]),
+            &evidence,
+            &BTreeMap::from([(
+                assigned.artifact_id.clone(),
+                prior_finding_artifact(&assigned).unwrap(),
+            )]),
             InspectionPhase::Initial,
         )
         .unwrap();
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].artifact_id, assigned.artifact_id);
+        assert!(matches!(
+            &projected[0].artifact,
+            PriorFindingArtifact::WorkingTree { logical_path }
+                if logical_path == &assigned.logical_path
+        ));
+        assert_eq!(
+            projected[0].occurrences[0]
+                .evidence
+                .as_ref()
+                .unwrap()
+                .as_bytes()
+                .unwrap(),
+            b"password = example"
+        );
     }
 
     #[test]
@@ -961,7 +1178,9 @@ mod tests {
                 findings: Vec::new(),
                 correlations: Vec::new(),
                 observation_to_finding: BTreeMap::new(),
+                observation_to_occurrence: BTreeMap::new(),
             }),
+            prior_evidence: Arc::from([]),
             prior_coverage: Arc::from([]),
         };
         assert_eq!(

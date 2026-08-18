@@ -2,504 +2,199 @@
 
 ## Product purpose
 
-File Guardian is a reusable file-policy and authorization engine. Its primary
-interface evaluates a caller-owned, private staging tree as one transaction and
-returns a fail-closed decision suitable for an upload, build, or publication
-workflow. Its daemon interface runs explicitly configured policy scans on a
-schedule; daemon operation is not an implicit mode.
+File Guardian evaluates one exact, job-owned filesystem stage before that stage
+is handed to another system. Its narrow purpose is to find passwords,
+credentials, and other configured disclosure-policy violations, combine
+deterministic scanners with trusted Pi semantic review, apply explicitly
+authorized whole-file remediation, and publish one fail-closed result.
 
-The current implementation is read-only. It captures immutable artifacts,
-executes built-in analyzers and a Linux-only internal Pi classifier through a
-compiled ordered pipeline, resolves policy, and reports `allow`, `deny`, or
-`error` without modifying the input. Later milestones add deterministic
-scanner delegates, verified actions, recursive archives, and fingerprint
-indexes.
+The normative detailed contract is
+[`docs/unified-processing-jobs.md`](docs/unified-processing-jobs.md). The
+operator workflow is
+[`docs/processing-operator-guide.md`](docs/processing-operator-guide.md).
 
-## Operating assumptions
+## One workflow and two source forms
 
-- Linux is the primary service platform; macOS ARM64 is also a supported
-  release target.
-- The service account must be able to read configured inputs, create its
-  workspace, and write configured logs. Root is deployment-dependent rather
-  than an inherent requirement.
-- The caller exclusively owns a one-shot staging tree and prevents all other
-  writers from changing it from capture through the final decision.
-- File Guardian is a policy gate. It does not intercept filesystem access and
-  cannot protect content an unconfined process reads before authorization.
-
-## Command-line contract
-
-File Guardian requires an explicit subcommand:
+The public processing interface has exactly two source forms:
 
 ```text
-file-guardian [--config FILE] authorize
-    [--profile PROFILE_ID]
-    [--request-id ID]
-    [--action-mode evaluate|apply]
-    PATH
-
-file-guardian [--config FILE] daemon [--job JOB_ID ...]
+file-guardian [--config FILE] process [COMMON OPTIONS] path DIRECTORY
+file-guardian [--config FILE] process [COMMON OPTIONS]
+    git [--ref REF] REMOTE
 ```
 
-Requirements:
+- `path` descriptor-copies one literal directory into a newly created,
+  job-owned stage. It never edits or removes the caller's directory.
+- `git` clones one HTTPS, `ssh://`, or SCP-like SSH remote directly into the
+  job-owned stage using ambient noninteractive Git authentication.
+- There is no separate local-repository source form and no hidden source-tree
+  projection. A copied directory containing a valid Git worktree is detected
+  after acquisition and reviewed as Git.
+- `.git`, dirty tracked files, tracked deletions, untracked files, ignored
+  files, executable modes, and symlink entries remain part of the exact staged
+  content. Symlinks are preserved as entries and never followed during capture.
+- A clone's `.git` directory stays in the same stage Pi inspects and the caller
+  may later receive. File Guardian does not keep a second clone as the
+  authoritative inspection source.
 
-- `authorize` accepts exactly one literal regular file or directory.
-- The transaction root must exist and must not be a symlink or special file.
-- The command does not expand globs. A directory is one authorization
-  transaction.
-- A configured default profile is used when `--profile` is absent.
-- A CLI action mode may reduce configured authority from `apply` to `evaluate`
-  but must never increase it. The current runtime supports only evaluate
-  execution.
-- Request IDs are bounded, log-safe correlation values; they are not paths,
-  credentials, or authorization tokens.
-- Missing subcommands, invalid syntax, and help use conventional CLI behavior,
-  including exit `2` for syntax errors.
-- After recognizing a valid `authorize` shape, operational failures attempt to
-  emit a schema-valid error report and exit `30`.
-- SIGINT and SIGTERM cancel in-flight authorization, signal supervised analyzer
-  teardown, release private workspace state, and attempt a schema-valid error
-  report with exit `30`. Uncatchable termination such as SIGKILL, OOM kill,
-  power loss, or a process crash requires protected stale-workspace cleanup at
-  deployment startup.
-- Obsolete implicit invocation, `--once`, and `--dry-run` are rejected. No
-  compatibility parser or environment-based semantic override is retained.
+Inputs using local/file/helper Git transports, credential-bearing or
+query-bearing HTTPS URLs, malformed or option-looking operands, unsupported
+submodules, hydrated LFS content, shallow/partial repositories, or ref movement
+fail closed. Git is invoked directly, never through a shell. Acquisition
+credentials and agent sockets are not passed to analyzers.
 
-## Caller protocol
+## Source and history scope
 
-The caller must:
+A profile selects independently:
 
-1. Finish writing a private staging tree.
-2. Prevent any other writer from modifying it during authorization.
-3. Invoke File Guardian once for the entire tree.
-4. Parse exactly one supported JSON value from stdout.
-5. Verify that the report's `exit_code` equals the process exit status.
-6. Publish only exits `0` and, after verified actions exist, `10`.
-7. Atomically promote or consume the exact authorized staging tree.
+- whether the staged working tree is scanned; and
+- Git history `none`, `head`, `reachable`, or `all_refs`.
 
-The manifest identity is for audit and correlation. It does not authorize a
-separately copied or subsequently changed tree. Callers should scan staged
-copies rather than active build or upload workspaces.
-
-## Exit and report contract
-
-Authorization report schema `1` uses these exits:
-
-| Exit | Outcome | Meaning |
-| ---: | --- | --- |
-| `0` | `allow` | Complete required analysis; input is allowed and unchanged. |
-| `10` | `allow_modified` | Reserved for verified actions; currently unavailable. |
-| `20` | `deny` | Complete required analysis; policy rejects the transaction. |
-| `30` | `error` | The authorization result is incomplete or untrustworthy. |
-
-Required behavior:
-
-- Required analyzer failure is `30`, including when another analyzer found a
-  deny.
-- Evaluate mode returns `20` when allowing the tree would require mutation.
-- Exit `20` is a complete policy decision, never a substitute for operational
-  uncertainty.
-- File Guardian emits exactly one compact JSON document plus a newline on
-  stdout. Diagnostics and logs go to stderr or protected log files.
-- Missing, malformed, truncated, unsupported, or exit-inconsistent output is a
-  caller-side failure.
-- Reports use relative logical artifact paths and safe codes. They must not
-  contain matched credentials, raw snippets, raw prompts or transcripts,
-  native scanner output, absolute staging or workspace paths, environment
-  values, credentials, or chain-of-thought.
-
-The report carries run and optional request identities, outcome, exit, modified
-state, phase-aware coverage, compiled policy and pipeline identities, immutable
-manifest identities, mandatory artifact records, analyzer runs, normalized
-observations, resolutions, centralized actions, typed issues, and bounded
-statistics. Golden examples live under
-[`docs/examples/reports`](docs/examples/reports).
-
-Top-level `artifacts` is always an array. Each record contains only a
-host-generated artifact ID, physical subject ID, kind, segment-encoded relative
-logical path, byte length, and content digest. It never contains an absolute or
-workspace object path or file bytes. A report retains safely known records from
-a trustworthy initial capture even if later analysis fails; an error before
-trustworthy capture uses an empty array.
-
-Report schema `1` remains aggregate: `pipeline_runs` records phase status and
-completed stage/analyzer counts, while per-analyzer coverage and normalized
-observations carry stable evidence. It does not expose task scheduling,
-selector candidate lists, or prior-observation projection payloads.
-
-## Configuration schema 2
-
-Schema `2` is a strict end-state contract rather than a migration layer.
-Unknown fields are rejected. IDs must be unique, references must resolve,
-administrator paths must be absolute, requested modes must be supported, and
-all workspace and protected roots must be safe and disjoint.
-
-The main configuration defines:
-
-- a private authorization workspace and named profiles;
-- ordered pipelines, serial or bounded-parallel stages, analyzer references,
-  selectors, bounded prior-observation projections, and execution settings;
-- built-in analyzer applicability and resource ceilings;
-- policy bindings that map observations to directives;
-- explicit `policy_scan` daemon jobs and schedules;
-- protected stderr/file logging.
-
-Pipeline identity covers ordered stages, execution and prior-observation
-settings, selected analyzer configurations, selectors, limits, and compiled
-rule material. Profile and policy bindings/directives are covered separately by
-policy identity.
-
-Configuration path precedence is `--config`, then `FILE_GUARDIAN_CONFIG`, then
-`/etc/file-guardian/config.toml`. Environment variables do not override fields
-inside the selected configuration or otherwise change policy, paths, analyzer
-selection, or logging semantics.
-
-The shipped [`config/config.toml`](config/config.toml) is the source of truth
-for the default executable built-in schema-v2 pipeline. The broader
-[`docs/examples/active-authorization-v2.toml`](docs/examples/active-authorization-v2.toml)
-records the mature pipeline and Pi contract. A valid selected Pi analyzer is
-executable on Linux and must be audit-only. External-tool definitions validate
-but are not executable yet; selecting one produces incomplete required coverage
-and exit `30`. No analyzer is skipped or reinterpreted.
-
-## Rule sources and built-in analysis
-
-External rule files are strict TOML and action-free. A rule has a unique ID and
-at least one supported matcher: a filename glob or text-content regex. Policy
-bindings in the main configuration map normalized findings to `audit`, `deny`,
-`delete`, or `quarantine`; detection rules cannot directly mutate files or
-choose an outcome.
-
-Built-in analysis requirements:
-
-- Match filename globs against the logical filename and content regexes against
-  captured immutable bytes.
-- Return every match in canonical order rather than stopping at the first.
-- Never include the matched value or raw content in a finding or report.
-- Treat invalid UTF-8 or any NUL byte as ordinary binary and count it once as
-  `not_applicable` while still evaluating filename rules. A binary path matched
-  by `content_applicability.required_text_include` is incomplete required
-  analysis.
-- Treat valid text over the configured content limit as incomplete rather than
-  `not_applicable`.
-- Treat object read, length, or digest disagreement as incomplete required
-  coverage and exit `30`.
-
-## Immutable inspection and workspace
-
-Every run owns a private workspace below the configured root. Its internal
-layout may contain manifests, content-addressed objects, analyzer views,
-archive work, an action journal, invocation quarantine, and temporary state;
-that layout is not a public interface.
-
-Requirements:
-
-- Create every run workspace with owner-only access and without symlink
-  traversal.
-- Reject input/workspace overlap in either direction, including ancestry that
-  is searchable but not directory-readable.
-- Walk capture through descriptor-anchored operations.
-- Count every encountered directory entry against
-  `authorization.workspace.capture.max_entries`, independently from regular
-  files accepted against `max_files`.
-- Copy or stream each regular file once into a SHA-256-addressed object while
-  hashing it, and verify metadata before and after the read.
-- Reject symlinks, hardlinks, special files, cross-filesystem traversal,
-  unreadable or disappearing entries, new entries during capture, and unstable
-  metadata unless an explicit later policy defines safe behavior.
-- Give all analyzers the same captured manifest and objects. An analyzer must
-  never reopen live staging.
-- Generate artifact IDs on the host. Logical paths are root-relative segment
-  arrays for matching/reporting and are never reused as unchecked OS paths.
-- Keep live staging unchanged in evaluate mode. Workspace cleanup failure is an
-  operational error, not an allow or deny.
-
-## Domain and policy separation
-
-The implementation keeps these concepts separate:
-
-- A **finding** is a deterministic observation.
-- A **classification** is a probabilistic or semantic observation.
-- A **resolution** maps one observation to `audit`, `deny`, `delete`, or
-  `quarantine`.
-- An **action** is a centralized filesystem mutation.
-- An **outcome** is `allow`, `allow_modified`, `deny`, or `error`.
-
-Analyzers emit only observations and coverage. They cannot authorize content,
-select arbitrary host paths, choose filesystem actions, or mutate staging.
-Bindings must resolve deterministically; ambiguous or unbound observations fail
-closed. In evaluate-only operation, an `audit` resolution permits continuation,
-`deny` rejects the transaction, and a mutation directive also rejects because
-the requested remediation cannot be applied.
-
-## Coverage requirements
-
-Coverage is phase-aware and records `eligible`, `assigned`, `completed`, and
-`not_applicable` candidate counts for every analyzer.
-
-- `completed` and `not_applicable` are disjoint.
-- An explicitly inapplicable assigned artifact counts as `not_applicable`, not
-  completed.
-- `completed + not_applicable == assigned` is necessary but not sufficient for
-  a complete analyzer row; protocol, budget, tool, or execution failure keeps
-  it incomplete.
-- A phase is complete only when all required analyzer rows are complete.
-- Exits `0` and `20` require complete initial coverage. Exit `10` will also
-  require complete post-action verification.
-- Coverage failures must be typed and represented in the report rather than
-  existing only in logs.
-
-## Explicit daemon operation
-
-The daemon runs only named, configured jobs. It supports `policy_scan` jobs
-with explicit targets, a profile, and an internal schedule.
-Selecting one or more `--job` values limits execution to those jobs; otherwise
-all enabled jobs run.
-
-Each policy scan asynchronously invokes the same compiled evaluate-only
-pipeline engine used by one-shot authorization. It captures each configured
-target independently, records the complete schema-valid decision on stderr and
-through configured protected structured logging, never modifies targets, and
-treats capture or analysis uncertainty as an error. Missed schedules delay the
-next scan rather than creating a burst of catch-up work. The
-daemon configuration states what the process does; simply starting File
-Guardian does not imply directory scanning.
-
-Any configuration with an enabled daemon job must select an `info`, `debug`, or
-`trace` logging level. Startup fails closed when the logging filter would omit
-daemon decision events.
-
-## Logging and operations
-
-- Human diagnostics and operational logs use stderr or configured protected
-  files, never authorization stdout.
-- Logging configuration is validated at startup and uses bounded file rotation
-  where file logging is enabled.
-- Reports and logs do not expose matched secrets or immutable object content.
-- Daemon errors identify the job and target without changing authorization
-  semantics.
-- Unit and integration tests are deterministic and offline.
+Handoff-capable profiles always scan the working tree. A history-requiring path
+profile errors if the copied stage is not a valid repository. File Guardian
+freezes selected refs and object IDs before analysis. Deterministic history
+scanners receive host-selected immutable blob assignments rather than choosing
+their own clone or ref coverage. Pi receives the actual read-only stage and may
+use normal Git commands against its `.git` metadata.
 
 ## Analyzer pipeline
 
-The runtime compiles ordered stages with serial or bounded-parallel execution
-and canonical aggregation. Candidate assignments and safe projections of prior
-observations are frozen before a stage begins. A failed batch stops later
-batches and stages, while aggregation remains in configured analyzer order
-rather than task-completion order.
+Profiles compile an ordered pipeline containing:
 
-Analyzer selection is compiled from `include` and `exclude` globs plus
-`artifact_kinds`. Globs match the canonical raw bytes of root-relative logical
-path segments joined by `/`, without lossy UTF-8 conversion; separator matching
-is explicit and exclusions win. An artifact outside the selector is not
-eligible and does not increment `not_applicable`. The current capture produces
-`physical_file` artifacts; `archive_member` becomes useful when archive
-materialization is implemented.
+- built-in filename and content rules;
+- configured, `PATH`-discovered Gitleaks and TruffleHog adapters; and
+- optional Pi triage.
 
-A stage may choose `prior_observations = "none"`, `"findings_summary"`, or
-`"all_normalized"`. `findings_summary` projects only safe normalized findings;
-`all_normalized` also includes safe normalized classifications. Every
-projection is canonically ordered and bounded by positive
-`prior_limits.max_observations` and `prior_limits.max_serialized_bytes` values.
-Limit or serialization failure stops the stage and makes required analysis
-incomplete.
+Every required analyzer reports complete assigned coverage. A missing binary,
+unsupported version, timeout, crash, malformed native result, truncated result,
+or incomplete required assignment is an error, never a clean scan. Native
+scanner output and matched values remain private pipeline input and do not
+enter public reports.
 
-Schema 2 currently requires every analyzer to have `required = true`; optional
-advisory coverage has not been enabled. `eligible`, `assigned`, `completed`,
-and `not_applicable` counters are explicit and disjoint. Complete coverage
-requires the analyzer to return valid output, no issue, and
-`completed + not_applicable == assigned`; arithmetic equality alone cannot turn a
-protocol, task, budget, or read failure into success.
+External scanners run against immutable host-materialized assignments with
+their configured scanner policy. File Guardian owns Git enumeration and
+provenance. Scanners cannot reclone, reinterpret ref scope, update themselves,
+or contact verification services.
 
-### Internal Pi classifier
+## Trusted Pi triage
 
-The internal Pi-based LLM may read sensitive captured content because the
-selected model and transport are approved for it. It remains transaction-scoped.
-File Guardian invokes an administrator-pinned Pi runtime without discovered
-user customizations, disables Pi built-ins, and exposes only the pinned File
-Guardian `bash`, `read`, `grep`, `find`, `ls`, `manifest_list`,
-`prior_observations`, and `submit_classification` tools. Terminal structured
-output remains strict and vocabulary-bound.
+Pi is a trusted semantic scanner, not an adversary. It receives:
 
-Pi itself is a normal supervised host process so credentials and approved model
-networking stay with Pi. On Linux, model-directed OS execution is confined:
-the trusted extension starts one persistent Bubblewrap sidecar per
-classification. The sidecar has no network, credentials, Pi home, proxy
-capability, host filesystem, or File Guardian workspace. It sees only a
-generated immutable text view at `/input`, a read-only manifest-pinned toolbox,
-and ephemeral writable `/work` and `/tmp`. Unsupported platforms,
-missing or mismatched runtime assets, sandbox startup failure, handshake or
-protocol disagreement, unavailable tools, invalid terminal output, budget
-exhaustion, timeout, abnormal exit, and incomplete coverage all produce exit
-`30`.
+- normalized deterministic findings and correlation identities;
+- the actual bounded matched evidence and surrounding canonical window;
+- the exact read-only job stage, including `.git` when present;
+- selected artifact and Git-history provenance; and
+- the closed policy vocabulary needed to assess each finding.
 
-The exact grant is closed. `bash`, `read`, `grep`, `find`, and `ls` all use the
-same persistent sidecar through inherited pipes; Bubblewrap is not restarted
-per call. Bash may read `/input` and write `/work`, including using pinned
-`sed`, `awk`, `file`, `jq`, `tar`, and `unzip`, but cannot change input, reach
-host paths, or open network connections. Every executable call has paired
-authenticated begin/end accounting. Each end record has exactly one of `completed`,
-`recoverable_error`, or `fatal_error`. Invalid model-supplied search patterns
-or arguments produce a sanitized recoverable tool result so the model can
-retry. Authentication, accounting, sidecar process, proxy, and other integrity
-failures are fatal and invalidate the run. The sidecar has no `/proc` or
-network, and command descendants are killed after each request. File Guardian
-control tools never execute in the sidecar.
+Pi may read passwords and other sensitive staged content. Keeping evidence or
+ordinary staged files secret from Pi is not a product goal. Pi never directly
+edits the stage or chooses an operating-system mutation.
 
-`manifest_list` is cursor-paged and byte-bounded. Each response contains its
-host-wire `cursor`, an `entries` slice, and `next_cursor`. The model-facing tool
-accepts no cursor or other arguments. The trusted extension starts at zero,
-advances the cursor internally, and asks the model only to call the tool again
-until `next_cursor` is `null`. Repeated calls after completion return a valid
-empty terminal page at the total count and do not restart enumeration. A single
-manifest entry that cannot fit is a preflight failure, while a large valid
-view—including the configured 100,000-file ceiling—is supported across
-multiple bounded responses rather than serialized as one message.
+The default Pi mode is advisory. An explicitly authoritative profile may clear
+a deterministic finding when Pi returns `false_positive` for that exact
+snapshot-bound finding and all required coverage is complete. The original
+finding, Pi assessment, matched adjudication rule, and effective policy result
+all remain in the report. A confirmed, uncertain, missing, stale, or malformed
+assessment does not clear the finding.
 
-The runtime configuration fixes `platform = "linux"`,
-`sandbox = "tool-sidecar-bubblewrap-v1"`,
-`network = "pi_host_sidecar_none"`, absolute
-administrator roots and executables, normalized runtime-relative manifest,
-Node launcher and Pi entrypoint paths, expected Bubblewrap and Pi versions,
-provider/model/thinking, the instruction, reviewed extension and sidecar runner, the isolated
-agent-state path and security contract, output schema, tool grant, closed
-vocabulary, and exhaustive nonzero limits. Mutable agent-state contents are
-not hashed into pipeline identity because Pi may update locks, settings, and
-OAuth credentials during a run; ownership and owner-only permissions are
-revalidated before each launch. Credential values come only from explicit,
-dedicated parent-environment mappings at execution; the values, run token, proxy
-endpoint, and invocation paths are neither config identity nor report material.
-Secret values and the run token must not appear in process arguments or other
-process-list-visible command material.
+Pi runs through the configured administrator-installed CLI and normal host
+runtime. File Guardian does not construct, hash, inspect, or attest a private
+runtime closure and does not perform ELF dependency analysis or require static
+binaries. Bubblewrap exists to prevent mistaken host/stage edits and contain
+runaway commands:
 
-The manifest-pinned runtime bundle is self-contained, including a self-contained
-Node executable, Pi and its dependencies, and statically linked Bash, common
-text/core utilities, `rg`, `fd`, `sed`, `awk`, `file`, `jq`, `tar`, and
-`unzip`. Sidecar executables cannot depend on unmounted host libraries. The
-sidecar does not mount host `/lib`, `/usr`, or `/etc`; missing or unmanifested
-assets fail closed. Pi itself uses the host resolver and CA
-configuration for its approved model transport. The fixed environment includes
-`PI_OFFLINE=1` and `PI_TELEMETRY=0`.
+- the exact stage and ordinary runtime/tool directories are read-only;
+- a dedicated scratch directory is writable;
+- Pi retains provider networking and only its configured provider credential;
+- model-requested shell tools run in a nested networkless view of the same
+  stage and scratch directory; and
+- timeout, cancellation, and normal completion terminate descendants.
 
-The protected runtime/policy assets and owner-only isolated Pi agent directory
-are part of the invoking user's trust boundary. A dedicated service UID is not
-required by this design.
+## Policy and remediation
 
-File Guardian does not lower `RLIMIT_NPROC` or expose `max_processes` for Pi.
-Linux accounts that limit across every process and thread owned by the invoking
-real UID, so it cannot be a deterministic per-invocation control. The sidecar
-PID namespace and supervised lifecycle guarantee teardown, but they are not a
-hard PID quota; deployments that require one provide an external cgroup limit.
+Policy bindings may audit, deny, request Pi adjudication, delete a whole regular
+file, or move a whole regular file to artifact quarantine. Only File Guardian's
+central action executor mutates the owned stage. Analyzer paths and commands
+are never executed as actions.
 
-Every classification code for every profile that selects Pi has exactly one
-classification binding and its directive is `audit`. Wildcard, missing,
-ambiguous, or non-audit Pi bindings are invalid configuration. Audit-only means
-a successfully normalized Pi result cannot cause allow, deny, or mutation and
-cannot remove any deterministic observation. It does not make Pi optional:
-required Pi failure still makes the authorization result untrustworthy.
+`evaluate` never mutates. `apply` may not exceed profile authority. A surviving
+deny suppresses mutation. Duplicate actions coalesce deterministically and
+quarantine dominates delete for the same file.
 
-Pi applicability is text-only. Assigned content is fully re-read from the
-immutable object, digest/length checked, and streamed through strict UTF-8/NUL
-validation before materialization. Ordinary binary files are complete
-`not_applicable` coverage and do not invoke Pi; if every assignment is binary,
-the audit analyzer completes with no classification. This can participate in an
-allow only because the configured Pi analyzer has no applicable text; it is not
-a positive LLM approval of binary content. Paths selected by
-`content_applicability.required_text_include` must be valid text or required
-analysis fails closed. Valid text exceeding `max_read_bytes_per_call` (which is
-capped at one MiB), object errors, or identity disagreement also fail closed.
-Archive members are not currently
-materialized or inspected; an archive is merely an ordinary physical file and
-normally becomes `not_applicable` when its bytes are binary.
+The action transaction is journaled and revalidates the exact planned file
+identity immediately before each rename. After at least one action:
 
-Prior observations are bounded, compact normalized DTOs only. They can contain
-safe finding/classification identities, categories, severities, validated
-locations, confidence, and reason codes. They never enumerate clean files and
-never contain content, matched values, snippets, raw scanner output, prompts,
-or transcripts.
+1. File Guardian captures a fresh final stage;
+2. it reruns the complete required pipeline, including required Pi;
+3. it resolves policy again against only the fresh results; and
+4. it produces `allow_modified` only if that final result allows the stage.
 
-The initial Pi rollout is audit-only. Model output cannot suppress a
-deterministic finding, and any required timeout, process, tool, budget, schema,
-or coverage failure produces exit `30`. Reports retain only normalized
-configured codes, confidence, reason codes, relative artifact identities,
-coverage, and safe issues. They never retain prompts, model prose or reasoning,
-tool queries/results, raw Pi stdout/stderr, artifact bytes, proxy credentials,
-socket paths, runtime paths, environment values, or transport credentials.
+If the second pipeline run fails technically or its final policy does not
+allow, the job returns `error`/exit `30`. It exposes no handoff, does not run a
+third automatic pass, does not roll back after fresh verification has begun,
+and forces whole-job quarantine of the modified stage and action evidence. A
+caller-owned path source remains unchanged.
 
-### Deterministic external analyzers
+## Outcomes and reports
 
-Password, credential, and secret scanners follow Pi. Reviewed adapters will
-accept host-assigned immutable candidates and return bounded, versioned NDJSON
-normalized to deterministic findings. They run without a shell, without
-network, inside a required sandbox with resource ceilings and full
-process-group cleanup. Raw matched values and native output never enter the
-authorization report.
+One valid processing command emits exactly one compact report plus a newline on
+stdout. The report's exit code equals the process status:
 
-## Planned actions and content expansion
+| Exit | Outcome | Required meaning |
+| ---: | --- | --- |
+| `0` | `allow` | Complete required analysis allows an unchanged stage. |
+| `10` | `allow_modified` | At least one action committed and a complete fresh pipeline allows the final stage. |
+| `20` | `deny` | Complete trustworthy analysis produced a blocking policy result before mutation. |
+| `30` | `error` | Acquisition, required analysis, policy, action, verification, report publication, or disposition is incomplete or failed after mutation. |
 
-### Verified delete and invocation quarantine
+Reports retain safe source/Git provenance, analyzer versions and coverage,
+findings, correlations, Pi assessments, adjudications, actions, stage manifest
+identities, disposition, and handoff eligibility. They never contain matched
+bytes, evidence windows, content snippets, raw scanner/model output, prompts,
+credentials, source paths, Git locators, or private workspace paths.
 
-After analyzers are established, File Guardian will add centralized actions.
-Delete and invocation-scoped quarantine require target identity revalidation,
-journaling, deterministic target ordering, and a complete recapture and rerun
-of every required analyzer. Only that verified flow may produce exit `10`.
-Evaluate mode remains non-mutating. A surviving deny suppresses all mutation.
+## Stage lifecycle
 
-### Recursive archives
+Jobs durably separate policy outcome from disposition. A profile configures
+retain, discard, or whole-job quarantine per outcome. Any ambiguous or failed
+post-mutation transaction overrides retain/discard to whole-job quarantine.
 
-ZIP, TAR, tar+gzip, and single gzip members will become logical immutable
-artifacts inside the invocation workspace, with global depth, entry, expanded
-byte, compression-ratio, and time ceilings. Attacker-controlled paths will not
-be conventionally extracted. A finding on an archive member targets the outer
-physical staged archive for any later action.
+Only a retained, sealed `allow` or `allow_modified` stage is available for
+handoff. Handoff revalidates the sealed manifest and either performs an atomic
+same-filesystem move or a verified copy to an absent destination; it never
+overwrites or silently changes mode. Reports survive stage discard and
+quarantine. Stale-job recovery reconciles durable state, action journals,
+reports, dispositions, and handoff receipts without manufacturing an allow.
 
-### Exact fingerprint indexes
+## Acceptance requirements
 
-Exact SHA-256 fingerprints remain a separate analyzer and administration
-track. Indexes will support configured source roots, root-relative
-include/exclude globs, manual `build`, `sync`, `add`, and `inspect` operations,
-and optional per-index daemon schedules. Static indexes may be on-demand only.
+Deterministic offline tests must prove:
 
-Incremental operation may reuse a file hash when validated size, modification
-time, identity, and generation metadata agree; directory modification times are
-hints and never proof that descendants are unchanged. Atomic SQLite
-generations, WAL, one writer, pinned concurrent readers, freshness policy, and
-retention provide safe daemon/one-shot database sharing. Exact whole-file
-hashes detect renamed identical copies, not excerpts or modified copies.
+- path and remote Git sources enter the same engine;
+- local Git auto-detection preserves `.git`, dirty, untracked, and ignored
+  content;
+- working-tree, HEAD, reachable, and all-ref scopes differ as configured;
+- built-in, Gitleaks, and TruffleHog findings normalize with complete coverage;
+- Pi receives actual evidence and the exact staged/Git context;
+- authoritative Pi can clear an incorrect deterministic finding while both are
+  reported;
+- shell tools cannot edit the stage or host, can write scratch, and have no
+  network or acquisition credentials;
+- delete/quarantine changes only the owned stage;
+- successful remediation runs the full pipeline twice;
+- failed second-pass verification returns exit `30`, forces whole-job
+  quarantine, preserves the modified stage, and leaves the source unchanged;
+- every outcome/disposition/handoff invariant round-trips through the strict
+  report schema; and
+- reports and logs pass privacy canaries containing fake secrets, credentials,
+  paths, URLs, and raw native output.
 
-## Implementation sequence
+Opt-in live acceptance uses preinstalled Git, Bubblewrap, Gitleaks,
+TruffleHog, and the configured Pi model. It never downloads tools or relies on
+real credentials or production repositories.
 
-1. Contract and golden examples.
-2. Private workspace, immutable inspection, typed domain, and all-match
-   built-in rules.
-3. Strict schema-v2 read-only `authorize`, JSON/stdout protocol, exits `0`,
-   `20`, and `30`, plus explicit evaluate-only daemon jobs.
-4. Compiled ordered pipeline, bounded parallelism, selectors, prior-observation
-   projections, and shared one-shot/daemon execution.
-5. Internal Pi classifier, audit-only (implemented on Linux).
-6. Sandboxed deterministic password and secret scanner adapters.
-7. Centralized delete and invocation quarantine with full verification and
-   exit `10`.
-8. Bounded recursive archive inspection.
-9. Manual exact fingerprint indexing and authorization matching.
-10. Incremental SQLite index generations, concurrent readers, freshness, and
-   optional per-index daemon schedules.
-11. Narrow deterministic redaction, then separately versioned similarity
-    fingerprints.
-
-The normative implementation contract is
-[`docs/active-authorization-analyzer-pipeline.md`](docs/active-authorization-analyzer-pipeline.md).
-
-## Acceptance gates
-
-- Strict TOML, JSON, and report-invariant tests run offline.
-- Fixed input produces deterministic manifest and observation ordering.
-- Inspection never mutates input and analyzers never reopen staging.
-- Every capture, analyzer, policy, cleanup, and reporting uncertainty is typed
-  and cannot produce exit `0` or `20`.
-- Privacy tests reject absolute paths, secrets, snippets, prompts, transcripts,
-  credentials, environment values, and raw scanner output in reports.
-- Offline Pi fixtures and later fake delegate processes cover malformed output,
-  crashes, timeouts, pipe floods, budget exhaustion, and incomplete coverage.
-- Each behavior change updates tests and public documentation and passes
-  `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release`.
+Before a milestone is committed, run `cargo fmt`, strict `cargo clippy`, the
+full deterministic `cargo test` suite, Node/Pi harnesses, and
+`cargo build --release`. Review feedback is a proposal: incorporate findings
+that support these requirements, explain conflicts to the reviewer, and do not
+silently redesign the product around adversarial-Pi assumptions.

@@ -115,6 +115,12 @@ pub enum RecoveredActionTransaction {
     AlreadyCommitted {
         final_manifest_identity: Digest,
     },
+    /// Every planned mutation was durably applied and the fresh publication
+    /// manifest was recorded before verification began. A verification
+    /// failure preserves this modified stage for whole-job quarantine.
+    VerificationStagePreserved {
+        manifest_identity: Digest,
+    },
     UnchangedProven {
         manifest_identity: Digest,
     },
@@ -221,6 +227,12 @@ impl ArtifactQuarantineMetadata {
             && self.subject_id == action.target.subject_id
             && self.logical_path == action.target.logical_path
             && same_content(&self.identity, &action.target.expected_identity)
+    }
+
+    pub fn validate_stored_record(&self) -> bool {
+        self.schema_version == QUARANTINE_METADATA_SCHEMA
+            && self.identity.file_type == SourceFileType::RegularFile
+            && self.identity.link_count == 1
     }
 }
 
@@ -381,6 +393,25 @@ pub fn recover_actions(
         return Ok(RecoveredActionTransaction::AlreadyCommitted {
             final_manifest_identity,
         });
+    }
+    let verification_manifest = parsed.records.iter().find_map(|record| match record.event {
+        JournalEvent::VerificationStarted { manifest_identity } => Some(manifest_identity),
+        _ => None,
+    });
+    if let Some(manifest_identity) = verification_manifest {
+        let observed = request
+            .manifest_prover
+            .capture_manifest(request.stage_root)
+            .map_err(|_| {
+                recovery_setup_failure(ActionFailureKind::ManifestProofFailed, &request)
+            })?;
+        if observed != manifest_identity {
+            return Err(recovery_setup_failure(
+                ActionFailureKind::ManifestProofFailed,
+                &request,
+            ));
+        }
+        return Ok(RecoveredActionTransaction::VerificationStagePreserved { manifest_identity });
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]

@@ -6,6 +6,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixListener;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Barrier,
@@ -402,7 +403,7 @@ fn detects_a_file_mutated_while_it_is_copied() {
 }
 
 #[test]
-fn owned_stage_capture_enforces_symlink_policy_and_lexical_confinement() {
+fn owned_stage_capture_enforces_symlink_policy_and_preserves_targets_exactly() {
     let fixture = Fixture::new();
     fs::create_dir(fixture.stage.join("nested")).unwrap();
     fs::write(fixture.stage.join("file.txt"), b"bytes").unwrap();
@@ -431,17 +432,20 @@ fn owned_stage_capture_enforces_symlink_policy_and_lexical_confinement() {
 
     fs::remove_file(fixture.stage.join("nested/safe-link")).unwrap();
     symlink("../../outside", fixture.stage.join("nested/escape-link")).unwrap();
-    assert!(matches!(
-        capture_owned_stage(
-            &fixture.stage,
-            &fixture.jobs,
-            PathInputKind::Directory,
-            &limits(),
-            SymlinkPolicy::Preserve,
-            &fixture.cancellation,
-        ),
-        Err(LocalAcquisitionError::SymlinkRejected)
-    ));
+    let captured = capture_owned_stage(
+        &fixture.stage,
+        &fixture.jobs,
+        PathInputKind::Directory,
+        &limits(),
+        SymlinkPolicy::Preserve,
+        &fixture.cancellation,
+    )
+    .unwrap();
+    assert_eq!(captured.statistics.symbolic_links, 1);
+    assert_eq!(
+        fs::read_link(fixture.stage.join("nested/escape-link")).unwrap(),
+        PathBuf::from("../../outside")
+    );
 }
 
 #[test]

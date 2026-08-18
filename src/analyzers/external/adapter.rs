@@ -309,9 +309,8 @@ pub(super) fn rule_id(scanner: ScannerKind, native: &str) -> Result<RuleId, Scan
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     RuleId::new(format!(
-        "{}/{}-{native_key}",
+        "{}:{component}-{native_key}",
         scanner.executable_name(),
-        component
     ))
     .map_err(|_| ScannerAdapterError::RuleIdentifier)
 }

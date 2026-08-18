@@ -22,15 +22,14 @@ use crate::analyzers::external::{
 use crate::analyzers::{
     BuiltinAnalyzerLimits, BuiltinContentApplicability, BuiltinRulesAnalyzer, RequiredTextMatcher,
 };
-use crate::domain::{AnalyzerId, Digest, ReasonCode, RuleId, RunId};
+use crate::domain::{AnalyzerId, Digest, RunId};
 use crate::pipeline::{PriorObservationMode, ProjectionLimits, StageExecution, StageId};
 use crate::processing::config::{
-    self, AnalyzerArtifactKind, AnalyzerConfig, AnalyzerKind, AttestationRequirement,
-    ClearanceRule, CompletionPolicy, Confidence, HistoryScope, LfsPolicy, PhaseExecution,
-    PiAdjudicationMode, ProcessingConfigFile, ProcessingProfile, ProfilePurpose, Severity,
-    SubmodulePolicy, SymlinkPolicy, VerificationState,
+    self, AnalyzerArtifactKind, AnalyzerConfig, AnalyzerKind, CompletionPolicy, HistoryScope,
+    LfsPolicy, PhaseExecution, PiAdjudicationMode, ProcessingConfigFile, ProcessingProfile,
+    ProfilePurpose, SubmodulePolicy,
 };
-use crate::processing::domain::{ClearanceRuleId, GitHistoryScope, GitTransport, ProcessPurpose};
+use crate::processing::domain::{GitHistoryScope, GitTransport, ProcessPurpose};
 use crate::processing::policy::CompiledProcessingPolicy;
 use crate::rules::load_rule_files;
 
@@ -47,10 +46,6 @@ pub enum RequestedActionMode {
 pub enum ProcessingSourceRequest {
     Path {
         path: PathBuf,
-    },
-    Repo {
-        path: PathBuf,
-        reference: Option<String>,
     },
     Git {
         remote: String,
@@ -84,22 +79,12 @@ pub struct FrozenGitConstraints {
     pub allowed_checkout_ref_patterns: Vec<String>,
     pub submodules: SubmodulePolicy,
     pub lfs: LfsPolicy,
-    pub symlinks: SymlinkPolicy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FrozenLocalConstraints {
-    pub symlinks: SymlinkPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FrozenSourceRequest {
     Path {
         path: PathBuf,
-    },
-    Repo {
-        path: PathBuf,
-        checkout_ref: Option<String>,
     },
     Git {
         remote: String,
@@ -160,7 +145,6 @@ pub struct CompiledProcessingRuntime {
     pub source: FrozenSourceRequest,
     pub source_scope: FrozenSourceScope,
     pub git_constraints: FrozenGitConstraints,
-    pub local_constraints: FrozenLocalConstraints,
     pub source_scope_identity: Digest,
     pub jobs: FrozenJobLimits,
     pub acquisition: FrozenAcquisitionLimits,
@@ -226,7 +210,6 @@ pub struct FrozenPiLimits {
     pub idle_timeout_secs: u64,
     pub wall_timeout_secs: u64,
     pub termination_grace_secs: u64,
-    pub memory_bytes: u64,
     pub cpu_time_secs: u64,
     pub max_open_files: u64,
     pub max_stdout_bytes: u64,
@@ -294,25 +277,6 @@ pub struct CompiledPiAdjudication {
     pub mode: PiAdjudicationMode,
     pub required_initial: bool,
     pub required_after_actions: bool,
-    pub minimum_confidence: Option<Confidence>,
-    pub initial_attestation: AttestationRequirement,
-    pub post_action_attestation: AttestationRequirement,
-    pub non_clearable_categories: Vec<String>,
-    pub non_clearable_minimum_severity: Option<Severity>,
-    pub non_clearable_verification_states: Vec<VerificationState>,
-    pub hard_block_rules: Vec<RuleId>,
-    pub clearance_rules: Vec<CompiledClearanceRule>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CompiledClearanceRule {
-    pub id: ClearanceRuleId,
-    pub analyzer: AnalyzerId,
-    pub rules: Vec<RuleId>,
-    pub categories: Vec<String>,
-    pub maximum_severity: Severity,
-    pub verification_states: Vec<VerificationState>,
-    pub reason_codes: Vec<ReasonCode>,
 }
 
 #[derive(Debug, Error)]
@@ -323,8 +287,6 @@ pub enum ProcessingRuntimeError {
     UnknownProfile(String),
     #[error("requested apply authority exceeds the selected profile")]
     AuthorityEscalation,
-    #[error("path sources require history = 'none'")]
-    PathHistory,
     #[error("checkout ref is invalid or outside the selected profile")]
     CheckoutRef,
     #[error("remote Git locator is invalid or uses a prohibited transport")]
@@ -370,7 +332,6 @@ pub fn compile_processing_runtime(
         profile.purpose,
         &profile.source_scope,
         &profile.git,
-        &profile.local,
     ))?);
     let pipeline_config = config
         .pipelines
@@ -413,10 +374,6 @@ pub fn compile_processing_runtime(
             allowed_checkout_ref_patterns: profile.git.allowed_checkout_ref_patterns.clone(),
             submodules: profile.git.submodules,
             lfs: profile.git.lfs,
-            symlinks: profile.git.symlinks,
-        },
-        local_constraints: FrozenLocalConstraints {
-            symlinks: profile.local.symlinks,
         },
         source_scope_identity,
         jobs: FrozenJobLimits {
@@ -483,19 +440,7 @@ fn compile_source(
     source: ProcessingSourceRequest,
 ) -> Result<FrozenSourceRequest, ProcessingRuntimeError> {
     match source {
-        ProcessingSourceRequest::Path { path } => {
-            if profile.source_scope.history != HistoryScope::None {
-                return Err(ProcessingRuntimeError::PathHistory);
-            }
-            Ok(FrozenSourceRequest::Path { path })
-        }
-        ProcessingSourceRequest::Repo { path, reference } => {
-            validate_checkout_ref(profile, reference.as_deref())?;
-            Ok(FrozenSourceRequest::Repo {
-                path,
-                checkout_ref: reference,
-            })
-        }
+        ProcessingSourceRequest::Path { path } => Ok(FrozenSourceRequest::Path { path }),
         ProcessingSourceRequest::Git { remote, reference } => {
             validate_checkout_ref(profile, reference.as_deref())?;
             let transport = parse_remote(&remote)?;
@@ -734,7 +679,7 @@ fn compile_pi(
         .map_err(|message| analyzer_error(&analyzer.id, &message))?;
     let instruction_identity = Digest::sha256(instruction.as_bytes());
     for path in [
-        &pi.pi.runtime_root,
+        &pi.pi.pi_executable,
         &pi.pi.bubblewrap_executable,
         &pi.pi.trusted_extension,
         &pi.pi.tool_sidecar_runner,
@@ -744,17 +689,6 @@ fn compile_pi(
             return Err(analyzer_error(
                 &analyzer.id,
                 "Pi runtime administrator path is unavailable",
-            ));
-        }
-    }
-    let runtime_manifest = pi.pi.runtime_root.join(&pi.pi.runtime_manifest);
-    let launcher = pi.pi.runtime_root.join(&pi.pi.launcher);
-    let entrypoint = pi.pi.runtime_root.join(&pi.pi.pi_entrypoint);
-    for path in [&runtime_manifest, &launcher, &entrypoint] {
-        if !path.is_file() {
-            return Err(analyzer_error(
-                &analyzer.id,
-                "Pi runtime closure is unavailable",
             ));
         }
     }
@@ -805,7 +739,6 @@ fn compile_pi(
                     "termination_grace_secs",
                     analyzer.limits.termination_grace_secs,
                 )?,
-                memory_bytes: required("memory_bytes", analyzer.limits.memory_bytes)?,
                 cpu_time_secs: required("cpu_time_secs", analyzer.limits.cpu_time_secs)?,
                 max_open_files: required("max_open_files", analyzer.limits.max_open_files)?,
                 max_stdout_bytes: required("max_stdout_bytes", analyzer.limits.max_stdout_bytes)?,
@@ -1062,7 +995,6 @@ fn scanner_limits(analyzer: &AnalyzerConfig) -> Result<ScannerRunLimits, Process
             "max_output_bytes",
             analyzer.limits.max_output_bytes,
         )?,
-        memory_bytes: analyzer.limits.memory_bytes.unwrap_or(512 * 1024 * 1024),
         cpu_seconds: analyzer.limits.cpu_time_secs.unwrap_or(120),
         open_files: analyzer.limits.max_open_files.unwrap_or(64),
     })
@@ -1092,70 +1024,12 @@ fn read_bounded_utf8(path: &Path, limit: u64) -> Result<String, String> {
 fn compile_pi_adjudication(
     config: &config::PiAdjudication,
 ) -> Result<CompiledPiAdjudication, ProcessingRuntimeError> {
-    let mut hard_block_rules = config
-        .non_clearable
-        .hard_block_rules
-        .iter()
-        .cloned()
-        .map(RuleId::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ProcessingRuntimeError::Configuration(error.to_string()))?;
-    hard_block_rules.sort();
-    let mut clearance_rules = config
-        .clearance_rules
-        .iter()
-        .map(compile_clearance_rule)
-        .collect::<Result<Vec<_>, _>>()?;
-    clearance_rules.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(CompiledPiAdjudication {
         analyzer: AnalyzerId::new(config.analyzer.clone())
             .map_err(|error| ProcessingRuntimeError::Configuration(error.to_string()))?,
         mode: config.mode,
         required_initial: config.required_initial,
         required_after_actions: config.required_after_actions,
-        minimum_confidence: config.minimum_confidence,
-        initial_attestation: config.attestation.initial,
-        post_action_attestation: config.attestation.post_action,
-        non_clearable_categories: config.non_clearable.categories.clone(),
-        non_clearable_minimum_severity: config.non_clearable.minimum_severity,
-        non_clearable_verification_states: config.non_clearable.verification_states.clone(),
-        hard_block_rules,
-        clearance_rules,
-    })
-}
-
-fn compile_clearance_rule(
-    rule: &ClearanceRule,
-) -> Result<CompiledClearanceRule, ProcessingRuntimeError> {
-    let mut rules = rule
-        .rules
-        .iter()
-        .cloned()
-        .map(RuleId::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ProcessingRuntimeError::Configuration(error.to_string()))?;
-    rules.sort();
-    let mut reason_codes = rule
-        .reason_codes
-        .iter()
-        .cloned()
-        .map(ReasonCode::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ProcessingRuntimeError::Configuration(error.to_string()))?;
-    reason_codes.sort();
-    let wire_id = Digest::sha256(rule.id.as_bytes()).to_string();
-    Ok(CompiledClearanceRule {
-        // Config IDs permit `:` while public record IDs deliberately do not.
-        // Hashing preserves a stable mapping without weakening either grammar.
-        id: ClearanceRuleId::from_suffix(&wire_id["sha256:".len()..])
-            .map_err(|error| ProcessingRuntimeError::Configuration(error.to_string()))?,
-        analyzer: AnalyzerId::new(rule.analyzer.clone())
-            .map_err(|error| ProcessingRuntimeError::Configuration(error.to_string()))?,
-        rules,
-        categories: rule.categories.clone(),
-        maximum_severity: rule.maximum_severity,
-        verification_states: rule.verification_states.clone(),
-        reason_codes,
     })
 }
 

@@ -261,6 +261,18 @@ fn capture_working_tree(
 ) -> Result<(), ProcessingCatalogError> {
     require_current_publication(input, limits, entries)?;
     for entry in entries {
+        // Git administration data is part of the exact publication stage and
+        // remains available to Git-aware analyzers/Pi through that stage. It
+        // is not treated as an ordinary working-tree file for deterministic
+        // filesystem rules or stage-remediation targeting.
+        if entry
+            .logical_path
+            .segments()
+            .first()
+            .is_some_and(|segment| segment.as_slice() == b".git")
+        {
+            continue;
+        }
         match entry.kind {
             AcquiredEntryKind::Directory => {}
             AcquiredEntryKind::RegularFile => {

@@ -155,6 +155,7 @@ pub struct AnalyzerInvocation {
     pub artifacts: Arc<ProcessingArtifactCatalog>,
     pub prior: Arc<PriorObservationProjection>,
     pub prior_findings: Arc<NormalizedPhaseFindings>,
+    pub prior_evidence: Arc<[BackendObservationEvidence]>,
     pub prior_coverage: Arc<[AnalyzerCoverage]>,
 }
 
@@ -167,6 +168,7 @@ impl std::fmt::Debug for AnalyzerInvocation {
             .field("assignment_count", &self.assignments.len())
             .field("prior_identity", &self.prior.identity())
             .field("prior_finding_count", &self.prior_findings.findings.len())
+            .field("prior_evidence_count", &self.prior_evidence.len())
             .field("prior_coverage_count", &self.prior_coverage.len())
             .finish()
     }
@@ -354,6 +356,10 @@ pub struct ProcessingPhaseResult {
     pub findings: Vec<Finding>,
     pub correlations: Vec<Correlation>,
     pub observation_to_finding: BTreeMap<ObservationId, crate::processing::FindingId>,
+    pub observation_to_occurrence: BTreeMap<ObservationId, crate::processing::OccurrenceId>,
+    /// Private evidence forwarded to a later trusted Pi stage. Debug output is
+    /// redacted and report construction never serializes these bytes.
+    pub evidence: Vec<BackendObservationEvidence>,
     pub pi_results: Vec<PiAnalyzerResult>,
     pub coverage: Vec<AnalyzerCoverage>,
     pub analyzer_runs: Vec<AnalyzerRunRecord>,
@@ -401,6 +407,7 @@ struct PhaseAnalyzerInputs {
     artifacts: Arc<ProcessingArtifactCatalog>,
     prior: Arc<PriorObservationProjection>,
     prior_findings: Arc<NormalizedPhaseFindings>,
+    prior_evidence: Arc<[BackendObservationEvidence]>,
     prior_coverage: Arc<[AnalyzerCoverage]>,
 }
 
@@ -425,6 +432,8 @@ impl ProcessingPhaseExecutor {
             findings: Vec::new(),
             correlations: Vec::new(),
             observation_to_finding: BTreeMap::new(),
+            observation_to_occurrence: BTreeMap::new(),
+            evidence: Vec::new(),
             pi_results: Vec::new(),
             coverage: Vec::new(),
             analyzer_runs: Vec::new(),
@@ -462,6 +471,7 @@ impl ProcessingPhaseExecutor {
                 context, phase, &artifacts, &result, &evidence,
             )?);
             let prior_coverage: Arc<[AnalyzerCoverage]> = result.coverage.clone().into();
+            let prior_evidence: Arc<[BackendObservationEvidence]> = evidence.clone().into();
 
             let stage_results = execute_stage(
                 stage.execution,
@@ -472,6 +482,7 @@ impl ProcessingPhaseExecutor {
                     artifacts: Arc::clone(&artifacts),
                     prior,
                     prior_findings,
+                    prior_evidence,
                     prior_coverage,
                 },
                 &backends,
@@ -501,6 +512,8 @@ impl ProcessingPhaseExecutor {
         result.observations.sort();
         let normalized = normalize_phase(context, phase, &artifacts, &result, &evidence)?;
         apply_normalized(&mut result, normalized);
+        evidence.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+        result.evidence = evidence;
         result
             .pi_results
             .sort_by(|left, right| left.analyzer_id.cmp(&right.analyzer_id));
@@ -719,6 +732,7 @@ async fn execute_analyzer(
         artifacts: inputs.artifacts,
         prior: inputs.prior,
         prior_findings: Arc::clone(&inputs.prior_findings),
+        prior_evidence: Arc::clone(&inputs.prior_evidence),
         prior_coverage: Arc::clone(&inputs.prior_coverage),
     };
     let phase = invocation.phase;
@@ -1001,6 +1015,7 @@ fn normalize_phase(
             findings: Vec::new(),
             correlations: Vec::new(),
             observation_to_finding: BTreeMap::new(),
+            observation_to_occurrence: BTreeMap::new(),
         });
     }
     let finding_contexts = artifacts
@@ -1044,6 +1059,7 @@ fn apply_normalized(result: &mut ProcessingPhaseResult, normalized: NormalizedPh
     result.findings = normalized.findings;
     result.correlations = normalized.correlations;
     result.observation_to_finding = normalized.observation_to_finding;
+    result.observation_to_occurrence = normalized.observation_to_occurrence;
 }
 
 fn map_backend_error(error: AnalyzerBackendError) -> ProcessingExecutionIssueCode {

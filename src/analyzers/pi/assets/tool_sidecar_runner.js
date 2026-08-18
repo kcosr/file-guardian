@@ -14,9 +14,16 @@ const testRoots = process.argv[2] === "--test-roots" ? process.argv.slice(3, 6) 
 if (testRoots && (testRoots.length !== 3 || testRoots.some((root) => !isAbsolute(root)))) {
 	throw new Error("invalid sidecar test roots");
 }
-const INPUT_ROOT = testRoots?.[0] ?? "/input";
-const WORK_ROOT = testRoots?.[1] ?? "/work";
-const RUNTIME_ROOT = testRoots?.[2] ?? "/runtime";
+const INPUT_ROOT = testRoots?.[0] ?? process.env.FILE_GUARDIAN_INPUT_ROOT;
+const WORK_ROOT = testRoots?.[1] ?? process.env.FILE_GUARDIAN_WORK_ROOT;
+const TOOL_PATH = testRoots?.[2] ?? process.env.FILE_GUARDIAN_TOOL_PATH;
+if (
+	![INPUT_ROOT, WORK_ROOT].every((root) => typeof root === "string" && isAbsolute(root)) ||
+	typeof TOOL_PATH !== "string" ||
+	TOOL_PATH.split(":").some((entry) => !isAbsolute(entry))
+) {
+	throw new Error("invalid sidecar roots or tool path");
+}
 const MAX_REQUEST_BYTES = 64 * 1024;
 const MAX_COMMAND_CHARACTERS = 16 * 1024;
 const MAX_PATH_CHARACTERS = 4096;
@@ -30,8 +37,7 @@ const COMMAND_ENVIRONMENT = Object.freeze({
 	HOME: WORK_ROOT,
 	LANG: "C",
 	LC_ALL: "C",
-	MAGIC: `${RUNTIME_ROOT}/share/misc/magic.mgc`,
-	PATH: `${RUNTIME_ROOT}/bin`,
+	PATH: TOOL_PATH,
 	TMPDIR: "/tmp",
 });
 
@@ -58,7 +64,7 @@ function boundedString(value, minimum, maximum) {
 }
 
 function runtimeExecutable(name) {
-	return resolve(RUNTIME_ROOT, "bin", name);
+	return name;
 }
 
 function isContained(root, candidate) {

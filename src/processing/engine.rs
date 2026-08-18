@@ -15,10 +15,10 @@ use std::time::Duration;
 use crate::analyzers::external::ScannerCancellation;
 use crate::analyzers::pi::triage::PriorFinding;
 use crate::authorization::{CaptureLimits as SnapshotCaptureLimits, InvocationWorkspace};
+use crate::domain::Digest;
 use crate::domain::InspectionPhase;
-use crate::domain::{Digest, RunId};
 use crate::processing::acquisition::git::{
-    acquire_local_repository_source, acquire_remote_repository_source, FrozenGitRepository,
+    acquire_remote_repository_source, enumerate_local_repository, FrozenGitRepository,
     GitAcquisitionSummary, GitCommandLimits, GitCommandRunner, GitEnumerationLimits,
     GitEnumerationRequest, RemoteLocator, SanitizedGitEnvironment,
 };
@@ -40,7 +40,7 @@ use crate::processing::catalog::{
 use crate::processing::completion::{
     finalize_job, revalidate_and_seal, CompletionDisposition, FinalizeRequest,
 };
-use crate::processing::config::{CaptureLimits, SymlinkPolicy};
+use crate::processing::config::CaptureLimits;
 use crate::processing::domain::{
     ActionJournalState, ActionRecord, Disposition, HandoffStatus, JobExecutionState, Outcome,
     ProcessSource,
@@ -89,6 +89,8 @@ pub enum ProcessingEngineError {
     Analysis,
     #[error("processing policy resolution failed")]
     Policy,
+    #[error("the remediated stage failed required verification")]
+    Verification,
     #[error("Pi adjudication failed closed")]
     Adjudication,
     #[error("durable processing job state failed")]
@@ -123,18 +125,12 @@ pub fn recapture_processing_source(
 ) -> Result<AcquiredProcessingSource, ProcessingEngineError> {
     let input_kind = acquired.publication_stage.input_kind;
     let limits = acquisition_capture_limits(runtime)?;
-    let symlinks = match &runtime.source {
-        FrozenSourceRequest::Path { .. } => runtime.local_constraints.symlinks,
-        FrozenSourceRequest::Repo { .. } | FrozenSourceRequest::Git { .. } => {
-            runtime.git_constraints.symlinks
-        }
-    };
     let current = capture_owned_stage(
         &paths.stage(),
         &runtime.jobs.jobs_root,
         input_kind,
         &limits,
-        symlinks,
+        crate::processing::config::SymlinkPolicy::Preserve,
         cancellation,
     )
     .map_err(map_local_error)?;
@@ -232,97 +228,120 @@ impl ProcessingEngine {
         let mut verification = None;
         let mut verification_policy = None;
         let mut adjudications = initial_adjudication.adjudications;
-        let (outcome, acquired, final_manifest_identity) = match initial_policy.decision {
-            ProcessingPolicyDecision::Allow => {
-                let manifest = publication_manifest_identity(&acquired)?;
-                (Outcome::Allow, acquired, manifest)
-            }
-            ProcessingPolicyDecision::Deny => {
-                let manifest = publication_manifest_identity(&acquired)?;
-                (Outcome::Deny, acquired, manifest)
-            }
-            ProcessingPolicyDecision::RequiresMutation
-                if self.runtime.action_mode
-                    == crate::processing::runtime::EffectiveActionMode::Evaluate =>
-            {
-                let manifest = publication_manifest_identity(&acquired)?;
-                (Outcome::Deny, acquired, manifest)
-            }
-            ProcessingPolicyDecision::RequiresMutation => {
-                transition(&mut lease, JobExecutionState::PlanningActions)?;
-                let subjects = stage_subjects(&initial)?;
-                let plan = match build_action_plan(
-                    initial_publication_identity,
-                    &subjects,
-                    &initial.result.findings,
-                    &initial_policy.action_resolutions(),
-                )
-                .map_err(|_| ProcessingEngineError::Action)?
+        let mut terminal_issues = Vec::new();
+        let (outcome, acquired, final_manifest_identity, effective_disposition_override) =
+            match initial_policy.decision {
+                ProcessingPolicyDecision::Allow => {
+                    let manifest = publication_manifest_identity(&acquired)?;
+                    (Outcome::Allow, acquired, manifest, None)
+                }
+                ProcessingPolicyDecision::Deny => {
+                    let manifest = publication_manifest_identity(&acquired)?;
+                    (Outcome::Deny, acquired, manifest, None)
+                }
+                ProcessingPolicyDecision::RequiresMutation
+                    if self.runtime.action_mode
+                        == crate::processing::runtime::EffectiveActionMode::Evaluate =>
                 {
-                    ActionPlanOutcome::Planned(plan) => plan,
-                    ActionPlanOutcome::NoActions | ActionPlanOutcome::SuppressedByDeny { .. } => {
-                        return Err(ProcessingEngineError::Action)
-                    }
-                };
-                transition(&mut lease, JobExecutionState::ApplyingActions)?;
-                let action_paths = prepare_action_paths(lease.paths())?;
-                let prover = OwnedStageManifestProver {
-                    runtime: &self.runtime,
-                    input_kind: acquired.publication_stage.input_kind,
-                    cancellation: &self.cancellation,
-                };
-                crate::processing::actions::executor::execute_actions(
-                    crate::processing::actions::executor::ActionExecutionRequest {
-                        stage_root: &lease.paths().stage(),
-                        trash_root: &action_paths.trash,
-                        artifact_quarantine_root: &self.runtime.jobs.artifact_quarantine_root,
-                        journal_path: &action_paths.journal,
-                        plan: &plan,
+                    let manifest = publication_manifest_identity(&acquired)?;
+                    (Outcome::Deny, acquired, manifest, None)
+                }
+                ProcessingPolicyDecision::RequiresMutation => {
+                    transition(&mut lease, JobExecutionState::PlanningActions)?;
+                    let subjects = stage_subjects(&initial)?;
+                    let plan = match build_action_plan(
+                        initial_publication_identity,
+                        &subjects,
+                        &initial.result.findings,
+                        &initial_policy.action_resolutions(),
+                    )
+                    .map_err(|_| ProcessingEngineError::Action)?
+                    {
+                        ActionPlanOutcome::Planned(plan) => plan,
+                        ActionPlanOutcome::NoActions
+                        | ActionPlanOutcome::SuppressedByDeny { .. } => {
+                            return Err(ProcessingEngineError::Action)
+                        }
+                    };
+                    transition(&mut lease, JobExecutionState::ApplyingActions)?;
+                    let action_paths = prepare_action_paths(lease.paths())?;
+                    let prover = OwnedStageManifestProver {
+                        runtime: &self.runtime,
+                        input_kind: acquired.publication_stage.input_kind,
                         cancellation: &self.cancellation,
-                        manifest_prover: &prover,
-                        faults: &crate::processing::actions::executor::NoActionFaults,
-                    },
-                )
-                .map_err(|_| ProcessingEngineError::Action)?;
-                actions = action_records(&plan)?;
-                transition(&mut lease, JobExecutionState::CapturingVerification)?;
-                let acquired = recapture_processing_source(
-                    &self.runtime,
-                    lease.paths(),
-                    acquired,
-                    &self.cancellation,
-                )?;
-                let final_manifest = publication_manifest_identity(&acquired)?;
-                append_verification_started(&action_paths.journal, final_manifest)?;
-                transition(&mut lease, JobExecutionState::AnalyzingVerification)?;
-                let verified = execute_captured_phase(
-                    &self.runtime,
-                    lease.paths(),
-                    &acquired,
-                    InspectionPhase::Verification,
-                    correlation_key,
-                )
-                .await?;
-                transition(&mut lease, JobExecutionState::ResolvingVerification)?;
-                let (resolved, adjudicated) = resolve_phase(&self.runtime, &verified, true)?;
-                adjudications.extend(adjudicated.adjudications);
-                append_action_commit(&action_paths.journal, final_manifest)?;
-                crate::processing::actions::executor::cleanup_committed_actions(
-                    crate::processing::actions::executor::CommittedCleanupRequest {
-                        stage_root: &lease.paths().stage(),
-                        trash_root: &action_paths.trash,
-                        artifact_quarantine_root: &self.runtime.jobs.artifact_quarantine_root,
-                        journal_path: &action_paths.journal,
-                        plan: &plan,
-                        faults: &crate::processing::actions::executor::NoActionFaults,
-                    },
-                )
-                .map_err(|_| ProcessingEngineError::Action)?;
-                verification_policy = Some(resolved);
-                verification = Some(verified);
-                (Outcome::AllowModified, acquired, final_manifest)
-            }
-        };
+                    };
+                    crate::processing::actions::executor::execute_actions(
+                        crate::processing::actions::executor::ActionExecutionRequest {
+                            stage_root: &lease.paths().stage(),
+                            trash_root: &action_paths.trash,
+                            artifact_quarantine_root: &self.runtime.jobs.artifact_quarantine_root,
+                            journal_path: &action_paths.journal,
+                            plan: &plan,
+                            cancellation: &self.cancellation,
+                            manifest_prover: &prover,
+                            faults: &crate::processing::actions::executor::NoActionFaults,
+                        },
+                    )
+                    .map_err(|_| ProcessingEngineError::Action)?;
+                    actions = action_records(&plan)?;
+                    transition(&mut lease, JobExecutionState::CapturingVerification)?;
+                    let acquired = recapture_processing_source(
+                        &self.runtime,
+                        lease.paths(),
+                        acquired,
+                        &self.cancellation,
+                    )?;
+                    let final_manifest = publication_manifest_identity(&acquired)?;
+                    append_verification_started(&action_paths.journal, final_manifest)?;
+                    transition(&mut lease, JobExecutionState::AnalyzingVerification)?;
+                    let verified = execute_captured_phase(
+                        &self.runtime,
+                        lease.paths(),
+                        &acquired,
+                        InspectionPhase::Verification,
+                        correlation_key,
+                    )
+                    .await?;
+                    transition(&mut lease, JobExecutionState::ResolvingVerification)?;
+                    let (resolved, adjudicated) = resolve_phase(&self.runtime, &verified, true)?;
+                    adjudications.extend(adjudicated.adjudications);
+                    if resolved.decision != ProcessingPolicyDecision::Allow {
+                        append_verification_rejected(&action_paths.journal, final_manifest)?;
+                        terminal_issues.push(SafeComponentEvent {
+                            code: error_code(&ProcessingEngineError::Verification).to_owned(),
+                            phase: Some(InspectionPhase::Verification),
+                            component_id: None,
+                        });
+                        verification_policy = Some(resolved);
+                        verification = Some(verified);
+                        (
+                            Outcome::Error,
+                            acquired,
+                            final_manifest,
+                            Some(CompletionDisposition::Quarantine),
+                        )
+                    } else {
+                        append_action_commit(&action_paths.journal, final_manifest)?;
+                        crate::processing::actions::executor::cleanup_committed_actions(
+                            crate::processing::actions::executor::CommittedCleanupRequest {
+                                stage_root: &lease.paths().stage(),
+                                trash_root: &action_paths.trash,
+                                artifact_quarantine_root: &self
+                                    .runtime
+                                    .jobs
+                                    .artifact_quarantine_root,
+                                journal_path: &action_paths.journal,
+                                plan: &plan,
+                                faults: &crate::processing::actions::executor::NoActionFaults,
+                            },
+                        )
+                        .map_err(|_| ProcessingEngineError::Action)?;
+                        verification_policy = Some(resolved);
+                        verification = Some(verified);
+                        (Outcome::AllowModified, acquired, final_manifest, None)
+                    }
+                }
+            };
 
         transition(&mut lease, JobExecutionState::RevalidatingFinal)?;
         let initial_manifest_identity = initial_publication_identity;
@@ -342,16 +361,17 @@ impl ProcessingEngine {
             None
         };
         let configured = configured_disposition(&self.runtime, outcome);
+        let effective_completion = effective_disposition_override.unwrap_or(configured);
         let completion = has_reported_stage
             .then(|| {
                 completion_input(
                     outcome,
                     configured,
+                    effective_completion,
                     initial_manifest_identity,
                     final_manifest_identity,
                     sealed.is_some(),
-                    &self.runtime.run_id,
-                    self.runtime.jobs.retention.available_ttl_secs,
+                    &self.runtime,
                 )
             })
             .transpose()?;
@@ -400,7 +420,7 @@ impl ProcessingEngine {
             pi_invocations,
             adjudications: &adjudications,
             actions: &action_inputs,
-            issues: &[],
+            issues: &terminal_issues,
             degradations: &[],
             started_at,
             finished_at,
@@ -436,7 +456,7 @@ impl ProcessingEngine {
             DecisionDispositions::new(
                 outcome,
                 decision_disposition(configured),
-                decision_disposition(configured),
+                decision_disposition(effective_completion),
             )
             .map_err(|_| ProcessingEngineError::Job)?,
             report_identity,
@@ -450,7 +470,7 @@ impl ProcessingEngine {
                 decision: &decision,
                 report: &report,
                 configured_disposition: configured,
-                effective_disposition: configured,
+                effective_disposition: effective_completion,
                 sealed_stage: sealed.as_ref(),
                 now_unix_millis: system_time_unix_millis()
                     .map_err(|_| ProcessingEngineError::Job)?,
@@ -631,7 +651,10 @@ impl ProcessingEngine {
                 records,
                 details_omitted: false,
             },
-            Ok(crate::processing::actions::executor::RecoveredActionTransaction::AlreadyCommitted { .. }) => ErrorActionRecovery {
+            Ok(
+                crate::processing::actions::executor::RecoveredActionTransaction::AlreadyCommitted { .. }
+                | crate::processing::actions::executor::RecoveredActionTransaction::VerificationStagePreserved { .. },
+            ) => ErrorActionRecovery {
                 force_quarantine: true,
                 states: vec![ReportActionState::Committed; records.len()],
                 records,
@@ -811,9 +834,11 @@ pub fn resolve_phase(
 ) -> Result<(ProcessingPolicyEvaluation, AdjudicationDecision), ProcessingEngineError> {
     let preliminary = evaluate_phase_policy(runtime, phase, &BTreeSet::new())?;
     let adjudication = adjudicate_phase(runtime, phase, &preliminary, after_actions)?;
-    let resolved = evaluate_phase_policy(runtime, phase, &adjudication.cleared_finding_ids)?;
-    if after_actions && resolved.decision != ProcessingPolicyDecision::Allow {
-        return Err(ProcessingEngineError::Policy);
+    let mut resolved = evaluate_phase_policy(runtime, phase, &adjudication.cleared_finding_ids)?;
+    if adjudication.stage_attestation
+        == Some(crate::analyzers::pi::triage::PiStageAttestation::BlockingConcernsObserved)
+    {
+        resolved.decision = ProcessingPolicyDecision::Deny;
     }
     Ok((resolved, adjudication))
 }
@@ -960,6 +985,7 @@ pub async fn execute_captured_phase(
             run_id: runtime.run_id.clone(),
             pipeline_identity: runtime.pipeline_identity,
             policy_identity: runtime.policy_identity,
+            stage_root: stage.clone(),
         },
     )
     .map_err(|_| ProcessingEngineError::Backend)?;
@@ -995,72 +1021,71 @@ pub async fn acquire_processing_source(
     let limits = acquisition_capture_limits(runtime)?;
     let acquired = match &runtime.source {
         FrozenSourceRequest::Path { path } => {
+            if !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+                return Err(ProcessingEngineError::InvalidAcquisition);
+            }
             let result = acquire_local(LocalAcquisitionRequest {
                 source: path,
                 stage: &paths.stage(),
                 jobs_root: &runtime.jobs.jobs_root,
                 limits: &limits,
-                symlinks: runtime.local_constraints.symlinks,
+                symlinks: crate::processing::config::SymlinkPolicy::Preserve,
                 cancellation,
             })
             .map_err(map_local_error)?;
-            AcquiredProcessingSource {
-                source: ProcessSource::path(result.input_kind),
-                publication_stage: result,
-                analyze_working_tree: true,
-                repository: None,
-                git_summary: None,
-                implementation_id: "local_copy",
-                implementation_version: "1".to_owned(),
-            }
-        }
-        FrozenSourceRequest::Repo { path, checkout_ref } => {
-            let runner = git_runner(runtime)?;
-            let request = git_enumeration_request(runtime, checkout_ref.clone());
-            let result = acquire_local_repository_source(
-                &runner,
-                path,
-                &request,
-                runtime.source_scope.working_tree,
-                &paths.stage(),
-                &runtime.jobs.jobs_root,
-                &limits,
-                runtime.git_constraints.symlinks,
-                cancellation,
-            )
-            .await
-            .map_err(map_git_error)?;
-            let analyze_working_tree = result.working_tree.is_some();
-            let publication_stage = match result.working_tree {
-                Some(working_tree) => working_tree,
-                None => capture_owned_stage(
-                    &paths.stage(),
-                    &runtime.jobs.jobs_root,
-                    crate::processing::PathInputKind::Directory,
-                    &limits,
-                    runtime.git_constraints.symlinks,
-                    cancellation,
+            let repository = if result.input_kind == crate::processing::PathInputKind::Directory
+                && fs::symlink_metadata(paths.stage().join(".git"))
+                    .is_ok_and(|metadata| metadata.is_dir())
+            {
+                let runner = git_runner(runtime)?;
+                let request = git_enumeration_request(runtime, None);
+                Some(
+                    enumerate_local_repository(&runner, &paths.stage(), &request)
+                        .await
+                        .map_err(map_git_error)?,
                 )
-                .map_err(map_local_error)?,
+            } else {
+                None
             };
-            let source = ProcessSource::repo(
-                result.repository.repository_identity,
-                result.repository.resolved_head.clone(),
-                analyze_working_tree,
-                result.repository.bare,
-                runtime.source_scope.history,
-                result.repository.frozen_refs.clone(),
-            )
-            .map_err(|_| ProcessingEngineError::InvalidAcquisition)?;
-            let summary = result.summary;
+            if repository.is_none()
+                && runtime.source_scope.history != crate::processing::GitHistoryScope::None
+            {
+                return Err(ProcessingEngineError::InvalidAcquisition);
+            }
+            let source = repository
+                .as_ref()
+                .map_or_else(
+                    || Ok(ProcessSource::path(result.input_kind)),
+                    |repository| {
+                        ProcessSource::path_repository(
+                            result.input_kind,
+                            repository.repository_identity,
+                            repository.resolved_head.clone(),
+                            runtime.source_scope.history,
+                            repository.frozen_refs.clone(),
+                        )
+                    },
+                )
+                .map_err(|_| ProcessingEngineError::InvalidAcquisition)?;
+            let git_summary = repository.as_ref().map(|repository| GitAcquisitionSummary {
+                transport: None,
+                repository_identity: repository.repository_identity,
+                object_format: repository.object_format.clone(),
+                resolved_head: repository.resolved_head.clone(),
+                frozen_ref_count: repository.frozen_refs.len() as u64,
+                commit_count: repository.commits.len() as u64,
+                history_blob_count: repository.blobs.len() as u64,
+                working_tree_manifest_identity: Some(result.manifest_identity),
+                working_tree_statistics: Some(result.statistics),
+            });
             AcquiredProcessingSource {
                 source,
-                publication_stage,
-                analyze_working_tree,
-                repository: Some(result.repository),
-                git_summary: Some(summary),
-                implementation_id: "local_git",
-                implementation_version: runner.identity().digest.to_string(),
+                publication_stage: result,
+                analyze_working_tree: true,
+                repository,
+                git_summary,
+                implementation_id: "local_copy",
+                implementation_version: "1".to_owned(),
             }
         }
         FrozenSourceRequest::Git {
@@ -1074,14 +1099,14 @@ pub async fn acquire_processing_source(
                 return Err(ProcessingEngineError::InvalidAcquisition);
             }
             let request = git_enumeration_request(runtime, checkout_ref.clone());
-            let source_repository = paths.source_repository();
             let result = acquire_remote_repository_source(
                 &runner,
                 &locator,
                 &request,
-                &source_repository,
                 &paths.stage(),
-                runtime.git_constraints.symlinks == SymlinkPolicy::Preserve,
+                &limits,
+                crate::processing::config::SymlinkPolicy::Preserve,
+                cancellation,
             )
             .await
             .map_err(map_git_error)?;
@@ -1222,18 +1247,12 @@ impl crate::processing::actions::executor::StageManifestProver for OwnedStageMan
     ) -> Result<Digest, crate::processing::actions::executor::StageManifestProofError> {
         let limits = acquisition_capture_limits(self.runtime)
             .map_err(|_| crate::processing::actions::executor::StageManifestProofError)?;
-        let symlinks = match &self.runtime.source {
-            FrozenSourceRequest::Path { .. } => self.runtime.local_constraints.symlinks,
-            FrozenSourceRequest::Repo { .. } | FrozenSourceRequest::Git { .. } => {
-                self.runtime.git_constraints.symlinks
-            }
-        };
         capture_owned_stage(
             stage_root,
             &self.runtime.jobs.jobs_root,
             self.input_kind,
             &limits,
-            symlinks,
+            crate::processing::config::SymlinkPolicy::Preserve,
             self.cancellation,
         )
         .map(|value| value.manifest_identity)
@@ -1305,6 +1324,30 @@ fn append_action_commit(
     Ok(())
 }
 
+fn append_verification_rejected(
+    journal: &std::path::Path,
+    manifest: Digest,
+) -> Result<(), ProcessingEngineError> {
+    use crate::processing::actions::journal::{
+        ActionJournalWriter, JournalEvent, JournalFailureCode, VerificationDecision,
+    };
+    let mut writer =
+        ActionJournalWriter::open_append(journal).map_err(|_| ProcessingEngineError::Action)?;
+    writer
+        .append_and_sync(&JournalEvent::VerificationCompleted {
+            manifest_identity: manifest,
+            decision: VerificationDecision::Reject,
+        })
+        .map_err(|_| ProcessingEngineError::Action)?;
+    writer
+        .append_and_sync(&JournalEvent::FailureRecorded {
+            action_id: None,
+            code: JournalFailureCode::VerificationFailed,
+        })
+        .map_err(|_| ProcessingEngineError::Action)?;
+    Ok(())
+}
+
 fn publication_manifest_identity(
     acquired: &AcquiredProcessingSource,
 ) -> Result<Digest, ProcessingEngineError> {
@@ -1342,18 +1385,18 @@ const fn decision_disposition(value: CompletionDisposition) -> DecisionDispositi
 fn completion_input(
     outcome: Outcome,
     configured: CompletionDisposition,
+    effective: CompletionDisposition,
     initial: Digest,
     final_identity: Digest,
     sealed: bool,
-    run_id: &RunId,
-    available_ttl_secs: u64,
+    runtime: &CompiledProcessingRuntime,
 ) -> Result<CompletionReportInput, ProcessingEngineError> {
-    let effective_disposition = match configured {
+    let effective_disposition = match effective {
         CompletionDisposition::Retain => Disposition::Retained,
         CompletionDisposition::Discard => Disposition::Discarded,
         CompletionDisposition::Quarantine => Disposition::Quarantined,
     };
-    let available = outcome.is_allowed() && configured == CompletionDisposition::Retain;
+    let available = outcome.is_allowed() && effective == CompletionDisposition::Retain;
     Ok(CompletionReportInput {
         outcome,
         configured_disposition: configured,
@@ -1369,13 +1412,13 @@ fn completion_input(
         current_manifest_identity: Some(final_identity),
         expires_at: available
             .then(|| {
-                let seconds =
-                    i64::try_from(available_ttl_secs).map_err(|_| ProcessingEngineError::Report)?;
+                let seconds = i64::try_from(runtime.jobs.retention.available_ttl_secs)
+                    .map_err(|_| ProcessingEngineError::Report)?;
                 timestamp_from(chrono::Utc::now() + chrono::Duration::seconds(seconds))
             })
             .transpose()?,
-        quarantine_id: (configured == CompletionDisposition::Quarantine)
-            .then(|| run_id.as_str().to_owned()),
+        quarantine_id: (effective == CompletionDisposition::Quarantine)
+            .then(|| runtime.run_id.as_str().to_owned()),
     })
 }
 
@@ -1385,10 +1428,14 @@ fn acquisition_report(
     finished_at: Rfc3339Timestamp,
 ) -> Result<AcquisitionReportInput, ProcessingEngineError> {
     let source_identity = match &acquired.source {
-        ProcessSource::Path { .. } => Some(acquired.publication_stage.manifest_identity),
-        ProcessSource::Repo { repository_id, .. } | ProcessSource::Git { repository_id, .. } => {
-            Some(*repository_id)
-        }
+        ProcessSource::Path {
+            repository: Some(repository),
+            ..
+        } => Some(repository.repository_id),
+        ProcessSource::Path {
+            repository: None, ..
+        } => Some(acquired.publication_stage.manifest_identity),
+        ProcessSource::Git { repository_id, .. } => Some(*repository_id),
     };
     Ok(AcquisitionReportInput {
         status: AcquisitionStatus::Complete,
@@ -1485,6 +1532,7 @@ const fn error_code(error: &ProcessingEngineError) -> &'static str {
         ProcessingEngineError::Backend => "analyzer_backend_failed",
         ProcessingEngineError::Analysis => "required_analysis_failed",
         ProcessingEngineError::Policy => "policy_resolution_failed",
+        ProcessingEngineError::Verification => "verification_failed",
         ProcessingEngineError::Adjudication => "pi_adjudication_failed",
         ProcessingEngineError::Job => "job_state_failed",
         ProcessingEngineError::Action => "action_transaction_failed",

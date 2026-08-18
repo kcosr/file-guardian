@@ -44,23 +44,24 @@ required executable fails processing closed.
 
 ## Choose a source and scope
 
-Use `process path` for an upload directory or ordinary filesystem tree. Its
-profile must select the working tree and history `none`. A `.git` directory in
-this mode is ordinary payload.
+Use `process path` for an upload directory, ordinary filesystem tree, or local
+Git worktree. File Guardian copies the exact directory—including `.git`,
+untracked files, and ignored files—into the job-owned stage. It then detects
+whether that owned copy is a valid Git worktree. If it is, the configured
+HEAD/history review runs against that same staged repository; if the profile
+requires history and no repository is detected, acquisition fails.
 
-Use `process repo` for a local Git repository. File Guardian freezes Git
-metadata separately, materializes the selected working tree into the stage,
-and never copies `.git` into the handoff tree. A bare repository is usable only
-with a history-only report profile.
-
-Use `process git` for an HTTPS or SSH remote. Authentication is entirely
-ambient to the configured Git process. For unattended use, arrange an existing
-credential helper, SSH agent/key policy, and known-hosts policy before launch.
-File Guardian deliberately has no credential configuration. Git is invoked
+Use `process git` for an HTTPS or SSH remote. File Guardian clones directly
+into the owned stage and retains `.git`; there is no hidden second repository
+or stripped source-tree projection. Authentication is entirely ambient to the
+configured Git process. For unattended use, arrange an existing credential
+helper, SSH agent/key policy, and known-hosts policy before launch. File
+Guardian deliberately has no credential configuration. Git is invoked
 noninteractively, so an unavailable credential produces a bounded acquisition
 error instead of a prompt.
 
-Profile scope has two independent dimensions:
+Every profile scans the staged working tree. History is an optional additional
+dimension:
 
 | Setting | Reviewed material |
 | --- | --- |
@@ -94,11 +95,12 @@ Put deterministic analyzers before Pi. A typical pipeline is:
 2. Gitleaks and TruffleHog in a bounded-parallel stage;
 3. Pi triage with `prior_observations = "findings_summary"`.
 
-Gitleaks and TruffleHog run against host-materialized immutable views, never a
-repository's `.git` database or authentication context. Their network namespace
-is empty. Credential verification and updates are disabled. Native JSON is
-private adapter input; matched secrets and raw diagnostics never reach reports
-or Pi.
+Gitleaks and TruffleHog run against host-materialized immutable assignments
+derived from the staged working tree and configured history. Their network
+namespace is empty. Credential verification and updates are disabled. Native
+JSON remains private adapter input and never enters reports. File Guardian does
+pass each normalized finding's actual bounded evidence to Pi, because semantic
+triage cannot judge a match it is forbidden to see.
 
 Use the reviewed [scanner templates](examples/scanners/README.md). Treat native
 scanner exit/output disagreement, malformed or truncated JSON, an unknown
@@ -115,11 +117,14 @@ are never implicitly fed to a model.
 ## Pi triage
 
 Pi is optional and Linux-only. Its parent process performs the approved model
-request with normal host networking. Every model-visible OS tool call executes
-in one persistent Bubblewrap sidecar with no network, read-only input/runtime,
-and ephemeral writable `/work` and `/tmp`. The model does not receive the host
-home, job root, source repository, scanner output, Git credential, or File
-Guardian control socket.
+request with normal host networking. The configured Pi executable runs with
+the exact stage mounted read-only at `/input`, normal installed runtime/tool
+directories mounted read-only, and isolated writable agent state and scratch.
+Every model-visible shell command uses the same read-only stage and a
+networkless persistent sidecar. Pi is trusted to inspect candidate content,
+including `.git` and the actual matched evidence. Git acquisition credentials,
+unrelated environment values, and File Guardian control capabilities are not
+passed to command tools.
 
 Start with advisory mode:
 
@@ -132,14 +137,13 @@ mode = "advisory"
 Advisory assessments annotate deterministic findings but cannot clear them or
 make a denied tree allowable. Treat this as the default operational mode.
 
-If a well-understood recurring false positive justifies authority, create a
-separate profile with `mode = "clear_false_positives"`. Its clearance rule must
-name exact analyzer, rule, category, maximum severity, verification state, and
-allowed reason code, and it must require at least the configured confidence.
-Configure protected categories, verified/error verification states, critical
-severity, and hard-block rules as non-clearable. Apply profiles must require a
-fresh Pi assertion after actions. Keep the original finding visible even when
-the adjudication is applied.
+If Pi should decide whether routed deterministic findings are correct, create a
+separate profile with `mode = "authoritative"` and route the intended findings
+through ordinary `adjudicate` policy bindings. An exact `false_positive`
+assessment clears that blocker; confidence and reason codes remain audit
+metadata. There are no host-defined non-clearable secret classes. Apply
+profiles require a fresh authoritative Pi review after actions. Keep the
+original finding visible even when the adjudication is applied.
 
 Provider secrets enter only through explicit
 `FILE_GUARDIAN_PI_CREDENTIAL_*` mappings. Never put them in TOML, command
@@ -168,7 +172,10 @@ by the action plan. It journals and fsyncs each transition. After actions, it
 recaptures the complete final stage and reruns the frozen required pipeline.
 Only a changed manifest with complete clean verification can produce exit `10`.
 A residual/new finding or any verification uncertainty produces `error`, never
-an optimistic deny or allow.
+an optimistic deny or allow. Once the fresh verification pass has begun, File
+Guardian does not roll the successful stage actions back: it keeps the modified
+stage private, applies effective whole-job quarantine, exposes no handoff, and
+returns exit `30`. A caller-owned path source is still untouched.
 
 Artifact quarantine outlives stage handoff or discard until its own retention
 policy expires. Use `artifact inspect` for safe metadata, `artifact recover` to
@@ -252,15 +259,16 @@ Prerequisites:
   directory and whose profile names match the selected cases;
 - installed Gitleaks/TruffleHog on `PATH` for scanner cases;
 - an already configured isolated Pi runtime/credential environment for Pi
-  cases.
+  cases. This is the normal installed Pi runtime, not a copied runtime bundle.
 
 The block profile must require both scanner adapters and bind their documented
 synthetic AWS finding to deny. The clean profile uses the same required
 pipeline and retains allowed stages. The HEAD, reachable, and all-refs profiles
 must differ only where their declared source scopes require it; reachable must
 select `refs/heads/main`. Optional Pi profiles must bind the fixture-only
-`FILE_GUARDIAN_TEST_PASSWORD` rule: advisory leaves it active, while clearance
-may clear only that exact unverified rule at the configured confidence/reason.
+`FILE_GUARDIAN_TEST_PASSWORD` rule: advisory leaves it active, while the
+authoritative profile may clear the exact routed finding after inspecting its
+actual evidence and staged context.
 
 Fixture generation itself can be checked without a File Guardian configuration
 or any scanner/model invocation:
@@ -295,7 +303,7 @@ Optional cases are enabled only when their profile variable is set:
 ```bash
 FG_ACCEPTANCE_REMEDIATE_PROFILE=accept-remediate \
 FG_ACCEPTANCE_PI_ADVISORY_PROFILE=accept-pi-advisory \
-FG_ACCEPTANCE_PI_CLEARANCE_PROFILE=accept-pi-clearance \
+FG_ACCEPTANCE_PI_AUTHORITATIVE_PROFILE=accept-pi-authoritative \
 FG_ACCEPTANCE_HTTPS_REMOTE=https://example.invalid/disposable/repo.git \
 FG_ACCEPTANCE_SSH_REMOTE=git@example.invalid:disposable/repo.git \
 scripts/processing-live-acceptance.sh
@@ -307,8 +315,34 @@ remain fully local. Review the script header for exact profile expectations.
 
 The harness verifies process/report exit parity, expected scope outcomes,
 privacy canaries, original-source immutability, optional remediation and
-handoff, and optional Pi advisory versus narrow-clearance behavior. Live model
+handoff, and optional Pi advisory versus authoritative behavior. Live model
 output is integration evidence, not a deterministic policy oracle.
+
+To exercise real ambient authentication without using an external service,
+run the separate transport harness. It requires Docker and a suitable image
+already present locally; it never pulls an image or reaches the external
+network. The image needs Git, Python 3, and OpenSSH server. Put the configured
+Gitleaks and TruffleHog executables on the harness process's `PATH`.
+
+```bash
+PATH=/absolute/scanner/bin:"$PATH" \
+FG_TRANSPORT_ACCEPTANCE_BINARY=target/release/file-guardian \
+FG_TRANSPORT_ACCEPTANCE_CONFIG=/absolute/path/acceptance.toml \
+FG_TRANSPORT_ACCEPTANCE_PROFILE=accept-reachable \
+FG_TRANSPORT_ACCEPTANCE_RETAIN_PROFILE=accept-clean \
+FG_TRANSPORT_ACCEPTANCE_IMAGE=locally-installed-git-test-image \
+scripts/processing-git-transport-acceptance.sh
+```
+
+The harness creates a disposable two-commit repository, private CA, HTTP Basic
+credential helper, OpenSSH server, strict known-hosts file, and one-use key in
+a disposable `ssh-agent`. For both HTTPS and SSH it proves that reachable
+history blocks the deleted synthetic credential, then processes the clean HEAD
+under a retained profile and hands off a usable two-commit clone whose `.git`
+directory is intact. Reports and stderr are checked for the remote locator,
+synthetic credential, and transport password. Set
+`FG_TRANSPORT_ACCEPTANCE_KEEP=1` only when retaining synthetic diagnostics for
+review.
 
 ## Troubleshooting
 

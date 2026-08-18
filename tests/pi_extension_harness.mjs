@@ -29,9 +29,9 @@ const environment = {
 	FILE_GUARDIAN_PI_ANALYZER_ID: "pi-review",
 	FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS: "37",
 	FILE_GUARDIAN_PI_BUBBLEWRAP: "/usr/bin/bwrap",
-	FILE_GUARDIAN_PI_RUNTIME_ROOT: "/opt/file-guardian/pi-runtime",
-	FILE_GUARDIAN_PI_RUNTIME_LAUNCHER: "bin/node",
 	FILE_GUARDIAN_PI_INPUT_VIEW: "/var/lib/file-guardian/view",
+	FILE_GUARDIAN_PI_SCRATCH_ROOT: "/var/lib/file-guardian/scratch",
+	FILE_GUARDIAN_PI_TOOL_PATH: "/usr/local/bin:/usr/bin:/bin",
 	FILE_GUARDIAN_PI_TOOL_SIDECAR_RUNNER: "/usr/libexec/file-guardian/tool-sidecar-runner.js",
 };
 const Type = new Proxy(
@@ -49,7 +49,7 @@ const context = {
 	console,
 	isAbsolute,
 	posix,
-	process: { env: environment },
+	process: { env: environment, execPath: "/usr/bin/node" },
 	setTimeout,
 };
 vm.runInNewContext(source, context, { filename: extensionUrl.pathname });
@@ -116,10 +116,10 @@ for (const invalid of ["../secret", "/etc/passwd", "~/secret", "@/secret"]) {
 	assert.throws(() => hooks.normalizedInputPath(invalid), /relative to the immutable input/);
 }
 const sidecarArgs = hooks.sidecarArguments();
-assert.ok(sidecarArgs.includes("--unshare-all"));
-assert.ok(!sidecarArgs.includes("--share-net"));
-assert.ok(sidecarArgs.includes("/input"));
-assert.ok(sidecarArgs.includes("/work"));
-assert.ok(sidecarArgs.includes("/policy/tool-sidecar-runner.mjs"));
+assert.ok(sidecarArgs.includes("--unshare-net"));
+assert.ok(sidecarArgs.includes("--ro-bind"));
+assert.ok(sidecarArgs.includes("/"));
+assert.ok(sidecarArgs.includes(environment.FILE_GUARDIAN_PI_SCRATCH_ROOT));
+assert.ok(sidecarArgs.includes(environment.FILE_GUARDIAN_PI_TOOL_SIDECAR_RUNNER));
 
 console.log("Pi extension harness passed");

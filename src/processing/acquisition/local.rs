@@ -282,70 +282,7 @@ impl LocalAcquisitionError {
 pub fn acquire_local(
     request: LocalAcquisitionRequest<'_>,
 ) -> Result<LocalAcquisitionResult, LocalAcquisitionError> {
-    acquire_local_with_options(request, false, false)
-}
-
-/// Captures a local Git working tree as publication content. Every `.git`
-/// entry is excluded without following it, while dirty tracked, untracked, and
-/// ignored filesystem entries remain ordinary captured content. Preserved
-/// symbolic links must resolve lexically within the captured tree.
-pub fn acquire_local_repository_working_tree(
-    request: LocalAcquisitionRequest<'_>,
-) -> Result<LocalAcquisitionResult, LocalAcquisitionError> {
-    acquire_local_with_options(request, true, true)
-}
-
-/// Verifies an already-materialized, caller-owned publication stage and
-/// derives the same canonical manifest shape as descriptor-relative local
-/// acquisition. This is reserved for stages populated from previously frozen
-/// trusted bytes (for example, a remote Git HEAD tree).
-pub(crate) fn verify_owned_materialized_directory(
-    stage: &Path,
-    jobs_root: &Path,
-    mut entries: Vec<AcquiredEntry>,
-) -> Result<LocalAcquisitionResult, LocalAcquisitionError> {
-    let stage = open_private_stage(stage, jobs_root, false)?;
-    entries.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
-    if entries
-        .windows(2)
-        .any(|pair| pair[0].logical_path == pair[1].logical_path)
-    {
-        return Err(LocalAcquisitionError::StageVerificationFailed);
-    }
-    let cancellation = AcquisitionCancellation::default();
-    verify_stage(&stage, &entries, &cancellation)?;
-    let mut statistics = LocalAcquisitionStatistics {
-        entries: u64::try_from(entries.len())
-            .map_err(|_| LocalAcquisitionError::StageVerificationFailed)?,
-        ..LocalAcquisitionStatistics::default()
-    };
-    for entry in &entries {
-        match entry.kind {
-            AcquiredEntryKind::Directory => {}
-            AcquiredEntryKind::RegularFile => {
-                statistics.files = statistics
-                    .files
-                    .checked_add(1)
-                    .ok_or(LocalAcquisitionError::StageVerificationFailed)?;
-                statistics.total_file_bytes = statistics
-                    .total_file_bytes
-                    .checked_add(entry.byte_len)
-                    .ok_or(LocalAcquisitionError::StageVerificationFailed)?;
-            }
-            AcquiredEntryKind::SymbolicLink => {
-                statistics.symbolic_links = statistics
-                    .symbolic_links
-                    .checked_add(1)
-                    .ok_or(LocalAcquisitionError::StageVerificationFailed)?;
-            }
-        }
-    }
-    Ok(LocalAcquisitionResult {
-        input_kind: PathInputKind::Directory,
-        manifest_identity: manifest_identity(&entries)?,
-        entries,
-        statistics,
-    })
+    acquire_local_copy(request)
 }
 
 /// Descriptor-captures the current contents of an existing private job
@@ -507,9 +444,6 @@ impl OwnedStageCapture<'_> {
                 }
                 let target = fs::readlinkat(directory, entry.name.as_c_str(), Vec::new())
                     .map_err(|_| LocalAcquisitionError::InputUnstable)?;
-                if !symlink_target_stays_within_root(&logical, target.as_bytes()) {
-                    return Err(LocalAcquisitionError::SymlinkRejected);
-                }
                 let after = fs::statat(directory, entry.name.as_c_str(), AtFlags::SYMLINK_NOFOLLOW)
                     .map_err(|_| LocalAcquisitionError::InputUnstable)?;
                 ensure_same_key(entry.stat(), &after)?;
@@ -538,10 +472,8 @@ impl OwnedStageCapture<'_> {
     }
 }
 
-fn acquire_local_with_options(
+fn acquire_local_copy(
     request: LocalAcquisitionRequest<'_>,
-    exclude_git_entries: bool,
-    reject_escaping_symlinks: bool,
 ) -> Result<LocalAcquisitionResult, LocalAcquisitionError> {
     request.cancellation.check()?;
     let root_stat = fs::statat(fs::CWD, request.source, AtFlags::SYMLINK_NOFOLLOW)
@@ -561,8 +493,6 @@ fn acquire_local_with_options(
         limits: request.limits,
         symlinks: request.symlinks,
         cancellation: request.cancellation,
-        exclude_git_entries,
-        reject_escaping_symlinks,
         root_device: root_key.device,
         entries: Vec::new(),
         statistics: LocalAcquisitionStatistics::default(),
@@ -740,8 +670,6 @@ struct CopyState<'a> {
     limits: &'a CaptureLimits,
     symlinks: SymlinkPolicy,
     cancellation: &'a AcquisitionCancellation,
-    exclude_git_entries: bool,
-    reject_escaping_symlinks: bool,
     root_device: u64,
     entries: Vec<AcquiredEntry>,
     statistics: LocalAcquisitionStatistics,
@@ -767,16 +695,8 @@ impl CopyState<'_> {
             .max_entries
             .checked_sub(self.statistics.entries)
             .ok_or(LocalAcquisitionError::EntryLimitExceeded)?;
-        let enumeration_limit = if self.exclude_git_entries {
-            remaining.saturating_add(1)
-        } else {
-            remaining
-        };
-        let entries = enumerate(source, enumeration_limit)?;
-        let visible_entry_count = entries
-            .iter()
-            .filter(|entry| !self.exclude_git_entries || entry.name.as_bytes() != b".git")
-            .count();
+        let entries = enumerate(source, remaining)?;
+        let visible_entry_count = entries.len();
         self.statistics.entries = self
             .statistics
             .entries
@@ -788,9 +708,6 @@ impl CopyState<'_> {
 
         for entry in &entries {
             self.cancellation.check()?;
-            if self.exclude_git_entries && entry.name.as_bytes() == b".git" {
-                continue;
-            }
             let mut logical = parent.to_vec();
             logical.push(entry.segment.clone());
             self.require_root_device(entry.stat())?;
@@ -997,11 +914,6 @@ impl CopyState<'_> {
         }
         let target = fs::readlinkat(source_parent, entry.name.as_c_str(), Vec::new())
             .map_err(|_| LocalAcquisitionError::InputUnstable)?;
-        if self.reject_escaping_symlinks
-            && !symlink_target_stays_within_root(&logical, target.as_bytes())
-        {
-            return Err(LocalAcquisitionError::SymlinkRejected);
-        }
         let after = fs::statat(
             source_parent,
             entry.name.as_c_str(),
@@ -1037,22 +949,6 @@ impl CopyState<'_> {
             Err(LocalAcquisitionError::FilesystemCrossingRejected)
         }
     }
-}
-
-fn symlink_target_stays_within_root(logical: &[PathSegment], target: &[u8]) -> bool {
-    if target.is_empty() || target.starts_with(b"/") || target.contains(&0) {
-        return false;
-    }
-    let mut depth = logical.len().saturating_sub(1);
-    for segment in target.split(|byte| *byte == b'/') {
-        match segment {
-            b"" | b"." => {}
-            b".." if depth == 0 => return false,
-            b".." => depth -= 1,
-            _ => depth = depth.saturating_add(1),
-        }
-    }
-    true
 }
 
 fn path_name(logical: &[PathSegment]) -> Result<CString, LocalAcquisitionError> {

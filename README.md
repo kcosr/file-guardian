@@ -12,21 +12,22 @@ the complete required pipeline before it can return `allow_modified`.
 
 ## Capabilities
 
-- Local files and directories, local Git repositories, and authenticated HTTPS
-  or SSH Git remotes enter the same durable processing-job engine.
+- A caller directory copied with `process path` and an authenticated HTTPS/SSH
+  clone created with `process git` enter the same durable processing-job
+  engine. A copied directory containing `.git` is detected after acquisition
+  and receives the configured Git-aware review.
 - Git review scope is policy-controlled: working tree plus no history, `head`,
   `reachable`, or `all_refs`. Selected refs and object IDs are frozen before
   analysis.
 - Built-in filename/content rules, Gitleaks, and TruffleHog produce normalized,
   correlated findings with explicit coverage.
-- Optional Pi triage receives only normalized findings and a generated,
-  bounded artifact view. It is advisory by default. A profile may authorize
-  narrowly defined false-positive clearance, but never clearance of protected
-  categories, verified credentials, hard-block rules, incomplete scans, or
-  findings outside the exact configured clearance rule.
-- Every required tool is discovered from the startup `PATH`, identity-pinned,
-  and run in a read-only, networkless Bubblewrap sandbox. File Guardian never
-  downloads or updates scanners.
+- Optional Pi triage receives normalized findings, their actual bounded
+  evidence, and read-only access to the complete staged/history review surface.
+  It is advisory by default; an authoritative profile may override an incorrect
+  deterministic finding routed to Pi adjudication.
+- Tools use the administrator-installed host runtime and `PATH` inside a
+  read-only Bubblewrap filesystem with writable scratch. File Guardian never
+  builds a private runtime closure or downloads or updates scanners.
 - Durable jobs support retained-stage handoff, whole-job quarantine, artifact
   quarantine, discard, inspection, and stale-job recovery.
 - Reports contain normalized evidence and opaque identities, never matched
@@ -73,10 +74,7 @@ file-guardian [--config FILE] process
     [--profile PROFILE_ID]
     [--request-id ID]
     [--action-mode evaluate|apply]
-    path PATH
-
-file-guardian [--config FILE] process [COMMON OPTIONS]
-    repo [--ref REF] PATH
+    path DIRECTORY
 
 file-guardian [--config FILE] process [COMMON OPTIONS]
     git [--ref REF] REMOTE
@@ -90,10 +88,9 @@ file-guardian --config /etc/file-guardian/config.toml \
   process --profile upload --request-id upload-4821 path \
   /srv/uploader/private-stage/upload-4821
 
-# Local repository, including the profile's configured history surface.
+# Local repository: copy the exact directory, then detect and review `.git`.
 file-guardian --config /etc/file-guardian/config.toml \
-  process --profile repository-review repo --ref refs/heads/main \
-  /srv/repos/application
+  process --profile repository-review path /srv/repos/application
 
 # Ambient Git authentication is used; File Guardian stores no Git credential.
 file-guardian --config /etc/file-guardian/config.toml \
@@ -101,13 +98,15 @@ file-guardian --config /etc/file-guardian/config.toml \
   git@example.com:organization/application.git
 ```
 
-`process path` treats `.git` as ordinary input and requires history `none`.
-`process repo` understands a local Git worktree and excludes Git administrative
-metadata from the publication stage. `process git` accepts HTTPS, `ssh://`, and
-SCP-like SSH locators only. It invokes the configured absolute Git executable
-without a shell and relies on ambient noninteractive authentication. It rejects
-password-bearing/query-bearing HTTPS URLs, `http`, `file`, local paths, helper
-transports, and option-looking inputs.
+`process path` copies the exact directory, including `.git` and untracked or
+ignored files. File Guardian then detects Git from that owned copy; a profile
+requiring history fails acquisition if the copied stage is not a valid Git
+worktree. `process git` accepts HTTPS, `ssh://`, and SCP-like SSH locators only
+and clones directly into the job stage, retaining `.git` as part of the exact
+inspection and handoff candidate. It invokes the configured absolute Git
+executable without a shell and relies on ambient noninteractive authentication.
+It rejects password-bearing/query-bearing HTTPS URLs, `http`, `file`, local
+paths, helper transports, and option-looking inputs.
 
 Git scope belongs to the profile, not the command line. `--ref` selects the
 materialized working tree but does not narrow configured history coverage.
@@ -195,18 +194,21 @@ normalized by first-party adapters. Repository-provided `.gitleaks.toml`,
 Required analyzer assignment has explicit eligible, assigned, completed,
 excluded, and not-applicable coverage.
 
-Pi receives normalized finding records, stable opaque identities, closed reason
-codes, safe provenance, and bounded host-generated artifact access. Advisory Pi
-can annotate but cannot clear. `clear_false_positives` requires exact analyzer,
-rule, category, severity, verification state, confidence, and reason-code gates;
-the original deterministic finding remains in the report even when cleared.
+Pi receives normalized finding records, the real matched evidence and context,
+and complete read-only staged/history content access. Advisory Pi can annotate
+but cannot clear. `authoritative` Pi may clear a routed finding by classifying
+it `false_positive`; confidence and reason codes remain audit metadata rather
+than a second host veto. The original deterministic finding remains in the
+report even when cleared.
 
 Whole-file `delete` and `quarantine` actions operate only on regular files in
 the owned stage. They are identity-checked and durably journaled. Deny suppresses
 mutation, quarantine dominates delete for the same file, and Git-history
 artifacts are never actionable. After any action, File Guardian recaptures the
 stage and reruns every required analyzer (and required Pi assertion) against
-the final manifest.
+the final manifest. If that fresh verification does not allow the result, the
+job exits `30`, the modified stage is quarantined, and no handoff is available;
+File Guardian does not automatically retry or roll the stage back.
 
 ## Retention and recovery
 
@@ -230,6 +232,11 @@ journals; it never manufactures an allowed decision from incomplete state.
 - [Live acceptance harness](scripts/processing-live-acceptance.sh) creates only
   disposable synthetic fixtures and uses only explicitly installed tools. It
   never downloads scanners or uses production credentials/repos.
+- [Git transport acceptance](scripts/processing-git-transport-acceptance.sh)
+  starts disposable authenticated smart-HTTPS and OpenSSH servers from an
+  already-installed local container image. It proves credential-helper and
+  SSH-agent acquisition, history coverage, and retained handoff of the exact
+  clone including `.git`, without contacting an external network.
 
 The normal Rust suite is deterministic and offline:
 

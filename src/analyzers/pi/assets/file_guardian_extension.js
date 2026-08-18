@@ -1,7 +1,9 @@
 // Trusted File Guardian triage extension for Pi 0.83.0.
 //
 // Pi's built-ins remain disabled. This extension exposes sandboxed analysis
-// tools over the immutable analyzer view mounted at /input.
+// tools over the immutable analyzer view. Bubblewrap makes the normal host
+// filesystem readable but not writable and gives tools a disposable scratch
+// directory.
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -13,7 +15,6 @@ import { Type } from "typebox";
 
 const PROTOCOL = "file-guardian-pi-proxy/3";
 const SIDECAR_PROTOCOL = "file-guardian-tool-sidecar/1";
-const SIDECAR_RUNNER_TARGET = "/policy/tool-sidecar-runner.mjs";
 const MAX_PROXY_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_PATH_CHARACTERS = 4096;
 const MAX_NATIVE_TOOL_OUTPUT_BYTES = 64 * 1024;
@@ -28,9 +29,9 @@ const REQUIRED_TOOLS = Object.freeze([
 	"grep",
 	"ls",
 	"manifest_list",
-	"triage_request",
 	"read",
 	"submit_triage",
+	"triage_request",
 ]);
 const NATIVE_TOOLS = new Set(["bash", "read", "grep", "find", "ls"]);
 
@@ -44,9 +45,9 @@ const maxSearchResults = requiredBoundedIntegerEnvironment(
 	MAX_CONFIGURED_SEARCH_RESULTS,
 );
 const bubblewrapExecutable = requiredEnvironment("FILE_GUARDIAN_PI_BUBBLEWRAP");
-const runtimeRoot = requiredEnvironment("FILE_GUARDIAN_PI_RUNTIME_ROOT");
-const runtimeLauncher = requiredEnvironment("FILE_GUARDIAN_PI_RUNTIME_LAUNCHER");
 const inputView = requiredEnvironment("FILE_GUARDIAN_PI_INPUT_VIEW");
+const scratchRoot = requiredEnvironment("FILE_GUARDIAN_PI_SCRATCH_ROOT");
+const toolPath = requiredEnvironment("FILE_GUARDIAN_PI_TOOL_PATH");
 const toolSidecarRunner = requiredEnvironment("FILE_GUARDIAN_PI_TOOL_SIDECAR_RUNNER");
 
 let nextRequestId = 1;
@@ -386,57 +387,35 @@ function normalizedInputPath(rawPath, defaultPath = null) {
 function sidecarArguments() {
 	if (
 		!isAbsolute(bubblewrapExecutable) ||
-		!isAbsolute(runtimeRoot) ||
 		!isAbsolute(inputView) ||
+		!isAbsolute(scratchRoot) ||
 		!isAbsolute(toolSidecarRunner) ||
-		isAbsolute(runtimeLauncher) ||
-		runtimeLauncher.split("/").some((part) => part === "" || part === "." || part === "..")
+		!isAbsolute(process.execPath) ||
+		toolPath.split(":").some((entry) => !isAbsolute(entry))
 	) {
 		throw new Error("invalid File Guardian sidecar launch setting");
 	}
 	return [
-		"--unshare-all",
-		"--unshare-user",
-		"--disable-userns",
-		"--assert-userns-disabled",
+		"--unshare-net",
+		"--unshare-pid",
 		"--die-with-parent",
 		"--new-session",
-		"--hostname",
-		"file-guardian-tools",
-		"--cap-drop",
-		"ALL",
-		"--tmpfs",
+		"--ro-bind",
 		"/",
-		"--dir",
-		"/runtime",
-		"--dir",
-		"/policy",
-		"--dir",
-		"/input",
-		"--dir",
-		"/work",
-		"--dir",
+		"/",
+		"--bind",
+		scratchRoot,
+		scratchRoot,
+		"--tmpfs",
 		"/tmp",
-		"--dev",
+		"--dev-bind",
 		"/dev",
-		"--ro-bind",
-		runtimeRoot,
-		"/runtime",
-		"--ro-bind",
-		toolSidecarRunner,
-		SIDECAR_RUNNER_TARGET,
-		"--ro-bind",
-		inputView,
-		"/input",
-		"--tmpfs",
-		"/work",
-		"--tmpfs",
-		"/tmp",
+		"/dev",
 		"--chdir",
-		"/work",
+		scratchRoot,
 		"--",
-		`/runtime/${runtimeLauncher}`,
-		SIDECAR_RUNNER_TARGET,
+		process.execPath,
+		toolSidecarRunner,
 	];
 }
 
@@ -515,7 +494,12 @@ async function terminateToolSidecar(child) {
 async function startToolSidecar() {
 	if (toolSidecar) return toolSidecar;
 	const child = spawn(bubblewrapExecutable, sidecarArguments(), {
-		env: {},
+		env: {
+			FILE_GUARDIAN_INPUT_ROOT: inputView,
+			FILE_GUARDIAN_WORK_ROOT: scratchRoot,
+			FILE_GUARDIAN_TOOL_PATH: toolPath,
+			TMPDIR: "/tmp",
+		},
 		// Keep this exact three-descriptor map. Node/libuv closes every other
 		// descriptor in the child, including Pi's inherited proxy-directory fd.
 		stdio: ["pipe", "pipe", "pipe"],
@@ -825,7 +809,7 @@ export default function fileGuardianClassifierExtension(pi) {
 	pi.registerTool({
 		name: "triage_request",
 		label: "Read triage request",
-		description: "Read the bounded, identity-bound prior-finding triage request; content and matched values are never included.",
+		description: "Read the bounded, identity-bound findings, exact matched evidence, staged paths, and Git commit/blob provenance needed for semantic triage.",
 		parameters: strictObject({}),
 		executionMode: "sequential",
 		async execute(_toolCallId, _params, signal) {

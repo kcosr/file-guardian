@@ -302,7 +302,7 @@ impl MaterializedScannerView {
             .ok_or(MaterializationError::InvalidContent)?;
         let bytes = fs::read(self.input.join(&assignment.view_path))
             .map_err(|_| MaterializationError::InvalidContent)?;
-        canonical_evidence_window(&bytes, location)
+        canonical_evidence_window(&bytes, location).ok_or(MaterializationError::InvalidContent)
     }
 }
 
@@ -355,20 +355,19 @@ fn revalidate_directory<'a>(
 
 const MAX_EVIDENCE_WINDOW_BYTES: usize = 512;
 
-fn canonical_evidence_window(
+pub(crate) fn canonical_evidence_window(
     bytes: &[u8],
     location: &ValidatedLocation,
-) -> Result<Vec<u8>, MaterializationError> {
+) -> Option<Vec<u8>> {
     let window = match *location {
         ValidatedLocation::ByteRange {
             start,
             end_exclusive,
         } => {
-            let start = usize::try_from(start).map_err(|_| MaterializationError::InvalidContent)?;
-            let end =
-                usize::try_from(end_exclusive).map_err(|_| MaterializationError::InvalidContent)?;
+            let start = usize::try_from(start).ok()?;
+            let end = usize::try_from(end_exclusive).ok()?;
             if start >= end || end > bytes.len() {
-                return Err(MaterializationError::InvalidContent);
+                return None;
             }
             let center = start.saturating_add((end - start) / 2);
             let left = center
@@ -377,35 +376,26 @@ fn canonical_evidence_window(
             &bytes[left..bytes.len().min(left + MAX_EVIDENCE_WINDOW_BYTES)]
         }
         ValidatedLocation::Line { line } => {
-            let index = usize::try_from(line.saturating_sub(1))
-                .map_err(|_| MaterializationError::InvalidContent)?;
-            let line = bytes
-                .split(|byte| *byte == b'\n')
-                .nth(index)
-                .ok_or(MaterializationError::InvalidContent)?;
+            let index = usize::try_from(line.saturating_sub(1)).ok()?;
+            let line = bytes.split(|byte| *byte == b'\n').nth(index)?;
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             &line[..line.len().min(MAX_EVIDENCE_WINDOW_BYTES)]
         }
         ValidatedLocation::LineColumn { line, column } => {
-            let index = usize::try_from(line.saturating_sub(1))
-                .map_err(|_| MaterializationError::InvalidContent)?;
-            let line = bytes
-                .split(|byte| *byte == b'\n')
-                .nth(index)
-                .ok_or(MaterializationError::InvalidContent)?;
+            let index = usize::try_from(line.saturating_sub(1)).ok()?;
+            let line = bytes.split(|byte| *byte == b'\n').nth(index)?;
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let text =
-                std::str::from_utf8(line).map_err(|_| MaterializationError::InvalidContent)?;
+            let text = std::str::from_utf8(line).ok()?;
             if column > text.chars().count() as u64 + 1 {
-                return Err(MaterializationError::InvalidContent);
+                return None;
             }
             &line[..line.len().min(MAX_EVIDENCE_WINDOW_BYTES)]
         }
     };
     if window.is_empty() {
-        return Err(MaterializationError::InvalidContent);
+        return None;
     }
-    Ok(window.to_vec())
+    Some(window.to_vec())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

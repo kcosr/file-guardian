@@ -50,7 +50,7 @@ fn process_reports_schema_three_runtime_compilation_failure_without_private_inpu
 }
 
 #[test]
-fn unavailable_administrative_operations_emit_one_versioned_result() {
+fn invalid_artifact_operands_emit_one_versioned_error() {
     let cases = [
         (
             vec!["artifact", "inspect", "run_artifact", "quarantine_1"],
@@ -92,7 +92,7 @@ fn unavailable_administrative_operations_emit_one_versioned_result() {
         assert_eq!(result["schema_version"], "file-guardian-auxiliary-result/1");
         assert_eq!(result["operation"], operation, "{arguments:?}");
         assert_eq!(result["status"], "error", "{arguments:?}");
-        assert_eq!(result["issue_code"], "capability_unavailable");
+        assert_eq!(result["issue_code"], "invalid_artifact_identity");
         if let Some(run_id) = selected_run_id {
             assert_eq!(result["run_id"], run_id, "{arguments:?}");
         } else {

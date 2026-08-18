@@ -934,7 +934,6 @@ fn collect_directory(
         } else if entry.kind.is_symlink() {
             let target = fs::readlinkat(directory, entry.name.as_c_str(), Vec::new())
                 .map_err(|error| io_error("read stage symbolic link", error))?;
-            validate_handoff_symlink(parent.len(), &target)?;
             output.push(AcquiredEntry {
                 logical_path: logical_path(logical)?,
                 kind: AcquiredEntryKind::SymbolicLink,
@@ -945,25 +944,6 @@ fn collect_directory(
             });
         } else {
             return Err(CompletionError::SpecialFile);
-        }
-    }
-    Ok(())
-}
-
-fn validate_handoff_symlink(parent_depth: usize, target: &CStr) -> Result<(), CompletionError> {
-    let target = Path::new(OsStr::from_bytes(target.to_bytes()));
-    if target.is_absolute() {
-        return Err(CompletionError::UnsafeHandoffSymlink);
-    }
-    let mut depth = parent_depth;
-    for component in target.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(_) => depth = depth.saturating_add(1),
-            Component::ParentDir if depth > 0 => depth -= 1,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(CompletionError::UnsafeHandoffSymlink)
-            }
         }
     }
     Ok(())
@@ -1747,8 +1727,6 @@ pub enum CompletionError {
     HandoffIntentMismatch,
     #[error("the handoff destination does not match the durable intent manifest")]
     HandoffDestinationMismatch,
-    #[error("a handoff stage contains an absolute or lexically escaping symbolic link")]
-    UnsafeHandoffSymlink,
     #[error("move handoff requires the same filesystem")]
     CrossFilesystemMove,
     #[error("jobs and quarantine roots are not on the same filesystem")]

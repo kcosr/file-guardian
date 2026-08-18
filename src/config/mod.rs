@@ -818,7 +818,7 @@ impl AnalyzerConfig {
                 .map(|path| ("analyzers.rule_files", path.as_path()))
                 .collect(),
             AnalyzerKind::PiClassifier { pi, .. } => vec![
-                ("analyzers.pi.runtime_root", pi.runtime_root.as_path()),
+                ("analyzers.pi.pi_executable", pi.pi_executable.as_path()),
                 (
                     "analyzers.pi.bubblewrap_executable",
                     pi.bubblewrap_executable.as_path(),
@@ -886,10 +886,7 @@ pub struct PiConfig {
     pub platform: PiPlatform,
     pub sandbox: PiSandbox,
     pub network: PiNetworkMode,
-    pub runtime_root: PathBuf,
-    pub runtime_manifest: PathBuf,
-    pub launcher: PathBuf,
-    pub pi_entrypoint: PathBuf,
+    pub pi_executable: PathBuf,
     pub bubblewrap_executable: PathBuf,
     pub expected_bubblewrap_version: String,
     pub expected_pi_version: String,
@@ -908,7 +905,7 @@ pub struct PiConfig {
 impl PiConfig {
     fn validate(&self, id: &str) -> Result<(), ConfigError> {
         for (field, path) in [
-            ("analyzers.pi.runtime_root", &self.runtime_root),
+            ("analyzers.pi.pi_executable", &self.pi_executable),
             (
                 "analyzers.pi.bubblewrap_executable",
                 &self.bubblewrap_executable,
@@ -922,25 +919,6 @@ impl PiConfig {
             ("analyzers.pi.isolated_agent_dir", &self.isolated_agent_dir),
         ] {
             validate_absolute(field, path)?;
-        }
-        for (field, path) in [
-            ("runtime_manifest", &self.runtime_manifest),
-            ("launcher", &self.launcher),
-            ("pi_entrypoint", &self.pi_entrypoint),
-        ] {
-            validate_relative(field, path).map_err(|_| {
-                ConfigError::Invalid(format!(
-                    "Pi analyzer '{id}' {field} must be a normalized relative path inside runtime_root"
-                ))
-            })?;
-        }
-        if self.runtime_manifest == self.launcher
-            || self.runtime_manifest == self.pi_entrypoint
-            || self.launcher == self.pi_entrypoint
-        {
-            return invalid(format!(
-                "Pi analyzer '{id}' runtime_manifest, launcher, and pi_entrypoint must be distinct"
-            ));
         }
         for (field, value) in [
             (
@@ -1608,24 +1586,6 @@ fn validate_absolute(field: &str, path: &Path) -> Result<(), ConfigError> {
         })
     {
         return invalid(format!("{field} must be an absolute path"));
-    }
-    Ok(())
-}
-
-fn validate_relative(field: &str, path: &Path) -> Result<(), ConfigError> {
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::CurDir
-                    | std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        return invalid(format!("{field} must be a normalized relative path"));
     }
     Ok(())
 }
@@ -2301,7 +2261,7 @@ path = "/srv/uploads"
         else {
             panic!("expected Pi analyzer")
         };
-        pi.trusted_extension = pi.runtime_root.join("extension.js");
+        pi.trusted_extension = pi.pi_executable.clone();
         assert!(config.validate().is_err());
 
         let mut config = pi_example();

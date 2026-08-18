@@ -137,12 +137,15 @@ fn trusted_extension_has_only_the_reviewed_runtime_capabilities() {
         "from \"node:net\"",
         "from \"node:path\"",
         "from \"node:readline\"",
-        "--unshare-all",
+        "--unshare-net",
+        "--unshare-pid",
         "--die-with-parent",
         "--ro-bind",
         "--tmpfs",
-        "/policy/tool-sidecar-runner.mjs",
-        "env: {}",
+        "toolSidecarRunner",
+        "FILE_GUARDIAN_INPUT_ROOT: inputView",
+        "FILE_GUARDIAN_WORK_ROOT: scratchRoot",
+        "FILE_GUARDIAN_TOOL_PATH: toolPath",
         "stdio: [\"pipe\", \"pipe\", \"pipe\"]",
     ] {
         assert!(
@@ -155,8 +158,8 @@ fn trusted_extension_has_only_the_reviewed_runtime_capabilities() {
     assert!(!EXTENSION.contains("--share-net"));
     for required in [
         "from \"node:fs/promises\"",
-        "const INPUT_ROOT = testRoots?.[0] ?? \"/input\"",
-        "const WORK_ROOT = testRoots?.[1] ?? \"/work\"",
+        "const INPUT_ROOT = testRoots?.[0] ?? process.env.FILE_GUARDIAN_INPUT_ROOT",
+        "const WORK_ROOT = testRoots?.[1] ?? process.env.FILE_GUARDIAN_WORK_ROOT",
         "runtimeExecutable(\"bash\")",
         "runtimeExecutable(\"rg\")",
         "runtimeExecutable(\"fd\")",
@@ -195,7 +198,7 @@ fn trusted_extension_has_only_the_reviewed_runtime_capabilities() {
 #[test]
 fn native_paths_are_confined_to_the_read_only_input_tree() {
     for required in [
-        "const INPUT_ROOT = testRoots?.[0] ?? \"/input\"",
+        "const INPUT_ROOT = testRoots?.[0] ?? process.env.FILE_GUARDIAN_INPUT_ROOT",
         "isAbsolute(rawPath)",
         "!value.includes(\"\\0\")",
         "rawPath.startsWith(\"~\")",
@@ -325,8 +328,9 @@ fn executable_node_harness_passes_when_node_is_available() {
     }
     assert!(SIDECAR_HARNESS.contains("persistent"));
     assert!(BWRAP_SIDECAR_HARNESS.contains("hostConnectionObserved"));
-    assert!(BWRAP_SIDECAR_HARNESS.contains("test ! -e /proc/self/environ"));
+    assert!(BWRAP_SIDECAR_HARNESS.contains("git -C /input rev-parse --verify HEAD"));
     assert!(BWRAP_SIDECAR_HARNESS.contains("printf changed > /input/artifact.txt"));
+    assert!(BWRAP_SIDECAR_HARNESS.contains("printf scratch > /work/state.txt"));
 }
 
 #[test]
@@ -414,8 +418,8 @@ fn configured_search_result_cap_is_strict_and_clamps_every_default() {
         .contains("self.max_search_results.expect(\"checked above\") > NATIVE_SEARCH_MAX_RESULTS"));
     assert!(RUST_CONFIG.contains("must not exceed the native schema limit"));
     assert!(RUST_SANDBOX.contains("use super::proxy::NATIVE_SEARCH_MAX_RESULTS;"));
-    assert!(RUST_SANDBOX.contains("validate_max_search_results(invocation.max_search_results)?"));
-    assert!(RUST_SANDBOX.contains("value > NATIVE_SEARCH_MAX_RESULTS"));
+    assert!(RUST_SANDBOX.contains("invocation.max_search_results == 0"));
+    assert!(RUST_SANDBOX.contains("invocation.max_search_results > NATIVE_SEARCH_MAX_RESULTS"));
     assert!(RUST_SANDBOX.contains("OsString::from(\"FILE_GUARDIAN_PI_MAX_SEARCH_RESULTS\")"));
     assert!(RUST_SANDBOX.contains("OsString::from(invocation.max_search_results.to_string())"));
     assert!(RUST_RUNNER.contains("max_search_results: invocation.max_search_results"));

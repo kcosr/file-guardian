@@ -58,7 +58,6 @@ impl PreparedScannerExecutable {
             .open(&canonical_path)
             .map_err(|_| ScannerSandboxError::ToolUnavailable)?;
         let identity = stamp_executable(&mut file.try_clone().map_err(private_io)?)?;
-        ensure_static_elf(&mut file.try_clone().map_err(private_io)?)?;
         Ok(Self {
             kind,
             canonical_path,
@@ -275,9 +274,26 @@ pub(super) fn compile_confined_command(
         &[
             "--die-with-parent",
             "--new-session",
-            "--unshare-all",
             "--unshare-net",
+            "--unshare-pid",
             "--clearenv",
+            "--tmpfs",
+            "/",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind",
+            "/bin",
+            "/bin",
+            "--ro-bind",
+            "/lib",
+            "/lib",
+            "--ro-bind",
+            "/lib64",
+            "/lib64",
+            "--ro-bind",
+            "/etc",
+            "/etc",
             "--proc",
             "/proc",
             "--dev",
@@ -344,7 +360,7 @@ pub(super) fn compile_confined_command(
             "/tmp/cache",
             "--setenv",
             "PATH",
-            "/nonexistent",
+            "/usr/local/bin:/usr/bin:/bin",
             "--setenv",
             "LANG",
             "C",
@@ -499,73 +515,6 @@ fn stamp_regular(
     })
 }
 
-fn ensure_static_elf(file: &mut File) -> Result<(), ScannerSandboxError> {
-    file.seek(SeekFrom::Start(0)).map_err(private_io)?;
-    let byte_len = file.metadata().map_err(private_io)?.len();
-    let mut header = [0_u8; 64];
-    file.read_exact(&mut header).map_err(private_io)?;
-    if &header[..4] != b"\x7fELF" || header[5] != 1 {
-        return Err(ScannerSandboxError::ExecutableNotSelfContained);
-    }
-    let class = header[4];
-    let (phoff, phentsize, phnum) = match class {
-        1 => (
-            u64::from(read_u32(&header, 28)?),
-            u64::from(read_u16(&header, 42)?),
-            u64::from(read_u16(&header, 44)?),
-        ),
-        2 => (
-            read_u64(&header, 32)?,
-            u64::from(read_u16(&header, 54)?),
-            u64::from(read_u16(&header, 56)?),
-        ),
-        _ => return Err(ScannerSandboxError::ExecutableNotSelfContained),
-    };
-    if phentsize < 4
-        || phnum == 0
-        || phoff
-            .checked_add(phentsize.saturating_mul(phnum))
-            .is_none_or(|end| end > byte_len)
-    {
-        return Err(ScannerSandboxError::ExecutableNotSelfContained);
-    }
-    for index in 0..phnum {
-        file.seek(SeekFrom::Start(phoff + index * phentsize))
-            .map_err(private_io)?;
-        let mut program_type = [0_u8; 4];
-        file.read_exact(&mut program_type).map_err(private_io)?;
-        if u32::from_le_bytes(program_type) == 3 {
-            return Err(ScannerSandboxError::ExecutableNotSelfContained);
-        }
-    }
-    Ok(())
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ScannerSandboxError> {
-    let raw: [u8; 2] = bytes
-        .get(offset..offset + 2)
-        .ok_or(ScannerSandboxError::ExecutableNotSelfContained)?
-        .try_into()
-        .unwrap();
-    Ok(u16::from_le_bytes(raw))
-}
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ScannerSandboxError> {
-    let raw: [u8; 4] = bytes
-        .get(offset..offset + 4)
-        .ok_or(ScannerSandboxError::ExecutableNotSelfContained)?
-        .try_into()
-        .unwrap();
-    Ok(u32::from_le_bytes(raw))
-}
-fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ScannerSandboxError> {
-    let raw: [u8; 8] = bytes
-        .get(offset..offset + 8)
-        .ok_or(ScannerSandboxError::ExecutableNotSelfContained)?
-        .try_into()
-        .unwrap();
-    Ok(u64::from_le_bytes(raw))
-}
-
 fn validate_directory(path: &Path, writable: bool) -> Result<(), ScannerSandboxError> {
     if !path.is_absolute() {
         return Err(ScannerSandboxError::SandboxPathInvalid);
@@ -606,8 +555,6 @@ pub enum ScannerSandboxError {
     PathEnvironmentInvalid,
     #[error("scanner executable identity is invalid")]
     FileIdentityInvalid,
-    #[error("scanner executable is not a self-contained static ELF binary")]
-    ExecutableNotSelfContained,
     #[error("scanner executable changed after preflight")]
     ExecutableChanged,
     #[error("protected scanner input is invalid")]

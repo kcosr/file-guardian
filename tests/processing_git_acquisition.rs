@@ -9,12 +9,13 @@ use std::process::Command;
 use std::time::Duration;
 
 use file_guardian::processing::acquisition::git::{
-    acquire_local_repository_source, acquire_remote_repository_source, enumerate_local_repository,
-    freeze_remote_advertisement, materialize_frozen_head, GitAcquisitionError, GitCommandLimits,
-    GitCommandRunner, GitEnumerationLimits, GitEnumerationRequest, RemoteLocator,
-    SanitizedGitEnvironment,
+    acquire_remote_repository_source, enumerate_local_repository, freeze_remote_advertisement,
+    materialize_frozen_head, GitAcquisitionError, GitCommandLimits, GitCommandRunner,
+    GitEnumerationLimits, GitEnumerationRequest, RemoteLocator, SanitizedGitEnvironment,
 };
-use file_guardian::processing::acquisition::local::AcquisitionCancellation;
+use file_guardian::processing::acquisition::local::{
+    acquire_local, AcquisitionCancellation, LocalAcquisitionRequest,
+};
 use file_guardian::processing::config::{CaptureLimits, SymlinkPolicy};
 use file_guardian::processing::domain::{GitBlobMode, GitHistoryScope, GitTransport};
 use tempfile::TempDir;
@@ -138,14 +139,13 @@ fn private_stage() -> (TempDir, PathBuf, PathBuf) {
     (jobs, root, stage)
 }
 
-fn remote_job_paths() -> (TempDir, PathBuf, PathBuf) {
+fn remote_job_paths() -> (TempDir, PathBuf) {
     let job = TempDir::new().unwrap();
     fs::set_permissions(job.path(), fs::Permissions::from_mode(0o700)).unwrap();
-    let source = job.path().join("source-repository");
     let stage = job.path().join("stage");
     fs::create_dir(&stage).unwrap();
     fs::set_permissions(&stage, fs::Permissions::from_mode(0o700)).unwrap();
-    (job, source, stage)
+    (job, stage)
 }
 
 fn remote_fixture_runner(
@@ -244,15 +244,8 @@ fn sanitized_authentication_environment_debug_never_exposes_values() {
 #[tokio::test]
 async fn runner_uses_direct_argv_bounds_output_and_withholds_diagnostics() {
     let fixture = TempDir::new().unwrap();
-    let script = fixture.path().join("fake-git");
-    fs::write(
-        &script,
-        b"#!/bin/sh\nprintf '%s\\n' \"$@\"\nprintf 'https://user:secret@example.invalid/repo token=secret\\n' >&2\nexit 17\n",
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let runner = GitCommandRunner::new(
-        &script,
+        git_binary(),
         GitCommandLimits {
             wall_timeout: Duration::from_secs(2),
             max_stdout_bytes: 4096,
@@ -269,25 +262,15 @@ async fn runner_uses_direct_argv_bounds_output_and_withholds_diagnostics() {
     assert!(!rendered.contains("secret"));
     assert!(!rendered.contains("example.invalid"));
     assert!(
-        matches!(
-            &error,
-            GitAcquisitionError::CommandFailed {
-                exit_code: Some(17),
-                ..
-            }
-        ),
+        matches!(&error, GitAcquisitionError::CommandFailed { .. }),
         "unexpected error: {error:?}"
     );
 }
 
 #[tokio::test]
 async fn runner_times_out_and_reaps_a_process_group() {
-    let fixture = TempDir::new().unwrap();
-    let script = fixture.path().join("slow-git");
-    fs::write(&script, b"#!/bin/sh\nsleep 30\n").unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let runner = GitCommandRunner::new(
-        &script,
+        git_binary(),
         GitCommandLimits {
             wall_timeout: Duration::from_millis(100),
             max_stdout_bytes: 4096,
@@ -297,19 +280,25 @@ async fn runner_times_out_and_reaps_a_process_group() {
     )
     .unwrap();
     assert_eq!(
-        runner.run(None, &[]).await.unwrap_err(),
+        runner
+            .run(
+                None,
+                &[
+                    OsString::from("-c"),
+                    OsString::from("alias.slow=!/bin/sleep 30"),
+                    OsString::from("slow"),
+                ],
+            )
+            .await
+            .unwrap_err(),
         GitAcquisitionError::Timeout
     );
 }
 
 #[tokio::test]
 async fn runner_rejects_a_descendant_that_holds_output_after_git_exits() {
-    let fixture = TempDir::new().unwrap();
-    let script = fixture.path().join("leaky-git");
-    fs::write(&script, b"#!/bin/sh\nsleep 30 &\nexit 0\n").unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
     let runner = GitCommandRunner::new(
-        &script,
+        git_binary(),
         GitCommandLimits {
             wall_timeout: Duration::from_secs(3),
             max_stdout_bytes: 4096,
@@ -319,7 +308,17 @@ async fn runner_rejects_a_descendant_that_holds_output_after_git_exits() {
     )
     .unwrap();
     assert_eq!(
-        runner.run(None, &[]).await.unwrap_err(),
+        runner
+            .run(
+                None,
+                &[
+                    OsString::from("-c"),
+                    OsString::from("alias.leaky=!/bin/sleep 30 & exit 0"),
+                    OsString::from("leaky"),
+                ],
+            )
+            .await
+            .unwrap_err(),
         GitAcquisitionError::OutputRead
     );
 }
@@ -363,15 +362,17 @@ async fn remote_acquisition_freezes_all_refs_publishes_head_and_scrubs_repositor
     let locator_text = "https://git@example.invalid/private/repository.git";
     let runner = remote_fixture_runner(runner_dir.path(), fixture.path(), locator_text, false);
     let locator = RemoteLocator::parse(locator_text).unwrap();
-    let (_job, source_repository, stage) = remote_job_paths();
+    let (_job, stage) = remote_job_paths();
+    let cancellation = AcquisitionCancellation::default();
 
     let acquired = acquire_remote_repository_source(
         &runner,
         &locator,
         &enumeration(GitHistoryScope::AllRefs, vec![]),
-        &source_repository,
         &stage,
-        false,
+        &capture_limits(),
+        SymlinkPolicy::Reject,
+        &cancellation,
     )
     .await
     .unwrap_or_else(|error| {
@@ -381,8 +382,8 @@ async fn remote_acquisition_freezes_all_refs_publishes_head_and_scrubs_repositor
         )
     });
 
-    assert!(!source_repository.exists());
-    assert!(!stage.join(".git").exists());
+    assert!(stage.join(".git").is_dir());
+    assert!(!git_s(&stage, &["log", "-1", "--format=%H"]).is_empty());
     assert_eq!(
         fs::read(stage.join("tracked.txt")).unwrap(),
         b"head bytes\n"
@@ -401,7 +402,7 @@ async fn remote_acquisition_freezes_all_refs_publishes_head_and_scrubs_repositor
         .entries
         .iter()
         .any(|entry| entry.logical_path.to_string() == "tracked.txt"));
-    assert_eq!(acquired.working_tree.statistics.files, 3);
+    assert!(acquired.working_tree.statistics.files > 3);
 }
 
 #[tokio::test]
@@ -412,35 +413,38 @@ async fn remote_acquisition_honors_head_and_reachable_ref_scopes() {
     let runner = remote_fixture_runner(runner_dir.path(), fixture.path(), locator_text, false);
     let locator = RemoteLocator::parse(locator_text).unwrap();
 
-    let (_head_job, head_source, head_stage) = remote_job_paths();
+    let (_head_job, head_stage) = remote_job_paths();
+    let cancellation = AcquisitionCancellation::default();
     let head = acquire_remote_repository_source(
         &runner,
         &locator,
         &enumeration(GitHistoryScope::Head, vec![]),
-        &head_source,
         &head_stage,
-        false,
+        &capture_limits(),
+        SymlinkPolicy::Reject,
+        &cancellation,
     )
     .await
     .unwrap();
     assert_eq!(head.repository.commits.len(), 1);
     assert_eq!(head.repository.frozen_refs.len(), 1);
-    assert!(!head_source.exists());
+    assert!(head_stage.join(".git").is_dir());
 
-    let (_reachable_job, reachable_source, reachable_stage) = remote_job_paths();
+    let (_reachable_job, reachable_stage) = remote_job_paths();
     let reachable = acquire_remote_repository_source(
         &runner,
         &locator,
         &enumeration(GitHistoryScope::Reachable, vec!["refs/heads/side"]),
-        &reachable_source,
         &reachable_stage,
-        false,
+        &capture_limits(),
+        SymlinkPolicy::Reject,
+        &cancellation,
     )
     .await
     .unwrap();
     assert_eq!(reachable.repository.commits.len(), 3);
     assert_eq!(reachable.repository.frozen_refs.len(), 2);
-    assert!(!reachable_source.exists());
+    assert!(reachable_stage.join(".git").is_dir());
 }
 
 #[tokio::test]
@@ -450,23 +454,25 @@ async fn remote_acquisition_removes_credential_bearing_metadata_on_fetch_failure
     let locator_text = "https://git@example.invalid/private/failure.git";
     let runner = remote_fixture_runner(runner_dir.path(), fixture.path(), locator_text, true);
     let locator = RemoteLocator::parse(locator_text).unwrap();
-    let (_job, source_repository, stage) = remote_job_paths();
+    let (_job, stage) = remote_job_paths();
+    let cancellation = AcquisitionCancellation::default();
 
     let error = acquire_remote_repository_source(
         &runner,
         &locator,
         &enumeration(GitHistoryScope::Head, vec![]),
-        &source_repository,
         &stage,
-        false,
+        &capture_limits(),
+        SymlinkPolicy::Reject,
+        &cancellation,
     )
     .await
     .unwrap_err();
 
     assert!(matches!(error, GitAcquisitionError::CommandFailed { .. }));
     assert!(!error.to_string().contains(locator_text));
-    assert!(!source_repository.exists());
-    assert!(fs::read_dir(stage).unwrap().next().is_none());
+    let staged_config = fs::read_to_string(stage.join(".git/config")).unwrap_or_default();
+    assert!(!staged_config.contains(locator_text));
 }
 
 #[tokio::test]
@@ -523,7 +529,7 @@ async fn real_repository_head_and_all_ref_scopes_are_distinct_and_paths_are_loss
 }
 
 #[tokio::test]
-async fn local_repository_working_tree_captures_dirty_untracked_and_ignored_bytes_without_git() {
+async fn local_directory_copy_preserves_the_exact_repository_and_detects_git_afterward() {
     let fixture = repository_fixture();
     write(fixture.path(), ".gitignore", b"ignored.txt\n");
     commit(fixture.path(), "ignore policy");
@@ -536,21 +542,28 @@ async fn local_repository_working_tree_captures_dirty_untracked_and_ignored_byte
     );
 
     let (_jobs, jobs_root, stage) = private_stage();
-    let acquired = acquire_local_repository_source(
+    let cancellation = AcquisitionCancellation::default();
+    let acquired = acquire_local(LocalAcquisitionRequest {
+        source: fixture.path(),
+        stage: &stage,
+        jobs_root: &jobs_root,
+        limits: &capture_limits(),
+        symlinks: SymlinkPolicy::Reject,
+        cancellation: &cancellation,
+    })
+    .unwrap();
+    let repository = enumerate_local_repository(
         &runner(),
-        fixture.path(),
-        &enumeration(GitHistoryScope::Head, vec![]),
-        true,
         &stage,
-        &jobs_root,
-        &capture_limits(),
-        SymlinkPolicy::Reject,
-        &AcquisitionCancellation::default(),
+        &enumeration(GitHistoryScope::Head, vec![]),
     )
     .await
     .unwrap();
 
-    assert!(acquired.working_tree.is_some());
+    assert!(acquired
+        .entries
+        .iter()
+        .any(|entry| { entry.logical_path.to_string() == ".git/HEAD" }));
     assert_eq!(
         fs::read(stage.join("tracked.txt")).unwrap(),
         b"dirty working tree bytes\n"
@@ -563,16 +576,15 @@ async fn local_repository_working_tree_captures_dirty_untracked_and_ignored_byte
         fs::read(stage.join("ignored.txt")).unwrap(),
         b"ignored but published bytes\n"
     );
-    assert!(!stage.join(".git").exists());
-    assert!(acquired
-        .repository
+    assert!(stage.join(".git").is_dir());
+    assert!(repository
         .head_tree
         .iter()
         .any(|entry| entry.bytes == b"head bytes\n"));
 }
 
 #[tokio::test]
-async fn repository_working_tree_rejects_absolute_and_escaping_symlinks() {
+async fn local_directory_copy_preserves_absolute_and_escaping_symlinks_exactly() {
     for (name, target) in [
         ("absolute-link", "/etc/passwd"),
         ("escape-link", "../outside"),
@@ -580,27 +592,25 @@ async fn repository_working_tree_rejects_absolute_and_escaping_symlinks() {
         let fixture = repository_fixture();
         std::os::unix::fs::symlink(target, fixture.path().join(name)).unwrap();
         let (_jobs, jobs_root, stage) = private_stage();
+        let cancellation = AcquisitionCancellation::default();
+        acquire_local(LocalAcquisitionRequest {
+            source: fixture.path(),
+            stage: &stage,
+            jobs_root: &jobs_root,
+            limits: &capture_limits(),
+            symlinks: SymlinkPolicy::Preserve,
+            cancellation: &cancellation,
+        })
+        .unwrap();
         assert_eq!(
-            acquire_local_repository_source(
-                &runner(),
-                fixture.path(),
-                &enumeration(GitHistoryScope::Head, vec![]),
-                true,
-                &stage,
-                &jobs_root,
-                &capture_limits(),
-                SymlinkPolicy::Preserve,
-                &AcquisitionCancellation::default(),
-            )
-            .await
-            .unwrap_err(),
-            GitAcquisitionError::WorkingTreeCapture
+            fs::read_link(stage.join(name)).unwrap(),
+            PathBuf::from(target)
         );
     }
 }
 
 #[tokio::test]
-async fn frozen_head_materialization_rejects_an_escaping_symlink_target() {
+async fn frozen_head_materialization_preserves_an_escaping_symlink_without_following_it() {
     let fixture = repository_fixture();
     fs::create_dir_all(fixture.path().join("nested")).unwrap();
     std::os::unix::fs::symlink("../../outside", fixture.path().join("nested/bad-link")).unwrap();
@@ -613,9 +623,10 @@ async fn frozen_head_materialization_rejects_an_escaping_symlink_target() {
     .await
     .unwrap();
     let stage = TempDir::new().unwrap();
+    materialize_frozen_head(&frozen, stage.path(), true).unwrap();
     assert_eq!(
-        materialize_frozen_head(&frozen, stage.path(), true).unwrap_err(),
-        GitAcquisitionError::SymbolicLink
+        fs::read_link(stage.path().join("nested/bad-link")).unwrap(),
+        PathBuf::from("../../outside")
     );
 }
 

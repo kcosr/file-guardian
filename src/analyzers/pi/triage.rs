@@ -1,23 +1,23 @@
-//! Strict, content-free protocol values for Pi finding triage.
+//! Strict protocol values for trusted Pi finding triage.
 //!
-//! This module deliberately accepts only normalized processing findings. Raw
-//! scanner records, matched bytes, snippets, paths outside the immutable
-//! artifact namespace, and model prose have no representation in the wire
-//! contract.
+//! The request contains normalized findings and bounded matched evidence so Pi
+//! can make the semantic judgment the product asks it to make. Public reports
+//! remain content-safe; this private request is not a report DTO.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::domain::{
     AnalyzerCoverage, AnalyzerId, ArtifactId, ConfiguredConfidence, Digest, FindingCategory,
-    InspectionPhase, ReasonCode, RuleId, RunId, Severity, ValidatedLocation,
+    InspectionPhase, LogicalPath, ReasonCode, RuleId, RunId, Severity, ValidatedLocation,
 };
 use crate::processing::{
-    CorrelationId, CredentialVerificationState, FindingId, GitHistoryScope, OccurrenceId,
-    PiFindingAssessment, PiFindingClassification, RecommendedAction,
+    CorrelationId, CredentialVerificationState, FindingId, GitHistoryScope, GitProvenance,
+    OccurrenceId, PiFindingAssessment, PiFindingClassification, RecommendedAction,
 };
 
 pub const TRIAGE_REQUEST_SCHEMA: &str = "file-guardian-pi-triage-request/1";
@@ -65,6 +65,10 @@ pub enum PiTriageError {
     DuplicateOccurrence,
     #[error("Pi triage prior finding must contain at least one occurrence")]
     MissingOccurrence,
+    #[error("Pi triage prior finding artifact provenance is invalid")]
+    InvalidArtifact,
+    #[error("Pi triage matched evidence is empty or not canonically encoded")]
+    InvalidEvidence,
     #[error("Pi triage terminal submission contains too many assessments")]
     AssessmentLimitExceeded,
     #[error("Pi triage terminal submission contains duplicate finding assessments")]
@@ -224,6 +228,103 @@ pub struct PriorOccurrence {
     pub verification_state: CredentialVerificationState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_token: Option<Digest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<MatchedEvidence>,
+}
+
+/// The exact staged artifact that Pi should inspect for one finding.
+///
+/// Working-tree paths are relative to the read-only stage. Git-history
+/// findings additionally carry the frozen object/commit/ref provenance needed
+/// to inspect the blob through the stage's own `.git` directory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "surface", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PriorFindingArtifact {
+    WorkingTree {
+        logical_path: LogicalPath,
+    },
+    GitHistory {
+        logical_path: LogicalPath,
+        repository_identity: Digest,
+        history_scope: GitHistoryScope,
+        provenance: GitProvenance,
+    },
+}
+
+impl PriorFindingArtifact {
+    fn validate(&self) -> Result<(), PiTriageError> {
+        match self {
+            Self::WorkingTree { .. } => Ok(()),
+            Self::GitHistory {
+                logical_path,
+                history_scope,
+                provenance,
+                ..
+            } if *history_scope != GitHistoryScope::None
+                && provenance
+                    .occurrences
+                    .iter()
+                    .any(|occurrence| &occurrence.path == logical_path) =>
+            {
+                Ok(())
+            }
+            Self::GitHistory { .. } => Err(PiTriageError::InvalidArtifact),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "encoding", content = "value", rename_all = "snake_case")]
+pub enum MatchedEvidence {
+    Utf8(String),
+    Base64url(String),
+}
+
+impl MatchedEvidence {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            None
+        } else if let Ok(value) = std::str::from_utf8(bytes) {
+            Some(Self::Utf8(value.to_owned()))
+        } else {
+            Some(Self::Base64url(URL_SAFE_NO_PAD.encode(bytes)))
+        }
+    }
+
+    pub fn as_bytes(&self) -> Result<Vec<u8>, PiTriageError> {
+        match self {
+            Self::Utf8(value) if !value.is_empty() => Ok(value.as_bytes().to_vec()),
+            Self::Base64url(value) if !value.is_empty() => URL_SAFE_NO_PAD
+                .decode(value)
+                .map_err(|_| PiTriageError::InvalidEvidence),
+            Self::Utf8(_) | Self::Base64url(_) => Err(PiTriageError::InvalidEvidence),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MatchedEvidence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "encoding", content = "value", rename_all = "snake_case")]
+        enum Wire {
+            Utf8(String),
+            Base64url(String),
+        }
+        let value = match Wire::deserialize(deserializer)? {
+            Wire::Utf8(value) => Self::Utf8(value),
+            Wire::Base64url(value) => Self::Base64url(value),
+        };
+        let bytes = value.as_bytes().map_err(serde::de::Error::custom)?;
+        if Self::from_bytes(&bytes).as_ref() != Some(&value) {
+            return Err(serde::de::Error::custom(
+                "evidence encoding is not canonical",
+            ));
+        }
+        Ok(value)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -235,6 +336,7 @@ pub struct PriorFinding {
     pub analyzer_id: AnalyzerId,
     pub rule_id: RuleId,
     pub artifact_id: ArtifactId,
+    pub artifact: PriorFindingArtifact,
     pub category: FindingCategory,
     pub severity: Severity,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,14 +355,25 @@ impl PriorFinding {
         analyzer_id: AnalyzerId,
         rule_id: RuleId,
         artifact_id: ArtifactId,
+        artifact: PriorFindingArtifact,
         category: FindingCategory,
         severity: Severity,
         location: Option<ValidatedLocation>,
         evidence_token: Option<Digest>,
         mut occurrences: Vec<PriorOccurrence>,
     ) -> Result<Self, PiTriageError> {
+        artifact.validate()?;
         if occurrences.is_empty() {
             return Err(PiTriageError::MissingOccurrence);
+        }
+        if occurrences.iter().any(|occurrence| {
+            occurrence.evidence.is_some() != occurrence.evidence_token.is_some()
+                || occurrence
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.as_bytes().is_err())
+        }) {
+            return Err(PiTriageError::InvalidEvidence);
         }
         occurrences.sort_by(|left, right| left.occurrence_id.cmp(&right.occurrence_id));
         if occurrences
@@ -276,6 +389,7 @@ impl PriorFinding {
             analyzer_id,
             rule_id,
             artifact_id,
+            artifact,
             category,
             severity,
             location,
@@ -299,6 +413,7 @@ impl<'de> Deserialize<'de> for PriorFinding {
             analyzer_id: AnalyzerId,
             rule_id: RuleId,
             artifact_id: ArtifactId,
+            artifact: PriorFindingArtifact,
             category: FindingCategory,
             severity: Severity,
             location: Option<ValidatedLocation>,
@@ -314,6 +429,7 @@ impl<'de> Deserialize<'de> for PriorFinding {
             wire.analyzer_id,
             wire.rule_id,
             wire.artifact_id,
+            wire.artifact,
             wire.category,
             wire.severity,
             wire.location,

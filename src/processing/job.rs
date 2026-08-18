@@ -392,9 +392,6 @@ impl JobPaths {
     pub fn stage(&self) -> PathBuf {
         self.root.join("stage")
     }
-    pub fn source_repository(&self) -> PathBuf {
-        self.root.join("source-repository")
-    }
     pub fn private_root(&self) -> PathBuf {
         self.root.join("private")
     }
@@ -1024,7 +1021,7 @@ fn normal_transition(from: JobExecutionState, to: JobExecutionState) -> bool {
 }
 
 fn create_layout(run_dir: &OwnedFd) -> Result<(), JobStoreError> {
-    for name in ["stage", "source-repository", "private"] {
+    for name in ["stage", "private"] {
         mkdir_private(run_dir, name, "create job layout")?;
     }
     let private = open_private_directory(run_dir, "private", "open private job layout")?;

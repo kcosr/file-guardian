@@ -5,10 +5,10 @@ use file_guardian::processing::config::{
     AcquisitionConfig, ActionMode, AnalyzerArtifactKind, AnalyzerConfig, AnalyzerExecution,
     AnalyzerKind, AnalyzerLimits, AnalyzerSelection, BuiltinRulesConfig, CaptureLimits,
     CompletionDisposition, CompletionPolicy, ContentApplicability, DaemonConfig,
-    ExternalScannerRuntimeConfig, GitPolicy, HistoryScope, JobsConfig, LfsPolicy, LocalPolicy,
-    PhaseExecution, PipelineConfig, PipelineStage, PriorLimits, PriorObservations,
-    ProcessingConfig, ProcessingConfigFile, ProcessingProfile, ProfilePurpose, RetentionConfig,
-    SourceScope, StageExecution, SubmodulePolicy, SymlinkPolicy, UnboundObservation,
+    ExternalScannerRuntimeConfig, GitPolicy, HistoryScope, JobsConfig, LfsPolicy, PhaseExecution,
+    PipelineConfig, PipelineStage, PriorLimits, PriorObservations, ProcessingConfig,
+    ProcessingConfigFile, ProcessingProfile, ProfilePurpose, RetentionConfig, SourceScope,
+    StageExecution, SubmodulePolicy, UnboundObservation,
 };
 use file_guardian::processing::domain::{GitHistoryScope, GitTransport};
 use file_guardian::processing::runtime::{
@@ -48,10 +48,6 @@ fn fixture(history: HistoryScope, action_mode: ActionMode) -> ProcessingConfigFi
             ],
             submodules: SubmodulePolicy::Reject,
             lfs: LfsPolicy::RejectPointer,
-            symlinks: SymlinkPolicy::Preserve,
-        },
-        local: LocalPolicy {
-            symlinks: SymlinkPolicy::Reject,
         },
         completion: CompletionPolicy {
             allow: if action_mode == ActionMode::Apply {
@@ -215,9 +211,9 @@ fn rejects_an_authority_upgrade() {
 }
 
 #[test]
-fn path_sources_cannot_select_git_history() {
+fn path_sources_may_select_git_history_for_post_copy_repository_detection() {
     let config = fixture(HistoryScope::Head, ActionMode::Evaluate);
-    let error = compile_processing_runtime(
+    let runtime = compile_processing_runtime(
         &config,
         request(
             None,
@@ -226,9 +222,8 @@ fn path_sources_cannot_select_git_history() {
             },
         ),
     )
-    .err()
     .unwrap();
-    assert!(matches!(error, ProcessingRuntimeError::PathHistory));
+    assert!(matches!(runtime.source, FrozenSourceRequest::Path { .. }));
 }
 
 #[test]
@@ -238,8 +233,8 @@ fn checkout_refs_are_full_symbolic_refs_within_profile_policy() {
         &config,
         request(
             None,
-            ProcessingSourceRequest::Repo {
-                path: "/repo".into(),
+            ProcessingSourceRequest::Git {
+                remote: "https://example.test/repo.git".into(),
                 reference: Some("refs/tags/release-1".into()),
             },
         ),
@@ -247,7 +242,7 @@ fn checkout_refs_are_full_symbolic_refs_within_profile_policy() {
     .unwrap();
     assert!(matches!(
         runtime.source,
-        FrozenSourceRequest::Repo { checkout_ref: Some(ref value), .. }
+        FrozenSourceRequest::Git { checkout_ref: Some(ref value), .. }
             if value == "refs/tags/release-1"
     ));
 
@@ -261,8 +256,8 @@ fn checkout_refs_are_full_symbolic_refs_within_profile_policy() {
             &config,
             request(
                 None,
-                ProcessingSourceRequest::Repo {
-                    path: "/repo".into(),
+                ProcessingSourceRequest::Git {
+                    remote: "https://example.test/repo.git".into(),
                     reference: Some(reference.into()),
                 },
             ),

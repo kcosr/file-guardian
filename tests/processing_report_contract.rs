@@ -39,23 +39,24 @@ fn rebuild(report: ProcessingReport) -> Result<ProcessingReport, ReportError> {
     })
 }
 
-fn repo_source(working_tree: bool) -> SourceSummary {
+fn detected_repository_source() -> SourceSummary {
     serde_json::from_value(json!({
-        "kind": "repo",
-        "repository_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-        "resolved_head": {"algorithm": "sha1", "value": "2222222222222222222222222222222222222222"},
-        "working_tree": working_tree,
-        "bare": !working_tree,
-        "history": "head",
-        "frozen_refs": [{
-            "name": {"segments": [
-                {"encoding": "utf8", "value": "refs"},
-                {"encoding": "utf8", "value": "heads"},
-                {"encoding": "utf8", "value": "main"}
-            ]},
-            "object_id": {"algorithm": "sha1", "value": "2222222222222222222222222222222222222222"},
-            "peeled_commit_id": {"algorithm": "sha1", "value": "2222222222222222222222222222222222222222"}
-        }]
+        "kind": "path",
+        "input_kind": "directory",
+        "repository": {
+            "repository_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            "resolved_head": {"algorithm": "sha1", "value": "2222222222222222222222222222222222222222"},
+            "history": "head",
+            "frozen_refs": [{
+                "name": {"segments": [
+                    {"encoding": "utf8", "value": "refs"},
+                    {"encoding": "utf8", "value": "heads"},
+                    {"encoding": "utf8", "value": "main"}
+                ]},
+                "object_id": {"algorithm": "sha1", "value": "2222222222222222222222222222222222222222"},
+                "peeled_commit_id": {"algorithm": "sha1", "value": "2222222222222222222222222222222222222222"}
+            }]
+        }
     }))
     .unwrap()
 }
@@ -85,7 +86,7 @@ fn all_four_goldens_validate_with_exact_exits_and_one_json_line() {
 #[test]
 fn composite_analysis_identity_is_independent_of_publication_stage_identity() {
     let mut report = parse(ALLOW);
-    report.source = Some(repo_source(true));
+    report.source = Some(detected_repository_source());
     report.phases.initial.as_mut().unwrap().manifest_identity = Sha256Digest::new(
         "sha256:9999999999999999999999999999999999999999999999999999999999999999",
     )
@@ -101,18 +102,6 @@ fn composite_analysis_identity_is_independent_of_publication_stage_identity() {
             .clone()
             .unwrap()
     );
-}
-
-#[test]
-fn history_only_report_only_allow_and_deny_have_no_publication_stage() {
-    for golden in [ALLOW, DENY] {
-        let mut report = parse(golden);
-        report.source = Some(repo_source(false));
-        report.stage = None;
-        let report = rebuild(report).expect("history-only report-only decision");
-        assert!(report.stage.is_none());
-        assert!(report.phases.initial.is_some());
-    }
 }
 
 #[test]

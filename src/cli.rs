@@ -61,11 +61,8 @@ pub struct ProcessArgs {
 /// Source acquired by a processing job.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum ProcessSource {
-    /// Copy one literal regular file or directory into an owned stage.
+    /// Copy one literal directory exactly into an owned stage.
     Path(ProcessPathArgs),
-
-    /// Acquire one local Git repository without modifying it.
-    Repo(ProcessRepoArgs),
 
     /// Clone one supported HTTPS or SSH Git remote.
     Git(ProcessGitArgs),
@@ -74,20 +71,8 @@ pub enum ProcessSource {
 /// Filesystem source arguments.
 #[derive(Clone, Debug, Eq, PartialEq, ClapArgs)]
 pub struct ProcessPathArgs {
-    /// Literal regular file or directory to copy and process.
-    #[arg(value_name = "PATH")]
-    pub path: PathBuf,
-}
-
-/// Local Git repository source arguments.
-#[derive(Clone, Debug, Eq, PartialEq, ClapArgs)]
-pub struct ProcessRepoArgs {
-    /// Optional branch or tag selected as the materialized HEAD.
-    #[arg(long = "ref", value_name = "REF", value_parser = validate_git_ref)]
-    pub checkout_ref: Option<String>,
-
-    /// Literal path to a local Git repository.
-    #[arg(value_name = "PATH")]
+    /// Literal directory to copy exactly and process.
+    #[arg(value_name = "DIRECTORY")]
     pub path: PathBuf,
 }
 

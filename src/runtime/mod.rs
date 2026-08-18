@@ -433,7 +433,6 @@ fn compile_pi_analyzer(
             Ok((OsString::from(&credential.target_env), value))
         })
         .collect::<Result<Vec<_>, RuntimeError>>()?;
-    let runtime_manifest = pi.runtime_root.join(&pi.runtime_manifest);
     let identity_material = serde_json::to_vec(&(
         "file-guardian-compiled-pi/1",
         id.as_str(),
@@ -458,10 +457,7 @@ fn compile_pi_analyzer(
         runtime: PiRuntimeSpec {
             bubblewrap_executable: pi.bubblewrap_executable.clone(),
             expected_bubblewrap_version: pi.expected_bubblewrap_version.clone(),
-            runtime_root: pi.runtime_root.clone(),
-            runtime_manifest,
-            launcher: pi.launcher.clone(),
-            pi_entrypoint: pi.pi_entrypoint.clone(),
+            pi_executable: pi.pi_executable.clone(),
             expected_pi_version: pi.expected_pi_version.clone(),
             instruction_file: pi.instruction_file.clone(),
             trusted_extension: pi.trusted_extension.clone(),
@@ -522,7 +518,6 @@ fn compile_pi_analyzer(
                 "termination_grace_secs",
                 limits.termination_grace_secs,
             )?),
-            memory_bytes: required("memory_bytes", limits.memory_bytes)?,
             cpu_seconds: required("cpu_time_secs", limits.cpu_time_secs)?,
             open_files: required("max_open_files", limits.max_open_files)?,
             stdout_bytes: required("max_stdout_bytes", limits.max_stdout_bytes)?,

@@ -2,11 +2,13 @@ use file_guardian::analyzers::pi::triage::{
     parse_and_normalize_terminal, PiReviewScope, PiStageAttestation, PiTriageAssessmentWire,
     PiTriageCoverage, PiTriageError, PiTriageInvocationId, PiTriageLimits, PiTriageRequest,
     PiTriageRequestContext, PiTriageSubmissionStatus, PiTriageTerminalSubmission,
-    PiTriageVocabulary, PriorFinding, PriorOccurrence, TRIAGE_TERMINAL_SCHEMA,
+    PiTriageVocabulary, PriorFinding, PriorFindingArtifact, PriorOccurrence,
+    TRIAGE_TERMINAL_SCHEMA,
 };
 use file_guardian::domain::{
     AnalyzerCoverage, AnalyzerId, ArtifactId, ConfiguredConfidence, CoverageStatus, Digest,
-    FindingCategory, InspectionPhase, ReasonCode, RuleId, RunId, Severity, ValidatedLocation,
+    FindingCategory, InspectionPhase, LogicalPath, PathSegment, ReasonCode, RuleId, RunId,
+    Severity, ValidatedLocation,
 };
 use file_guardian::processing::{
     CorrelationId, CredentialVerificationState, FindingId, GitHistoryScope, OccurrenceId,
@@ -30,6 +32,12 @@ fn finding(suffix: &str) -> PriorFinding {
         AnalyzerId::new("gitleaks").unwrap(),
         RuleId::new("generic-password").unwrap(),
         ArtifactId::from_suffix(format!("artifact-{suffix}")).unwrap(),
+        PriorFindingArtifact::WorkingTree {
+            logical_path: LogicalPath::new(vec![
+                PathSegment::utf8(format!("{suffix}.txt")).unwrap()
+            ])
+            .unwrap(),
+        },
         FindingCategory::Credential,
         Severity::Medium,
         Some(ValidatedLocation::line_column(4, 12).unwrap()),
@@ -40,6 +48,9 @@ fn finding(suffix: &str) -> PriorFinding {
             rule_id: RuleId::new("generic-password").unwrap(),
             verification_state: CredentialVerificationState::Unverified,
             evidence_token: Some(Digest::sha256(format!("opaque-token-{suffix}"))),
+            evidence: file_guardian::analyzers::pi::triage::MatchedEvidence::from_bytes(
+                format!("password = example-{suffix}").as_bytes(),
+            ),
         }],
     )
     .unwrap()
@@ -127,7 +138,7 @@ fn parse(
 }
 
 #[test]
-fn canonical_request_is_identity_bound_and_content_free() {
+fn canonical_request_is_identity_bound_and_carries_exact_private_evidence() {
     let request = request_with(vec![finding("b"), finding("a")]);
     assert_eq!(request.findings[0].finding_id.as_str(), "fnd_a");
     request.validate_identity().unwrap();
@@ -137,9 +148,12 @@ fn canonical_request_is_identity_bound_and_content_free() {
     );
 
     let json = String::from_utf8(request.canonical_json().unwrap()).unwrap();
+    assert!(json.contains("password = example-a"));
+    assert!(json.contains("password = example-b"));
+    assert!(json.contains("\"surface\":\"working_tree\""));
+    assert!(json.contains("\"value\":\"a.txt\""));
     for forbidden in [
         "hunter2",
-        "password =",
         "matched_value",
         "snippet",
         "stdout",
