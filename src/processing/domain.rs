@@ -140,13 +140,6 @@ pub enum ProcessPurpose {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PathInputKind {
-    File,
-    Directory,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum GitTransport {
     Https,
     Ssh,
@@ -312,8 +305,6 @@ impl<'de> Deserialize<'de> for GitRefSnapshot {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProcessSource {
     Path {
-        input_kind: PathInputKind,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         repository: Option<DetectedGitRepository>,
     },
     Git {
@@ -336,15 +327,11 @@ pub struct DetectedGitRepository {
 }
 
 impl ProcessSource {
-    pub fn path(input_kind: PathInputKind) -> Self {
-        Self::Path {
-            input_kind,
-            repository: None,
-        }
+    pub fn path() -> Self {
+        Self::Path { repository: None }
     }
 
     pub fn path_repository(
-        input_kind: PathInputKind,
         repository_id: Digest,
         resolved_head: GitObjectId,
         history: GitHistoryScope,
@@ -353,7 +340,6 @@ impl ProcessSource {
         validate_ref_algorithms(&resolved_head, &frozen_refs)?;
         canonicalize_unique(&mut frozen_refs, "frozen_refs")?;
         Ok(Self::Path {
-            input_kind,
             repository: Some(DetectedGitRepository {
                 repository_id,
                 resolved_head,
@@ -410,8 +396,7 @@ impl<'de> Deserialize<'de> for ProcessSource {
         #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
         enum Wire {
             Path {
-                input_kind: PathInputKind,
-                #[serde(default)]
+                #[serde(deserialize_with = "deserialize_required_option")]
                 repository: Option<DetectedGitRepository>,
             },
             Git {
@@ -424,15 +409,10 @@ impl<'de> Deserialize<'de> for ProcessSource {
             },
         }
         match Wire::deserialize(deserializer)? {
+            Wire::Path { repository: None } => Ok(Self::path()),
             Wire::Path {
-                input_kind,
-                repository: None,
-            } => Ok(Self::path(input_kind)),
-            Wire::Path {
-                input_kind,
                 repository: Some(repository),
             } => Self::path_repository(
-                input_kind,
                 repository.repository_id,
                 repository.resolved_head,
                 repository.history,
@@ -456,6 +436,14 @@ impl<'de> Deserialize<'de> for ProcessSource {
         }
         .map_err(serde::de::Error::custom)
     }
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1124,7 +1112,6 @@ mod tests {
     #[test]
     fn handoff_requires_a_working_tree() {
         let source = ProcessSource::path_repository(
-            PathInputKind::Directory,
             Digest::sha256(b"repo"),
             oid('a'),
             GitHistoryScope::AllRefs,
@@ -1142,6 +1129,19 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(empty_scope, Err(ProcessingDomainError::EmptySourceScope));
+    }
+
+    #[test]
+    fn path_source_has_one_explicit_directory_wire_shape() {
+        let source = ProcessSource::path();
+        assert_eq!(
+            serde_json::to_value(&source).unwrap(),
+            serde_json::json!({"kind": "path", "repository": null})
+        );
+        assert!(serde_json::from_value::<ProcessSource>(serde_json::json!({
+            "kind": "path"
+        }))
+        .is_err());
     }
 
     #[test]

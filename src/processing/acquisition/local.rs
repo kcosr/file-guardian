@@ -26,7 +26,6 @@ use thiserror::Error;
 
 use crate::domain::{Digest, LogicalPath, PathSegment};
 use crate::processing::config::{CaptureLimits, SymlinkPolicy};
-use crate::processing::domain::PathInputKind;
 
 const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
@@ -150,7 +149,6 @@ pub struct LocalAcquisitionStatistics {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalAcquisitionResult {
-    pub input_kind: PathInputKind,
     pub manifest_identity: Digest,
     pub entries: Vec<AcquiredEntry>,
     pub statistics: LocalAcquisitionStatistics,
@@ -276,7 +274,7 @@ impl LocalAcquisitionError {
     }
 }
 
-/// Copy one literal local file or directory into an already-created empty job
+/// Copy one literal local directory into an already-created empty job
 /// stage. The stage must be a direct or indirect child of `jobs_root`, owned by
 /// the effective user, and mode `0700`.
 pub fn acquire_local(
@@ -291,7 +289,6 @@ pub fn acquire_local(
 pub fn capture_owned_stage(
     stage: &Path,
     jobs_root: &Path,
-    input_kind: PathInputKind,
     limits: &CaptureLimits,
     symlinks: SymlinkPolicy,
     cancellation: &AcquisitionCancellation,
@@ -311,7 +308,6 @@ pub fn capture_owned_stage(
         .entries
         .sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
     Ok(LocalAcquisitionResult {
-        input_kind,
         manifest_identity: manifest_identity(&capture.entries)?,
         entries: capture.entries,
         statistics: capture.statistics,
@@ -482,7 +478,7 @@ fn acquire_local_copy(
     if root_kind.is_symlink() {
         return Err(LocalAcquisitionError::SymlinkRejected);
     }
-    if !root_kind.is_file() && !root_kind.is_dir() {
+    if !root_kind.is_dir() {
         return Err(LocalAcquisitionError::SpecialFileRejected);
     }
 
@@ -498,50 +494,17 @@ fn acquire_local_copy(
         statistics: LocalAcquisitionStatistics::default(),
     };
 
-    let input_kind = if root_kind.is_dir() {
-        let source = fs::open(request.source, DIRECTORY_FLAGS, Mode::empty())
-            .map_err(|_| LocalAcquisitionError::InputUnavailable)?;
-        ensure_same_entry(
-            &root_stat,
-            &fs::fstat(&source).map_err(|_| LocalAcquisitionError::InputUnstable)?,
-        )?;
-        reject_jobs_ancestry(&source, request.jobs_root)?;
-        reject_jobs_descendant(&source, request.jobs_root)?;
-        state.copy_directory(&source, &stage, &[], 0)?;
-        let after = fs::fstat(&source).map_err(|_| LocalAcquisitionError::InputUnstable)?;
-        ensure_stable(&root_stat, &after)?;
-        PathInputKind::Directory
-    } else {
-        let name = request
-            .source
-            .file_name()
-            .filter(|name| !name.as_bytes().is_empty())
-            .ok_or(LocalAcquisitionError::InvalidInputName)?;
-        let segment =
-            PathSegment::try_from(name).map_err(|_| LocalAcquisitionError::InvalidInputName)?;
-        let parent_path = request
-            .source
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let parent = fs::open(parent_path, SEARCH_DIRECTORY_FLAGS, Mode::empty())
-            .map_err(|_| LocalAcquisitionError::InputUnavailable)?;
-        reject_jobs_ancestry(&parent, request.jobs_root)?;
-        let before = fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|_| LocalAcquisitionError::InputUnstable)?;
-        ensure_stable(&root_stat, &before)?;
-        let source = fs::openat(&parent, name, SOURCE_FILE_FLAGS, Mode::empty())
-            .map_err(|_| LocalAcquisitionError::InputUnavailable)?;
-        ensure_same_entry(
-            &before,
-            &fs::fstat(&source).map_err(|_| LocalAcquisitionError::InputUnstable)?,
-        )?;
-        state.copy_regular_file(source, &stage, name, vec![segment], before)?;
-        let after = fs::statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|_| LocalAcquisitionError::InputUnstable)?;
-        ensure_stable(&root_stat, &after)?;
-        PathInputKind::File
-    };
+    let source = fs::open(request.source, DIRECTORY_FLAGS, Mode::empty())
+        .map_err(|_| LocalAcquisitionError::InputUnavailable)?;
+    ensure_same_entry(
+        &root_stat,
+        &fs::fstat(&source).map_err(|_| LocalAcquisitionError::InputUnstable)?,
+    )?;
+    reject_jobs_ancestry(&source, request.jobs_root)?;
+    reject_jobs_descendant(&source, request.jobs_root)?;
+    state.copy_directory(&source, &stage, &[], 0)?;
+    let after = fs::fstat(&source).map_err(|_| LocalAcquisitionError::InputUnstable)?;
+    ensure_stable(&root_stat, &after)?;
 
     request.cancellation.check()?;
     let final_root = fs::statat(fs::CWD, request.source, AtFlags::SYMLINK_NOFOLLOW)
@@ -553,7 +516,6 @@ fn acquire_local_copy(
     let manifest_identity = manifest_identity(&state.entries)?;
     verify_stage(&stage, &state.entries, request.cancellation)?;
     Ok(LocalAcquisitionResult {
-        input_kind,
         manifest_identity,
         entries: state.entries,
         statistics: state.statistics,

@@ -21,8 +21,7 @@ use crate::processing::domain::{
     ActionKind as DomainActionKind, Adjudication, AdjudicationReason,
     AdjudicationState as DomainAdjudicationState, CredentialVerificationState, Disposition,
     GitHistoryScope, GitObjectId as DomainGitObjectId, GitTransport as DomainGitTransport,
-    HandoffStatus as DomainHandoffStatus, Outcome, PathInputKind, PiFindingClassification,
-    ProcessSource,
+    HandoffStatus as DomainHandoffStatus, Outcome, PiFindingClassification, ProcessSource,
 };
 use crate::processing::executor::{
     AnalyzerRunRecord, AnalyzerRunState, ProcessingArtifact, ProcessingArtifactCatalog,
@@ -37,7 +36,7 @@ use crate::processing::report::{
     ConfiguredDisposition, CorrelationSummary, CoverageSummary, DegradationSummary,
     EffectiveDisposition, ExecutionStatus, FindingCategory, FindingSummary, FrozenRefSummary,
     GitObjectAlgorithm, GitObjectId, GitProvenanceSummary, GitTransport, HandoffStatus,
-    HistoryScope, InputKind, InspectionPhase, IssueSummary, OmissionSummary, PersistenceStatus,
+    HistoryScope, InspectionPhase, IssueSummary, OmissionSummary, PersistenceStatus,
     PhaseStatistics, PhaseSummary, PhasesSummary, PiAssessment, PiInvocationSummary,
     PolicyDirective, PolicySummary, ProcessingOutcome, ProcessingReport, ProcessingReportData,
     ProcessingStatistics, PublicationType, ReportError, ResolutionState, ResolutionSummary,
@@ -290,14 +289,7 @@ fn processing_outcome(value: Outcome) -> ProcessingOutcome {
 
 fn source_summary(source: &ProcessSource) -> Result<SourceSummary, ReportBuildError> {
     Ok(match source {
-        ProcessSource::Path {
-            input_kind,
-            repository,
-        } => SourceSummary::Path {
-            input_kind: match input_kind {
-                PathInputKind::File => InputKind::File,
-                PathInputKind::Directory => InputKind::Directory,
-            },
+        ProcessSource::Path { repository } => SourceSummary::Path {
             repository: repository
                 .as_ref()
                 .map(|repository| {

@@ -123,12 +123,10 @@ pub fn recapture_processing_source(
     mut acquired: AcquiredProcessingSource,
     cancellation: &AcquisitionCancellation,
 ) -> Result<AcquiredProcessingSource, ProcessingEngineError> {
-    let input_kind = acquired.publication_stage.input_kind;
     let limits = acquisition_capture_limits(runtime)?;
     let current = capture_owned_stage(
         &paths.stage(),
         &runtime.jobs.jobs_root,
-        input_kind,
         &limits,
         crate::processing::config::SymlinkPolicy::Preserve,
         cancellation,
@@ -267,7 +265,6 @@ impl ProcessingEngine {
                     let action_paths = prepare_action_paths(lease.paths())?;
                     let prover = OwnedStageManifestProver {
                         runtime: &self.runtime,
-                        input_kind: acquired.publication_stage.input_kind,
                         cancellation: &self.cancellation,
                     };
                     crate::processing::actions::executor::execute_actions(
@@ -628,7 +625,6 @@ impl ProcessingEngine {
         let trash = lease.paths().temporary().join("action-trash");
         let prover = OwnedStageManifestProver {
             runtime: &self.runtime,
-            input_kind: crate::processing::PathInputKind::Directory,
             cancellation: &self.cancellation,
         };
         match crate::processing::actions::executor::recover_actions(
@@ -1033,9 +1029,8 @@ pub async fn acquire_processing_source(
                 cancellation,
             })
             .map_err(map_local_error)?;
-            let repository = if result.input_kind == crate::processing::PathInputKind::Directory
-                && fs::symlink_metadata(paths.stage().join(".git"))
-                    .is_ok_and(|metadata| metadata.is_dir())
+            let repository = if fs::symlink_metadata(paths.stage().join(".git"))
+                .is_ok_and(|metadata| metadata.is_dir())
             {
                 let runner = git_runner(runtime)?;
                 let request = git_enumeration_request(runtime, None);
@@ -1055,10 +1050,9 @@ pub async fn acquire_processing_source(
             let source = repository
                 .as_ref()
                 .map_or_else(
-                    || Ok(ProcessSource::path(result.input_kind)),
+                    || Ok(ProcessSource::path()),
                     |repository| {
                         ProcessSource::path_repository(
-                            result.input_kind,
                             repository.repository_identity,
                             repository.resolved_head.clone(),
                             runtime.source_scope.history,
@@ -1236,7 +1230,6 @@ fn prepare_action_paths(paths: &JobPaths) -> Result<ActionPaths, ProcessingEngin
 
 struct OwnedStageManifestProver<'a> {
     runtime: &'a CompiledProcessingRuntime,
-    input_kind: crate::processing::PathInputKind,
     cancellation: &'a AcquisitionCancellation,
 }
 
@@ -1250,7 +1243,6 @@ impl crate::processing::actions::executor::StageManifestProver for OwnedStageMan
         capture_owned_stage(
             stage_root,
             &self.runtime.jobs.jobs_root,
-            self.input_kind,
             &limits,
             crate::processing::config::SymlinkPolicy::Preserve,
             self.cancellation,

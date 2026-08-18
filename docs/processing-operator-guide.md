@@ -126,6 +126,17 @@ including `.git` and the actual matched evidence. Git acquisition credentials,
 unrelated environment values, and File Guardian control capabilities are not
 passed to command tools.
 
+The checked-in [schema-3 example](examples/processing-v3.toml) includes the
+complete strict `pi_classifier` analyzer shape: installed Pi and Bubblewrap
+versions, trusted instruction/extension/sidecar paths, isolated agent state,
+one explicitly mapped provider credential, closed triage vocabulary, phase
+execution, artifact selection, and every enforced resource limit. Replace its
+illustrative runtime paths, version, provider/model, and credential mapping with
+the administrator-installed values; do not add generic analyzer arguments. If
+the deployment does not use Pi, remove the `semantic-triage` pipeline stage,
+both profile `pi_adjudication` blocks, and the `pi-triage` analyzer as one
+closed configuration change.
+
 Start with advisory mode:
 
 ```toml
@@ -242,6 +253,12 @@ Use `overlap = "reject"` to skip an overlapping tick or `queue_one` to retain
 at most one pending run. The application that owns an upload inbox should still
 coordinate completed writes and decide when to remove its source; File Guardian
 does not infer that application lifecycle.
+
+For each completed run, daemon writes one newline-terminated schema-2
+processing report to stdout in completion order. Durable reports are persisted
+byte-for-byte under `reports_root` by run ID; a run that fails before the job
+store is available emits only an `unavailable` stdout report. Logs use stderr.
+Failure to write a completed report terminates daemon with exit `30`.
 
 ## Live acceptance
 

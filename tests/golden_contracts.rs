@@ -29,9 +29,9 @@ enum Outcome {
 #[test]
 fn golden_reports_match_typed_domain_contracts_and_exit_invariants() {
     let reports = [
-        include_str!("../docs/examples/reports/allow.json"),
-        include_str!("../docs/examples/reports/deny.json"),
-        include_str!("../docs/examples/reports/error.json"),
+        include_str!("fixtures/legacy-reports/allow.json"),
+        include_str!("fixtures/legacy-reports/deny.json"),
+        include_str!("fixtures/legacy-reports/error.json"),
     ]
     .map(|source| serde_json::from_str::<GoldenReport>(source).expect("valid golden report"));
 
@@ -67,7 +67,7 @@ fn golden_reports_match_typed_domain_contracts_and_exit_invariants() {
     );
 
     let error: Value =
-        serde_json::from_str(include_str!("../docs/examples/reports/error.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/legacy-reports/error.json")).unwrap();
     assert_eq!(error["pipeline_runs"][0]["stages_completed"], 2);
     assert_eq!(error["pipeline_runs"][0]["analyzers_completed"], 3);
     let pi_coverage = error["coverage"]["initial"]["analyzers"]
@@ -82,9 +82,9 @@ fn golden_reports_match_typed_domain_contracts_and_exit_invariants() {
 #[test]
 fn golden_coverage_round_trips_as_the_exact_canonical_json_shape() {
     for source in [
-        include_str!("../docs/examples/reports/allow.json"),
-        include_str!("../docs/examples/reports/deny.json"),
-        include_str!("../docs/examples/reports/error.json"),
+        include_str!("fixtures/legacy-reports/allow.json"),
+        include_str!("fixtures/legacy-reports/deny.json"),
+        include_str!("fixtures/legacy-reports/error.json"),
     ] {
         let report: Value = serde_json::from_str(source).expect("valid golden report JSON");
         let expected = report.get("coverage").expect("golden coverage").clone();
@@ -100,9 +100,9 @@ fn golden_coverage_round_trips_as_the_exact_canonical_json_shape() {
 #[test]
 fn golden_reports_satisfy_the_full_machine_report_contract() {
     for source in [
-        include_str!("../docs/examples/reports/allow.json"),
-        include_str!("../docs/examples/reports/deny.json"),
-        include_str!("../docs/examples/reports/error.json"),
+        include_str!("fixtures/legacy-reports/allow.json"),
+        include_str!("fixtures/legacy-reports/deny.json"),
+        include_str!("fixtures/legacy-reports/error.json"),
     ] {
         let report: AuthorizationReport =
             serde_json::from_str(source).expect("valid authorization report");
@@ -117,7 +117,7 @@ fn golden_reports_satisfy_the_full_machine_report_contract() {
 #[test]
 fn decisions_reject_forged_empty_or_inconsistent_execution_coverage() {
     let allow: Value =
-        serde_json::from_str(include_str!("../docs/examples/reports/allow.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/legacy-reports/allow.json")).unwrap();
 
     let mut empty_coverage = allow.clone();
     empty_coverage["coverage"]["initial"]["analyzers"] = serde_json::json!([]);
@@ -136,12 +136,12 @@ fn decisions_reject_forged_empty_or_inconsistent_execution_coverage() {
 #[test]
 fn final_manifest_identity_is_strict_for_decisions_and_partial_for_errors() {
     let mut allow: Value =
-        serde_json::from_str(include_str!("../docs/examples/reports/allow.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/legacy-reports/allow.json")).unwrap();
     allow["input"]["final_manifest_identity"] = Value::Null;
     assert!(serde_json::from_value::<AuthorizationReport>(allow).is_err());
 
     let mut error: Value =
-        serde_json::from_str(include_str!("../docs/examples/reports/error.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/legacy-reports/error.json")).unwrap();
     assert!(serde_json::from_value::<AuthorizationReport>(error.clone()).is_ok());
     error["input"]["final_manifest_identity"] = Value::String(
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -152,7 +152,7 @@ fn final_manifest_identity_is_strict_for_decisions_and_partial_for_errors() {
 #[test]
 fn error_report_keeps_relative_artifacts_from_a_trustworthy_initial_capture() {
     let mut error: Value =
-        serde_json::from_str(include_str!("../docs/examples/reports/error.json")).unwrap();
+        serde_json::from_str(include_str!("fixtures/legacy-reports/error.json")).unwrap();
     error["artifacts"] = serde_json::json!([{
         "artifact_id": "a_initial",
         "subject_id": "subject_initial",
@@ -171,10 +171,9 @@ fn error_report_keeps_relative_artifacts_from_a_trustworthy_initial_capture() {
 
 #[test]
 fn checked_in_configuration_and_triage_examples_parse() {
-    let configuration: Config = toml::from_str(include_str!(
-        "../docs/examples/active-authorization-v2.toml"
-    ))
-    .expect("example follows the strict configuration schema");
+    let configuration: Config =
+        toml::from_str(include_str!("fixtures/legacy-authorization-v2.toml"))
+            .expect("example follows the strict configuration schema");
     configuration
         .validate()
         .expect("example satisfies cross-reference and path invariants");

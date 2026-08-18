@@ -19,8 +19,7 @@ use file_guardian::processing::config::{
 };
 use file_guardian::processing::domain::{
     ActionId, ActionJournalState, ActionKind, ActionRecord, Disposition, Finding, FindingId,
-    HandoffStatus as DomainHandoffStatus, Occurrence, OccurrenceId, Outcome, PathInputKind,
-    ProcessSource,
+    HandoffStatus as DomainHandoffStatus, Occurrence, OccurrenceId, Outcome, ProcessSource,
 };
 use file_guardian::processing::executor::{
     AnalyzerRunRecord, AnalyzerRunState, ProcessingArtifact, ProcessingArtifactCatalog,
@@ -420,7 +419,7 @@ fn try_build<'a>(
         analyzer_duration_ms: &phase.durations,
         duration_ms: 3,
     });
-    let source = ProcessSource::path(PathInputKind::Directory);
+    let source = ProcessSource::path();
     build_processing_report(ProcessingReportBuildInput {
         run_id: &runtime.run_id,
         request_id: Some("request-report"),
@@ -576,7 +575,7 @@ fn assembles_durable_error_and_rejects_unsafe_issue_identifiers() {
         component_id: None,
     }];
     let initial = phase(InspectionPhase::Initial, None);
-    let source = ProcessSource::path(PathInputKind::Directory);
+    let source = ProcessSource::path();
     let result = build_processing_report(ProcessingReportBuildInput {
         run_id: &runtime.run_id,
         request_id: None,

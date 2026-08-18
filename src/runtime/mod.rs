@@ -996,7 +996,7 @@ directive = "deny"
     #[test]
     fn invocation_view_quota_is_component_wise_maximum_for_selected_pi_analyzers() {
         let mut config: Config = toml::from_str(include_str!(
-            "../../docs/examples/active-authorization-v2.toml"
+            "../../tests/fixtures/legacy-authorization-v2.toml"
         ))
         .unwrap();
         let pi_index = config

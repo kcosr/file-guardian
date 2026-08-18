@@ -9,9 +9,9 @@
   "finished_at": "2026-08-17T12:00:01+00:00",
   "persistence": {
     "status": "durable",
-    "report_digest": "sha256:d940385de64645ac0c508ad4642b08cb7f91fb7b3310a10c159b722ccf615fcb"
+    "report_digest": "sha256:11cec3a3e307c0fd769b0b9f1bdcf832b87cf90abd277b72dfe3161b96ff1c2a"
   },
-  "source": {"kind": "path", "input_kind": "directory"},
+  "source": {"kind": "path", "repository": null},
   "acquisition": {
     "status": "complete",
     "implementation_id": "local-copy",

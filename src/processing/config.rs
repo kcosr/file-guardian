@@ -1729,7 +1729,7 @@ max_view_depth = 64
         let config = ProcessingConfigFile::parse(EXAMPLE).unwrap();
         assert_eq!(config.schema_version, "3");
         assert_eq!(config.processing.profiles.len(), 2);
-        assert_eq!(config.analyzers.len(), 2);
+        assert_eq!(config.analyzers.len(), 3);
         assert_eq!(config.daemon.jobs.len(), 2);
     }
 
@@ -1918,17 +1918,12 @@ required_text_include = ["**/*.rs"]
             .as_mut()
             .unwrap()
             .analyzer = "pi-triage".into();
-        config.analyzers.push(toml::from_str(PI_ANALYZER).unwrap());
-        assert!(config.validate().is_err());
-        config.pipelines[0].stages.push(PipelineStage {
-            id: "pi-review".into(),
-            analyzers: vec!["pi-triage".into()],
-            execution: StageExecution::Serial,
-            max_concurrency: 1,
-            prior_observations: PriorObservations::FindingsSummary,
-            prior_limits: PriorLimits::default(),
-        });
         assert!(config.validate().is_ok());
+
+        config.pipelines[0]
+            .stages
+            .retain(|stage| !stage.analyzers.iter().any(|id| id == "pi-triage"));
+        assert!(config.validate().is_err());
     }
 
     #[test]

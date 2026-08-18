@@ -20,7 +20,7 @@ use file_guardian::processing::external_backend::{
     ProcessingArtifactReadError, ProcessingArtifactReader,
 };
 use file_guardian::processing::{
-    GitBlobMode, GitBlobOccurrence, GitHistoryScope, GitObjectId, GitProvenance, PathInputKind,
+    GitBlobMode, GitBlobOccurrence, GitHistoryScope, GitObjectId, GitProvenance,
 };
 use tempfile::TempDir;
 
@@ -489,7 +489,6 @@ fn descriptor_recapture_produces_a_fresh_post_action_publication() {
     let recaptured = capture_owned_stage(
         &fixture.stage,
         &fixture.jobs,
-        PathInputKind::Directory,
         &acquisition_limits(),
         SymlinkPolicy::Reject,
         &AcquisitionCancellation::default(),

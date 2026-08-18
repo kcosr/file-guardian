@@ -1057,9 +1057,9 @@ impl PiProxyError {
     }
 
     fn is_fatal(&self) -> bool {
-        // The initial Pi contract is audit-only but required. Any failed tool
-        // operation invalidates its coverage; continuing would permit a model
-        // to ignore a denied read and submit a superficially complete result.
+        // Any failed tool operation invalidates trusted Pi's coverage;
+        // continuing would permit an incomplete review to submit a
+        // superficially complete result.
         !matches!(self, Self::Stopped)
     }
 }

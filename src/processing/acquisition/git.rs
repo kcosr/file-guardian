@@ -990,15 +990,9 @@ async fn acquire_remote_repository_inner(
     let repository = enumerate_local_repository(runner, stage, &local_request).await?;
     validate_frozen_remote_result(&repository, &advertisement, &selection, request)?;
     materialize_frozen_head(&repository, stage, symlinks == SymlinkPolicy::Preserve)?;
-    let working_tree = capture_owned_stage(
-        stage,
-        jobs_root,
-        crate::processing::PathInputKind::Directory,
-        capture_limits,
-        symlinks,
-        cancellation,
-    )
-    .map_err(|_| GitAcquisitionError::WorkingTreeCapture)?;
+    let working_tree =
+        capture_owned_stage(stage, jobs_root, capture_limits, symlinks, cancellation)
+            .map_err(|_| GitAcquisitionError::WorkingTreeCapture)?;
     let summary = acquisition_summary(
         Some(advertisement.transport),
         &repository,

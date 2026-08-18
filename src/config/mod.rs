@@ -2046,7 +2046,7 @@ path = "/srv/uploads"
 
     fn pi_example() -> Config {
         parse(include_str!(
-            "../../docs/examples/active-authorization-v2.toml"
+            "../../tests/fixtures/legacy-authorization-v2.toml"
         ))
         .unwrap()
     }
@@ -2124,7 +2124,7 @@ path = "/srv/uploads"
 
     #[test]
     fn sidecar_pi_contract_rejects_obsolete_grant_and_limits() {
-        let old_grant = include_str!("../../docs/examples/active-authorization-v2.toml")
+        let old_grant = include_str!("../../tests/fixtures/legacy-authorization-v2.toml")
             .replace("sandboxed-shell-v1", "native-readonly-v1");
         let config = parse(&old_grant).unwrap();
         assert!(config
@@ -2133,7 +2133,7 @@ path = "/srv/uploads"
             .to_string()
             .contains("requires tool_grant = 'sandboxed-shell-v1'"));
 
-        let old_search_limit = include_str!("../../docs/examples/active-authorization-v2.toml")
+        let old_search_limit = include_str!("../../tests/fixtures/legacy-authorization-v2.toml")
             .replace(
                 "max_search_calls = 100",
                 "max_search_calls = 100\nmax_search_query_bytes = 4096",
@@ -2141,7 +2141,7 @@ path = "/srv/uploads"
         assert!(parse(&old_search_limit).is_err());
 
         let host_wide_process_limit =
-            include_str!("../../docs/examples/active-authorization-v2.toml").replace(
+            include_str!("../../tests/fixtures/legacy-authorization-v2.toml").replace(
                 "max_open_files = 64",
                 "max_open_files = 64\nmax_processes = 4096",
             );

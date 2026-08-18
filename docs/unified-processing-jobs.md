@@ -205,9 +205,10 @@ store is available, operational failure attempts a durable report with
 `persistence.status = "durable"`. Only CLI shape/help failures return `2`
 without a processing report.
 
-`--request-id` is an optional correlation label matching
-`[A-Za-z0-9._:-]{1,128}`. It is not a path, credential, authorization token, or
-idempotency key; repeated request IDs create distinct runs.
+`--request-id` is an optional correlation label of 1–128 ASCII characters. It
+must start with a letter or digit; subsequent characters may be letters,
+digits, `.`, `_`, `:`, or `-`. It is not a path, credential, authorization
+token, or idempotency key; repeated request IDs create distinct runs.
 
 `RUN_ID` selects a job under the caller's operating-system access to the
 protected jobs root. It is a lookup identifier, not a bearer capability.
@@ -230,8 +231,7 @@ handoff mode.
 
 Handoff/recovery destinations must be absolute with an existing parent. File
 Guardian opens each parent component without following links, requires the
-terminal parent be owned by the configured service EUID (or one exact
-administrator-configured destination UID), and rejects group/world-writable
+terminal parent be owned by the service EUID, and rejects group/world-writable
 parents. The final basename must be absent. It holds the parent descriptor
 through temporary creation, verification, and rename. The same contract applies
 to artifact recovery; caller-selected destination contents are outside File
@@ -245,9 +245,8 @@ syntax. Mutating commands are idempotent by persisted operation ID. The caller
 never supplies that ID. File Guardian derives it from the command
 kind, run/quarantine identity, mode, and descriptor-resolved destination
 identity. `job inspect` returns mutable job status separately from the immutable
-processing report. `job recover` scans all stale jobs when no run ID is supplied and
-returns a bounded per-job result array; cancellation stops after the current
-descriptor-safe recovery step and reports which jobs remain untouched.
+processing report. `job recover` scans all stale jobs and returns a bounded
+per-job result array; fresh/non-stale jobs are reported as untouched.
 For handoff, the receipt is that single stdout object. The generated operation
 ID is durably recorded before copying/moving; repeating the exact command
 returns the identical receipt, while a different destination/mode against an
@@ -1214,11 +1213,11 @@ inserted, avoiding self-reference.
 
 `source` is exactly one variant:
 
-- path: `{kind:"path", input_kind:"file|directory", repository:null}` for an
-  ordinary copy, or the same shape with detected
+- path: `{kind:"path", repository:null}` for an ordinary directory copy, or
+  the same shape with detected
   `{repository_id,resolved_head,history,frozen_refs}`;
 - remote Git: `{kind:"git", transport:"https|ssh", repository_id,
-  resolved_head, history, frozen_refs:[...]}`.
+  resolved_head, working_tree, history, frozen_refs:[...]}`.
 
 Repository IDs are HMAC-SHA-256 tokens under the random job correlation key,
 not raw locator hashes. Frozen ref rows contain a bounded safe ref token,
@@ -1264,9 +1263,10 @@ adjudication binding and closed directive/reason.
 `pi_invocations` contains safe phase, configured/resolved model identity,
 prompt/tool/protocol identities, execution status, coverage, attestation,
 normalized output digest, and timestamps. `adjudications` contains finding ID,
-assessment, `not_requested|advisory|applied|rejected`, the authorizing policy
-binding, and a closed application/rejection reason. Neither contains model
-prose or provider request IDs.
+assessment, `not_requested|advisory|applied|rejected`, and a closed
+application/rejection reason. The corresponding resolution row cites the exact
+authorizing `adjudicate` policy binding. Neither contains model prose or
+provider request IDs.
 
 `actions` contains action ID, kind, initial subject/finding/binding IDs, planned
 and terminal journal state, and opaque artifact-quarantine ID. It never contains
@@ -1416,10 +1416,11 @@ identity.
 Strict validation covers the complete matrix of source kind, purpose, history
 mode, ref patterns, checkout ref, adapter scope, Pi phase execution, action
 authority, and completion disposition. Every profile requires a staged working
-tree; path sources require history none; report-only profiles prohibit
-available/retain handoff; reachable requires matching history patterns; other
-modes forbid them; and every selected history surface has at least one required
-capable analyzer.
+tree; report-only profiles prohibit available/retain handoff; reachable
+requires matching history patterns; other modes forbid them; and every selected
+history surface has at least one required capable analyzer. Applying a
+history-requiring profile to a path source succeeds only when the exact copied
+stage is a valid Git worktree; otherwise acquisition fails with exit `30`.
 
 ## Daemon behavior
 
@@ -1445,8 +1446,8 @@ path = "/srv/incoming/batch"
 ```
 
 The `path` variant may auto-detect Git after exact staging; the `git` variant
-permits `remote` plus optional `ref`. Fields belonging to another variant are
-rejected.
+permits `remote` plus optional `reference`. Fields belonging to another variant
+are rejected.
 Startup compiles every job/profile and preflights every required tool. Runs of
 the same job follow `overlap`: `reject` records a bounded daemon scheduling
 event and starts no processing run; `queue_one` retains at most one pending run
@@ -1459,6 +1460,14 @@ duplicate IDs are CLI/configuration errors and no daemon loop starts.
 same overlap rule. Acceptance covers startup preflight failure, exact selection,
 run-on-start, scheduled ticks under a fake clock, both overlap modes,
 cancellation, and per-run report/disposition behavior.
+
+Each completed daemon run writes exactly one newline-terminated schema-2
+processing report to stdout in completion order. A report whose
+`persistence.status` is `durable` is also persisted byte-for-byte under
+`reports_root` by run ID; a run that fails before the job store is available
+emits only an `unavailable` stdout report. Logs use stderr. If the daemon cannot
+write a completed run's report, it exits `30` rather than silently losing the
+result stream.
 
 ## Implementation phases and commit gates
 
@@ -1580,7 +1589,7 @@ selecting Linux-only Pi/sandbox behavior fails closed with a typed issue.
 
 ### Source and Git
 
-- Local file/directory, non-UTF-8 names, empty tree, binary/core file, every
+- Local directory, non-UTF-8 names, empty tree, binary/core file, every
   size/depth/count bound, source mutation during copy, unreadable directory,
   symlink, hardlink, FIFO/device, mount crossing, and source/jobs overlap.
 - HTTPS, `ssh://`, and SCP-like acquisition using a fake Git command fixture;

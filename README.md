@@ -191,8 +191,10 @@ authority fail before acquisition.
 Built-in rules detect; profile policy decides. External scanner findings are
 normalized by first-party adapters. Repository-provided `.gitleaks.toml`,
 `.gitleaksignore`, or tool binaries are untrusted scan inputs and never policy.
-Required analyzer assignment has explicit eligible, assigned, completed,
-excluded, and not-applicable coverage.
+Required analyzer assignment has explicit eligible, assigned, completed, and
+not-applicable coverage. Administrator-approved selector exclusions are bound
+into the compiled pipeline/report identity rather than counted as a coverage
+bucket.
 
 Pi receives normalized finding records, the real matched evidence and context,
 and complete read-only staged/history content access. Advisory Pi can annotate

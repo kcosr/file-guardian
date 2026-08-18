@@ -17,7 +17,6 @@ use file_guardian::processing::acquisition::local::{
     LocalAcquisitionError, LocalAcquisitionIssueCode, LocalAcquisitionRequest,
 };
 use file_guardian::processing::config::{CaptureLimits, SymlinkPolicy};
-use file_guardian::processing::domain::PathInputKind;
 use tempfile::TempDir;
 
 fn limits() -> CaptureLimits {
@@ -99,7 +98,6 @@ fn copies_a_literal_tree_with_normalized_publication_modes() {
         .acquire(&source, &limits(), SymlinkPolicy::Reject)
         .unwrap();
 
-    assert_eq!(result.input_kind, PathInputKind::Directory);
     assert_eq!(result.statistics.entries, 3);
     assert_eq!(result.statistics.files, 2);
     assert_eq!(
@@ -131,21 +129,15 @@ fn copies_a_literal_tree_with_normalized_publication_modes() {
 }
 
 #[test]
-fn copies_a_single_file_under_its_literal_basename() {
+fn rejects_a_single_file_source() {
     let fixture = Fixture::new();
     let source = fixture.source();
     fs::write(&source, [0_u8, 1, 2, 255]).unwrap();
 
-    let result = fixture
-        .acquire(&source, &limits(), SymlinkPolicy::Reject)
-        .unwrap();
-
-    assert_eq!(result.input_kind, PathInputKind::File);
-    assert_eq!(result.statistics.files, 1);
-    assert_eq!(
-        fs::read(fixture.stage.join("source")).unwrap(),
-        [0, 1, 2, 255]
-    );
+    assert!(matches!(
+        fixture.acquire(&source, &limits(), SymlinkPolicy::Reject),
+        Err(LocalAcquisitionError::SpecialFileRejected)
+    ));
 }
 
 #[test]
@@ -284,7 +276,8 @@ fn rejects_source_and_jobs_overlap_before_copying() {
 fn requires_a_fresh_owner_only_stage() {
     let nonempty = Fixture::new();
     let source = nonempty.source();
-    fs::write(&source, b"source").unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("source"), b"source").unwrap();
     fs::write(nonempty.stage.join("old"), b"old").unwrap();
     assert!(matches!(
         nonempty.acquire(&source, &limits(), SymlinkPolicy::Reject),
@@ -293,7 +286,8 @@ fn requires_a_fresh_owner_only_stage() {
 
     let exposed = Fixture::new();
     let source = exposed.source();
-    fs::write(&source, b"source").unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("source"), b"source").unwrap();
     fs::set_permissions(&exposed.stage, fs::Permissions::from_mode(0o755)).unwrap();
     assert!(matches!(
         exposed.acquire(&source, &limits(), SymlinkPolicy::Reject),
@@ -329,7 +323,8 @@ fn enforces_entry_file_byte_and_depth_limits() {
 
     let file = Fixture::new();
     let source = file.source();
-    fs::write(&source, b"12345").unwrap();
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("large"), b"12345").unwrap();
     let mut bounded = limits();
     bounded.max_file_bytes = 4;
     assert!(matches!(
@@ -378,10 +373,12 @@ fn cancellation_is_cooperative_and_fail_closed() {
 fn detects_a_file_mutated_while_it_is_copied() {
     let fixture = Fixture::new();
     let source = fixture.source();
-    fs::write(&source, vec![0_u8; 32 * 1024 * 1024]).unwrap();
+    fs::create_dir(&source).unwrap();
+    let mutable = source.join("mutable");
+    fs::write(&mutable, vec![0_u8; 32 * 1024 * 1024]).unwrap();
     let barrier = Arc::new(Barrier::new(2));
     let stop = Arc::new(AtomicBool::new(false));
-    let writer_source = source.clone();
+    let writer_source = mutable;
     let writer_barrier = Arc::clone(&barrier);
     let writer_stop = Arc::clone(&stop);
     let writer = std::thread::spawn(move || {
@@ -412,7 +409,6 @@ fn owned_stage_capture_enforces_symlink_policy_and_preserves_targets_exactly() {
         capture_owned_stage(
             &fixture.stage,
             &fixture.jobs,
-            PathInputKind::Directory,
             &limits(),
             SymlinkPolicy::Reject,
             &fixture.cancellation,
@@ -422,7 +418,6 @@ fn owned_stage_capture_enforces_symlink_policy_and_preserves_targets_exactly() {
     let captured = capture_owned_stage(
         &fixture.stage,
         &fixture.jobs,
-        PathInputKind::Directory,
         &limits(),
         SymlinkPolicy::Preserve,
         &fixture.cancellation,
@@ -435,7 +430,6 @@ fn owned_stage_capture_enforces_symlink_policy_and_preserves_targets_exactly() {
     let captured = capture_owned_stage(
         &fixture.stage,
         &fixture.jobs,
-        PathInputKind::Directory,
         &limits(),
         SymlinkPolicy::Preserve,
         &fixture.cancellation,
@@ -458,7 +452,6 @@ fn owned_stage_capture_enforces_limits() {
         capture_owned_stage(
             &fixture.stage,
             &fixture.jobs,
-            PathInputKind::Directory,
             &bounded,
             SymlinkPolicy::Reject,
             &fixture.cancellation,
@@ -471,7 +464,6 @@ fn owned_stage_capture_enforces_limits() {
         capture_owned_stage(
             &fixture.stage,
             &fixture.jobs,
-            PathInputKind::Directory,
             &bounded,
             SymlinkPolicy::Reject,
             &fixture.cancellation,
@@ -504,7 +496,6 @@ fn owned_stage_capture_detects_concurrent_file_mutation() {
     let result = capture_owned_stage(
         &fixture.stage,
         &fixture.jobs,
-        PathInputKind::Directory,
         &limits(),
         SymlinkPolicy::Reject,
         &fixture.cancellation,

@@ -292,7 +292,6 @@ fn require_current_publication(
     let recaptured = capture_owned_stage(
         input.stage,
         input.jobs_root,
-        input.acquisition.input_kind,
         &PublicationCaptureLimits {
             max_entries: limits.max_entries,
             max_files: limits.max_files,

@@ -149,13 +149,6 @@ pub struct PersistenceSummary {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum InputKind {
-    File,
-    Directory,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum GitTransport {
     Https,
     Ssh,
@@ -214,8 +207,7 @@ pub struct FrozenRefSummary {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SourceSummary {
     Path {
-        input_kind: InputKind,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "deserialize_required_option")]
         repository: Option<DetectedRepositorySummary>,
     },
     Git {
@@ -226,6 +218,14 @@ pub enum SourceSummary {
         history: HistoryScope,
         frozen_refs: Vec<FrozenRefSummary>,
     },
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

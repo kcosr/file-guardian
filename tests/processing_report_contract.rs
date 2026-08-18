@@ -42,7 +42,6 @@ fn rebuild(report: ProcessingReport) -> Result<ProcessingReport, ReportError> {
 fn detected_repository_source() -> SourceSummary {
     serde_json::from_value(json!({
         "kind": "path",
-        "input_kind": "directory",
         "repository": {
             "repository_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "resolved_head": {"algorithm": "sha1", "value": "2222222222222222222222222222222222222222"},
@@ -279,6 +278,13 @@ fn unknown_fields_and_noncanonical_arrays_are_rejected_at_every_boundary() {
     let mut nested: Value = serde_json::from_str(ALLOW).unwrap();
     nested["stage"]["content_digest"] = json!("sha256:deadbeef");
     assert!(serde_json::from_value::<ProcessingReport>(nested).is_err());
+
+    let mut missing_source_key: Value = serde_json::from_str(ALLOW).unwrap();
+    missing_source_key["source"]
+        .as_object_mut()
+        .unwrap()
+        .remove("repository");
+    assert!(serde_json::from_value::<ProcessingReport>(missing_source_key).is_err());
 
     let mut reordered = parse(ALLOW_MODIFIED);
     reordered.actions[0].finding_ids = vec![

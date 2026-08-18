@@ -67,6 +67,10 @@ deny = "discard"
 error = "quarantine"
 cancelled = "quarantine"
 
+[processing.profiles.pi_adjudication]
+analyzer = "pi-triage"
+mode = "advisory"
+
 [[processing.profiles.bindings]]
 id = "quarantine-unverified-credentials"
 priority = 100
@@ -100,6 +104,10 @@ deny = "discard"
 error = "quarantine"
 cancelled = "quarantine"
 
+[processing.profiles.pi_adjudication]
+analyzer = "pi-triage"
+mode = "advisory"
+
 [[processing.profiles.bindings]]
 id = "deny-verified-credentials"
 priority = 100
@@ -118,6 +126,17 @@ execution = "parallel"
 max_concurrency = 2
 analyzers = ["gitleaks", "trufflehog"]
 prior_observations = "none"
+
+[pipelines.stages.prior_limits]
+max_observations = 10000
+max_serialized_bytes = 1048576
+
+[[pipelines.stages]]
+id = "semantic-triage"
+execution = "serial"
+max_concurrency = 1
+analyzers = ["pi-triage"]
+prior_observations = "findings_summary"
 
 [pipelines.stages.prior_limits]
 max_observations = 10000
@@ -167,6 +186,70 @@ wall_timeout_secs = 180
 max_file_bytes = 10485760
 max_output_bytes = 33554432
 max_findings = 10000
+
+[[analyzers]]
+id = "pi-triage"
+kind = "pi_classifier"
+scope = "tree"
+
+[analyzers.pi]
+platform = "linux"
+sandbox = "tool-sidecar-bubblewrap-v1"
+network = "pi_host_sidecar_none"
+pi_executable = "/usr/local/bin/pi"
+bubblewrap_executable = "/usr/bin/bwrap"
+expected_bubblewrap_version = "0.11.1"
+expected_pi_version = "0.83.0"
+provider = "internal"
+model = "triage"
+thinking = "high"
+instruction_file = "/etc/file-guardian/pi-triage.md"
+trusted_extension = "/usr/libexec/file-guardian/pi-extension.js"
+tool_sidecar_runner = "/usr/libexec/file-guardian/pi-sidecar.js"
+isolated_agent_dir = "/etc/file-guardian/pi-agent"
+output_schema = "file-guardian-pi-triage/1"
+tool_grant = "sandboxed-shell-v1"
+
+[[analyzers.pi.credentials]]
+label = "internal"
+source_env = "FILE_GUARDIAN_PI_CREDENTIAL_INTERNAL"
+target_env = "INTERNAL_API_KEY"
+
+[analyzers.vocabulary]
+classifications = ["confirmed", "likely_true_positive", "likely_false_positive", "false_positive", "uncertain", "unable_to_assess"]
+confidences = ["low", "medium", "high"]
+reason_codes = ["documented_test_fixture", "example_placeholder"]
+
+[analyzers.execution]
+initial = "advisory"
+verification = "advisory"
+
+[analyzers.selection]
+include = ["**"]
+exclude = []
+artifact_kinds = ["physical_file", "repository_blob"]
+
+[analyzers.limits]
+startup_timeout_secs = 20
+idle_timeout_secs = 30
+wall_timeout_secs = 180
+termination_grace_secs = 5
+cpu_time_secs = 120
+max_open_files = 64
+max_stdout_bytes = 1048576
+max_stderr_bytes = 1048576
+max_output_bytes = 2097152
+max_findings = 1000
+max_tool_calls = 1000
+max_bytes_read = 268435456
+max_read_bytes_per_call = 1048576
+max_search_bytes_per_call = 67108864
+max_search_calls = 100
+max_search_results = 1000
+max_view_files = 100000
+max_view_entries = 200000
+max_view_bytes = 268435456
+max_view_depth = 64
 
 [[daemon.jobs]]
 id = "incoming-upload"
