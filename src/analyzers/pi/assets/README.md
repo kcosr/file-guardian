@@ -18,6 +18,8 @@ The sidecar has no network, receives no provider credentials or proxy token,
 sees the exact staged review surface and configured runtime/tool roots read-only,
 and has a writable scratch directory that persists across tool calls. This is
 an accidental-write boundary, not a confidentiality boundary against Pi.
+The nested command sidecar masks Pi's `/agent` provider state and `/proxy`
+control socket; neither is part of the staged review surface or shell toolchain.
 
 `bash`, `read`, `grep`, `find`, and `ls` all execute inside that one sidecar.
 `bash` supplies a normal noninteractive shell over administrator-installed host

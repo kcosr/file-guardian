@@ -48,10 +48,18 @@ assert.equal(probe.status, 0, probe.stderr || "Bubblewrap probe failed");
 const temporary = await mkdtemp(join(tmpdir(), "file-guardian-bwrap-sidecar-"));
 const input = join(temporary, "input");
 const outside = join(temporary, "outside-sentinel");
-await mkdir(input, { mode: 0o700 });
+const agent = join(temporary, "agent");
+const proxy = join(temporary, "proxy");
+await Promise.all([
+	mkdir(input, { mode: 0o700 }),
+	mkdir(agent, { mode: 0o700 }),
+	mkdir(proxy, { mode: 0o700 }),
+]);
 await Promise.all([
 	writeFile(join(input, "artifact.txt"), "immutable\n", { mode: 0o400 }),
 	writeFile(outside, "outside sparse runtime\n", { mode: 0o600 }),
+	writeFile(join(agent, "provider-auth.json"), "synthetic provider state\n", { mode: 0o600 }),
+	writeFile(join(proxy, "control-token"), "synthetic control state\n", { mode: 0o600 }),
 ]);
 const gitInit = spawnSync("git", ["init", "-q", "-b", "main", input], { encoding: "utf8" });
 assert.equal(gitInit.status, 0, gitInit.stderr);
@@ -124,6 +132,16 @@ const argumentsList = [
 	"--ro-bind",
 	input,
 	"/input",
+	"--ro-bind",
+	agent,
+	"/agent",
+	"--ro-bind",
+	proxy,
+	"/proxy",
+	"--tmpfs",
+	"/agent",
+	"--tmpfs",
+	"/proxy",
 	"--tmpfs",
 	"/work",
 	"--tmpfs",
@@ -178,7 +196,8 @@ try {
 	assert.equal(read.result.text, "immutable");
 
 	const normalRuntime = await request("bash", {
-		command: "test -r /etc/passwd && test -x /usr/bin/env && test ! -e /outside-sentinel",
+		command:
+			"test -r /etc/passwd && test -x /usr/bin/env && test ! -e /outside-sentinel && test ! -e /agent/provider-auth.json && test ! -e /proxy/control-token",
 	});
 	assert.match(normalRuntime.result.text, /\[exit 0\]$/);
 

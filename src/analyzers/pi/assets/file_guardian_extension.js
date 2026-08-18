@@ -400,9 +400,16 @@ function sidecarArguments() {
 		"--unshare-pid",
 		"--die-with-parent",
 		"--new-session",
+		// This `/` is the already-sparse outer Pi namespace, not the host root.
+		// Mask Pi's provider state and the host proxy before exposing that normal
+		// runtime filesystem to model-requested command tools.
 		"--ro-bind",
 		"/",
 		"/",
+		"--tmpfs",
+		"/agent",
+		"--tmpfs",
+		"/proxy",
 		"--bind",
 		scratchRoot,
 		scratchRoot,

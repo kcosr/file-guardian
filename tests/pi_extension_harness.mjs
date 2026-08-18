@@ -119,6 +119,8 @@ const sidecarArgs = hooks.sidecarArguments();
 assert.ok(sidecarArgs.includes("--unshare-net"));
 assert.ok(sidecarArgs.includes("--ro-bind"));
 assert.ok(sidecarArgs.includes("/"));
+assert.ok(sidecarArgs.includes("/agent"));
+assert.ok(sidecarArgs.includes("/proxy"));
 assert.ok(sidecarArgs.includes(environment.FILE_GUARDIAN_PI_SCRATCH_ROOT));
 assert.ok(sidecarArgs.includes(environment.FILE_GUARDIAN_PI_TOOL_SIDECAR_RUNNER));
 

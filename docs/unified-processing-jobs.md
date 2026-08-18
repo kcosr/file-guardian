@@ -887,7 +887,8 @@ writable scratch directory. Unrelated host paths are not mounted merely for
 completeness. The sandbox prevents accidental host or stage modification; it
 does not conceal candidate passwords, the installed runtime, or shared
 libraries from Pi. The Pi host process retains model networking and its
-configured provider credentials.
+configured provider credentials. Model-requested command tools receive neither
+that credential-bearing Pi agent state nor the File Guardian proxy socket.
 
 Pi phase execution is explicit:
 

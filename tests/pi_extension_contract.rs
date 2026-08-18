@@ -142,6 +142,8 @@ fn trusted_extension_has_only_the_reviewed_runtime_capabilities() {
         "--die-with-parent",
         "--ro-bind",
         "--tmpfs",
+        "\"/agent\"",
+        "\"/proxy\"",
         "toolSidecarRunner",
         "FILE_GUARDIAN_INPUT_ROOT: inputView",
         "FILE_GUARDIAN_WORK_ROOT: scratchRoot",
@@ -156,6 +158,7 @@ fn trusted_extension_has_only_the_reviewed_runtime_capabilities() {
 
     assert!(!EXTENSION.contains("from \"node:fs"));
     assert!(!EXTENSION.contains("--share-net"));
+    assert!(EXTENSION.contains("already-sparse outer Pi namespace"));
     for required in [
         "from \"node:fs/promises\"",
         "const INPUT_ROOT = testRoots?.[0] ?? process.env.FILE_GUARDIAN_INPUT_ROOT",

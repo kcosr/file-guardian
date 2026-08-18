@@ -123,8 +123,8 @@ directories mounted read-only, and isolated writable agent state and scratch.
 Every model-visible shell command uses the same read-only stage and a
 networkless persistent sidecar. Pi is trusted to inspect candidate content,
 including `.git` and the actual matched evidence. Git acquisition credentials,
-unrelated environment values, and File Guardian control capabilities are not
-passed to command tools.
+unrelated environment values, Pi's provider-authentication state, and File
+Guardian control capabilities are not passed or mounted into command tools.
 
 The checked-in [schema-3 example](examples/processing-v3.toml) includes the
 complete strict `pi_classifier` analyzer shape: installed Pi and Bubblewrap
