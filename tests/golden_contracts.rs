@@ -170,7 +170,7 @@ fn error_report_keeps_relative_artifacts_from_a_trustworthy_initial_capture() {
 }
 
 #[test]
-fn checked_in_configuration_and_classifier_examples_parse() {
+fn checked_in_configuration_and_triage_examples_parse() {
     let configuration: Config = toml::from_str(include_str!(
         "../docs/examples/active-authorization-v2.toml"
     ))
@@ -178,10 +178,8 @@ fn checked_in_configuration_and_classifier_examples_parse() {
     configuration
         .validate()
         .expect("example satisfies cross-reference and path invariants");
-    let _: Value = serde_json::from_str(include_str!(
-        "../docs/examples/pi-classifier/restricted.json"
-    ))
-    .expect("valid classifier JSON");
+    let _: Value = serde_json::from_str(include_str!("../docs/examples/pi-triage/restricted.json"))
+        .expect("valid triage JSON");
 }
 
 #[test]

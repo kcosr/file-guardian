@@ -1,9 +1,10 @@
-//! Sandboxed Pi classification protocol and execution support.
+//! Sandboxed Pi prior-finding triage and attestation support.
 
 pub mod protocol;
 pub(crate) mod proxy;
 pub(crate) mod runner;
 pub(crate) mod sandbox;
+pub mod triage;
 
 use self::protocol::{ClassificationVocabulary, TerminalValidationLimits};
 use self::proxy::{
@@ -13,11 +14,14 @@ use self::runner::{PiInvocationSpec, PiRunError, PiRunLimits, PiRunSignals, PiRu
 #[cfg(test)]
 use self::sandbox::PI_RUNTIME_CONTEXT_MODE;
 use self::sandbox::{PiRuntimeSpec, PreparedPiRuntime};
+use self::triage::{
+    PiReviewScope, PiStageAttestation, PiTriageCoverage, PiTriageInvocationId, PiTriageLimits,
+    PiTriageRequest, PiTriageRequestContext, PiTriageResult, PiTriageVocabulary, PriorFinding,
+    PriorOccurrence,
+};
 use crate::analyzers::{
     assess_text_artifact, RequiredTextMatcher, TextApplicabilityError, TextArtifactDisposition,
 };
-#[cfg(test)]
-use crate::authorization::AnalyzerViewQuota;
 use crate::authorization::{
     AnalyzerView, AnalyzerViewBuilder, AnalyzerViewError, AnalyzerViewLimits, InvocationWorkspace,
 };
@@ -26,6 +30,9 @@ use crate::domain::{
     NormalizedObservation, RunId,
 };
 use crate::pipeline::{ArtifactAssignment, PriorObservationProjection};
+use crate::processing::{
+    CorrelationId, CredentialVerificationState, FindingId, GitHistoryScope, OccurrenceId,
+};
 use std::ffi::OsString;
 #[cfg(test)]
 use std::future::Future;
@@ -34,7 +41,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::{oneshot, watch};
 
-const FIXED_TASK: &[u8] = b"Classify the assigned immutable artifacts under the trusted system instruction. Submit exactly one terminal classification.\n";
+const FIXED_TASK: &[u8] = b"Assess every finding in the bounded triage request against the assigned immutable artifacts. Submit exactly one candidate-free terminal triage response.\n";
 
 struct ProxySignalBridge {
     signals: Option<PiRunSignals>,
@@ -127,7 +134,6 @@ type FakePiFuture = Pin<Box<dyn Future<Output = Result<(), PiRunError>> + Send>>
 #[derive(Clone)]
 struct FakePiInvocation {
     socket_path: std::path::PathBuf,
-    input_view: std::path::PathBuf,
     token: String,
     run_id: RunId,
     analyzer_id: AnalyzerId,
@@ -213,8 +219,42 @@ impl PiClassifierAnalyzer {
         workspace: Arc<InvocationWorkspace>,
         prior: Arc<PriorObservationProjection>,
     ) -> Result<PiClassifierResult, PiClassifierError> {
+        self.analyze_internal(manifest, assignments, workspace, Some(prior), None)
+            .await
+    }
+
+    pub(crate) async fn analyze_triage(
+        &self,
+        manifest: Arc<ArtifactManifest>,
+        assignments: Vec<ArtifactAssignment>,
+        workspace: Arc<InvocationWorkspace>,
+        request: Arc<PiTriageRequest>,
+    ) -> Result<PiClassifierResult, PiClassifierError> {
+        self.analyze_internal(manifest, assignments, workspace, None, Some(request))
+            .await
+    }
+
+    async fn analyze_internal(
+        &self,
+        manifest: Arc<ArtifactManifest>,
+        assignments: Vec<ArtifactAssignment>,
+        workspace: Arc<InvocationWorkspace>,
+        prior: Option<Arc<PriorObservationProjection>>,
+        supplied_request: Option<Arc<PiTriageRequest>>,
+    ) -> Result<PiClassifierResult, PiClassifierError> {
         let assigned =
             u64::try_from(assignments.len()).map_err(|_| PiClassifierError::PreparationTask)?;
+        let phase = supplied_request
+            .as_ref()
+            .map_or(InspectionPhase::Initial, |request| request.phase);
+        if supplied_request.as_ref().is_some_and(|request| {
+            request.run_id != self.run_id
+                || request.manifest_identity != manifest.identity
+                || request.assigned_artifact_count != assigned
+                || request.validate_identity().is_err()
+        }) {
+            return Err(PiClassifierError::InvalidAssignment);
+        }
         let manifest_for_preparation = Arc::clone(&manifest);
         let workspace_for_preparation = Arc::clone(&workspace);
         let required_text = self.required_text.clone();
@@ -270,7 +310,26 @@ impl PiClassifierAnalyzer {
             PreparedPiAssignments::AllNotApplicable { not_applicable } => {
                 return Ok(PiClassifierResult {
                     observations: Vec::new(),
-                    coverage: complete_coverage(self.id.clone(), assigned, 0, not_applicable),
+                    triage_result: PiTriageResult {
+                        assessments: Vec::new(),
+                        stage_attestation: PiStageAttestation::UnableToAssert,
+                        coverage: PiTriageCoverage {
+                            assigned_artifact_count: assigned,
+                            completed_artifact_count: 0,
+                            not_applicable_artifact_count: not_applicable,
+                            assigned_finding_count: supplied_request
+                                .as_ref()
+                                .map_or(0, |request| request.findings.len() as u64),
+                            assessed_finding_count: 0,
+                        },
+                    },
+                    coverage: complete_coverage(
+                        self.id.clone(),
+                        phase,
+                        assigned,
+                        0,
+                        not_applicable,
+                    ),
                 });
             }
             PreparedPiAssignments::Applicable {
@@ -281,6 +340,55 @@ impl PiClassifierAnalyzer {
         };
         let completed =
             u64::try_from(assignments.len()).map_err(|_| PiClassifierError::PreparationTask)?;
+        let triage_limits = PiTriageLimits::new(
+            self.terminal_limits.max_artifact_classifications,
+            1,
+            self.proxy_limits.max_response_bytes,
+            self.proxy_limits.max_terminal_bytes,
+            self.terminal_limits.max_reason_codes_per_classification,
+        )
+        .map_err(|_| PiClassifierError::PreparationTask)?;
+        let triage_request = if let Some(request) = supplied_request {
+            if request.run_id != self.run_id
+                || request.manifest_identity != manifest.identity
+                || request.assigned_artifact_count != assigned
+            {
+                return Err(PiClassifierError::InvalidAssignment);
+            }
+            request
+        } else {
+            let prior = prior.ok_or(PiClassifierError::InvalidAssignment)?;
+            let findings = prior_findings(&prior, InspectionPhase::Initial)?;
+            let invocation_digest =
+                Digest::sha256(format!("{}:{}:{}", self.run_id, self.id, manifest.identity));
+            let invocation_suffix = invocation_digest.to_string();
+            let invocation_id = PiTriageInvocationId::new(format!(
+                "pii_{}",
+                &invocation_suffix["sha256:".len().."sha256:".len() + 32]
+            ))
+            .map_err(|_| PiClassifierError::PreparationTask)?;
+            Arc::new(
+                PiTriageRequest::new(
+                    PiTriageRequestContext {
+                        run_id: self.run_id.clone(),
+                        invocation_id,
+                        phase: InspectionPhase::Initial,
+                        manifest_identity: manifest.identity,
+                        pipeline_identity: self.identity,
+                        policy_identity: self.identity,
+                        prompt_template_identity: Digest::sha256(self.instruction.as_bytes()),
+                        prior_observations_identity: prior.identity(),
+                        review_scope: PiReviewScope::new(true, GitHistoryScope::None)
+                            .map_err(|_| PiClassifierError::PreparationTask)?,
+                        assigned_artifact_count: assigned,
+                        prior_coverage: Vec::new(),
+                    },
+                    findings,
+                    triage_limits,
+                )
+                .map_err(|_| PiClassifierError::PreparationTask)?,
+            )
+        };
         let proxy = PiProxy::start(
             &workspace,
             PiProxyInput {
@@ -289,12 +397,11 @@ impl PiClassifierAnalyzer {
                 manifest: Arc::clone(&manifest),
                 assignments,
                 view: Arc::clone(&view),
-                prior_observations: prior,
+                triage_request,
                 instruction: Arc::clone(&self.instruction),
                 expected_runtime: self.expected_runtime.clone(),
-                vocabulary: Arc::clone(&self.vocabulary),
-                terminal_limits: self.terminal_limits,
-                phase: InspectionPhase::Initial,
+                vocabulary: Arc::new(PiTriageVocabulary::new(self.vocabulary.reason_codes())),
+                triage_limits,
                 limits: self.proxy_limits,
             },
         )?;
@@ -325,7 +432,6 @@ impl PiClassifierAnalyzer {
             PiRunnerBackend::Fake(fake) => {
                 fake(FakePiInvocation {
                     socket_path: proxy.endpoint().host_socket_path().to_path_buf(),
-                    input_view: view.host_path().to_path_buf(),
                     token: token.clone(),
                     run_id: self.run_id.clone(),
                     analyzer_id: self.id.clone(),
@@ -338,8 +444,15 @@ impl PiClassifierAnalyzer {
         let proxy_result = proxy.finish().await;
         match (run, proxy_result) {
             (Ok(()), Ok(outcome)) => Ok(PiClassifierResult {
-                observations: outcome.submission.into_observations(),
-                coverage: complete_coverage(self.id.clone(), assigned, completed, not_applicable),
+                observations: Vec::new(),
+                triage_result: outcome.submission,
+                coverage: complete_coverage(
+                    self.id.clone(),
+                    phase,
+                    assigned,
+                    completed,
+                    not_applicable,
+                ),
             }),
             (Ok(()), Err(error)) => Err(PiClassifierError::Proxy(error)),
             (Err(runner), Ok(_)) => Err(PiClassifierError::Runner(runner)),
@@ -366,18 +479,98 @@ enum PreparedPiAssignments {
 
 pub(crate) struct PiClassifierResult {
     pub observations: Vec<NormalizedObservation>,
+    pub triage_result: PiTriageResult,
     pub coverage: AnalyzerCoverage,
+}
+
+fn prior_findings(
+    prior: &PriorObservationProjection,
+    phase: InspectionPhase,
+) -> Result<Vec<PriorFinding>, PiClassifierError> {
+    #[derive(serde::Deserialize)]
+    struct Projection {
+        observations: Vec<Observation>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum Observation {
+        Finding {
+            id: crate::domain::ObservationId,
+            analyzer_id: AnalyzerId,
+            rule_id: crate::domain::RuleId,
+            artifact_id: crate::domain::ArtifactId,
+            category: crate::domain::FindingCategory,
+            severity: crate::domain::Severity,
+            location: Option<crate::domain::ValidatedLocation>,
+        },
+        Classification {},
+    }
+    let projection: Projection = serde_json::from_slice(prior.canonical_json())
+        .map_err(|_| PiClassifierError::PreparationTask)?;
+    projection
+        .observations
+        .into_iter()
+        .filter_map(|observation| match observation {
+            Observation::Finding {
+                id,
+                analyzer_id,
+                rule_id,
+                artifact_id,
+                category,
+                severity,
+                location,
+            } => Some((
+                id,
+                analyzer_id,
+                rule_id,
+                artifact_id,
+                category,
+                severity,
+                location,
+            )),
+            Observation::Classification {} => None,
+        })
+        .map(
+            |(id, analyzer_id, rule_id, artifact_id, category, severity, location)| {
+                let finding_id = FindingId::from_suffix(id.as_str())
+                    .map_err(|_| PiClassifierError::PreparationTask)?;
+                PriorFinding::new(
+                    finding_id,
+                    CorrelationId::from_suffix(id.as_str())
+                        .map_err(|_| PiClassifierError::PreparationTask)?,
+                    phase,
+                    analyzer_id.clone(),
+                    rule_id.clone(),
+                    artifact_id,
+                    category,
+                    severity,
+                    location,
+                    None,
+                    vec![PriorOccurrence {
+                        occurrence_id: OccurrenceId::from_suffix(id.as_str())
+                            .map_err(|_| PiClassifierError::PreparationTask)?,
+                        analyzer_id: analyzer_id.clone(),
+                        rule_id: rule_id.clone(),
+                        verification_state: CredentialVerificationState::NotApplicable,
+                        evidence_token: None,
+                    }],
+                )
+                .map_err(|_| PiClassifierError::PreparationTask)
+            },
+        )
+        .collect()
 }
 
 fn complete_coverage(
     analyzer_id: AnalyzerId,
+    phase: InspectionPhase,
     assigned: u64,
     completed: u64,
     not_applicable: u64,
 ) -> AnalyzerCoverage {
     AnalyzerCoverage::new(
         analyzer_id,
-        InspectionPhase::Initial,
+        phase,
         assigned,
         assigned,
         completed,
@@ -437,18 +630,18 @@ pub(crate) enum PiClassifierError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authorization::{CaptureLimits, Snapshotter};
+    use crate::authorization::{AnalyzerViewQuota, CaptureLimits, Snapshotter};
     use crate::domain::{
-        ArtifactKind, ClassificationCode, ConfiguredConfidence, IssueCode, ReasonCode,
+        ArtifactKind, ConfiguredConfidence, FindingCategory, ReasonCode, Severity,
     };
-    use crate::pipeline::{
-        CompiledAnalyzer, CompiledPipeline, CompiledStage, EligibilitySelector, PipelineExecutor,
-        PriorObservationMode, ProjectionLimits, StageExecution, StageId,
+    use crate::pipeline::EligibilitySelector;
+    use crate::processing::{
+        CorrelationId, FindingId, OccurrenceId, PiFindingClassification, RecommendedAction,
     };
     use serde_json::{json, Value};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -457,7 +650,6 @@ mod tests {
     struct Fixture {
         _temporary: TempDir,
         input: std::path::PathBuf,
-        workspace_root: std::path::PathBuf,
         workspace: Arc<InvocationWorkspace>,
         manifest: Arc<ArtifactManifest>,
         run_id: RunId,
@@ -465,20 +657,14 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            Self::with_files(&[("artifact.txt", b"immutable sensitive fixture")])
-        }
-
-        fn with_files(files: &[(&str, &[u8])]) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let input = temporary.path().join("input");
             let root = temporary.path().join("workspaces");
             fs::create_dir(&input).unwrap();
             fs::create_dir(&root).unwrap();
             fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-            for (name, bytes) in files {
-                fs::write(input.join(name), bytes).unwrap();
-            }
-            let run_id = RunId::from_suffix("pi-e2e").unwrap();
+            fs::write(input.join("fixture.txt"), b"password = example-only").unwrap();
+            let run_id = RunId::from_suffix("pi-triage-e2e").unwrap();
             let workspace = Arc::new(InvocationWorkspace::create(&root, &run_id).unwrap());
             let manifest = Arc::new(
                 Snapshotter::new(&workspace, CaptureLimits::default())
@@ -489,22 +675,10 @@ mod tests {
             Self {
                 _temporary: temporary,
                 input,
-                workspace_root: root,
                 workspace,
                 manifest,
                 run_id,
             }
-        }
-
-        fn analyzer_views_are_empty(&self) -> bool {
-            fs::read_dir(
-                self.workspace_root
-                    .join(self.run_id.as_str())
-                    .join("analyzer-views"),
-            )
-            .unwrap()
-            .next()
-            .is_none()
         }
     }
 
@@ -512,25 +686,23 @@ mod tests {
         fixture: &Fixture,
         fake: impl Fn(FakePiInvocation) -> FakePiFuture + Send + Sync + 'static,
     ) -> PiClassifierAnalyzer {
-        let vocabulary = ClassificationVocabulary::new(
-            [
-                ClassificationCode::new("public").unwrap(),
-                ClassificationCode::new("uncertain").unwrap(),
-            ],
-            [ConfiguredConfidence::Low, ConfiguredConfidence::High],
-            [ReasonCode::new("policy_review").unwrap()],
-        )
-        .unwrap();
         PiClassifierAnalyzer {
-            id: AnalyzerId::new("pi-review").unwrap(),
+            id: AnalyzerId::new("pi-triage").unwrap(),
             run_id: fixture.run_id.clone(),
             runner: PiRunnerBackend::Fake(Arc::new(fake)),
-            instruction: Arc::from("Classify under the internal publication policy."),
-            vocabulary: Arc::new(vocabulary),
+            instruction: Arc::from("Assess every assigned finding under the trusted policy."),
+            vocabulary: Arc::new(
+                ClassificationVocabulary::new(
+                    [crate::domain::ClassificationCode::new("false_positive").unwrap()],
+                    [ConfiguredConfidence::High],
+                    [ReasonCode::new("documented_test_fixture").unwrap()],
+                )
+                .unwrap(),
+            ),
             expected_runtime: ExpectedPiRuntime {
                 pi_version: "0.83.0".to_string(),
                 provider: "internal".to_string(),
-                model: "classifier".to_string(),
+                model: "triage".to_string(),
                 thinking: "high".to_string(),
                 mode: PI_RUNTIME_CONTEXT_MODE.to_string(),
             },
@@ -576,30 +748,8 @@ mod tests {
                 },
             },
             credential_environment: Arc::new(Vec::new()),
-            identity: Digest::sha256(b"fake-pi-integration"),
+            identity: Digest::sha256(b"fake-pi-triage"),
         }
-    }
-
-    fn pipeline(analyzer: PiClassifierAnalyzer) -> CompiledPipeline {
-        CompiledPipeline::new(vec![CompiledStage::new(
-            StageId::new("classify").unwrap(),
-            StageExecution::Serial,
-            vec![CompiledAnalyzer::new(
-                AnalyzerId::new("pi-review").unwrap(),
-                true,
-                EligibilitySelector::compile(
-                    &["**".to_string()],
-                    &[],
-                    [ArtifactKind::PhysicalFile],
-                )
-                .unwrap(),
-                crate::pipeline::AnalyzerImplementation::Pi(Box::new(analyzer)),
-            )],
-            PriorObservationMode::AllNormalized,
-            ProjectionLimits::new(100, 64 * 1024).unwrap(),
-        )
-        .unwrap()])
-        .unwrap()
     }
 
     fn bound(invocation: &FakePiInvocation, request_id: u64, operation: Value) -> Value {
@@ -634,7 +784,7 @@ mod tests {
             "type": "runtime_ready",
             "pi_version": "0.83.0",
             "provider": "internal",
-            "model": "classifier",
+            "model": "triage",
             "thinking": "high",
             "mode": "print",
             "model_in_catalog": true,
@@ -642,154 +792,53 @@ mod tests {
         })
     }
 
-    async fn run_analyzer(
-        fixture: &Fixture,
-        analyzer: &PiClassifierAnalyzer,
-    ) -> Result<PiClassifierResult, PiClassifierError> {
-        let analyzer_id = AnalyzerId::new("pi-review").unwrap();
-        let assignments =
-            EligibilitySelector::compile(&["**".to_string()], &[], [ArtifactKind::PhysicalFile])
-                .unwrap()
-                .assign(&analyzer_id, &fixture.manifest)
-                .unwrap()
-                .assignments;
-        let prior = Arc::new(
-            PriorObservationProjection::build(
-                PriorObservationMode::AllNormalized,
-                &[],
-                ProjectionLimits::new(100, 64 * 1024).unwrap(),
+    #[tokio::test]
+    async fn fake_pi_reads_bound_request_and_submits_candidate_free_triage() {
+        let fixture = Fixture::new();
+        let artifact_id = fixture.manifest.artifacts()[0].id.clone();
+        let finding_id = FindingId::from_suffix("fixture").unwrap();
+        let request = Arc::new(
+            PiTriageRequest::new(
+                PiTriageRequestContext {
+                    run_id: fixture.run_id.clone(),
+                    invocation_id: PiTriageInvocationId::new("pii_fixture").unwrap(),
+                    phase: InspectionPhase::Initial,
+                    manifest_identity: fixture.manifest.identity,
+                    pipeline_identity: Digest::sha256(b"pipeline"),
+                    policy_identity: Digest::sha256(b"policy"),
+                    prompt_template_identity: Digest::sha256(b"prompt"),
+                    prior_observations_identity: Digest::sha256(b"prior"),
+                    review_scope: PiReviewScope::new(true, GitHistoryScope::None).unwrap(),
+                    assigned_artifact_count: 1,
+                    prior_coverage: Vec::new(),
+                },
+                vec![PriorFinding::new(
+                    finding_id.clone(),
+                    CorrelationId::from_suffix("fixture").unwrap(),
+                    InspectionPhase::Initial,
+                    AnalyzerId::new("gitleaks").unwrap(),
+                    crate::domain::RuleId::new("generic-password").unwrap(),
+                    artifact_id,
+                    FindingCategory::Credential,
+                    Severity::Medium,
+                    None,
+                    Some(Digest::sha256(b"opaque-hmac")),
+                    vec![PriorOccurrence {
+                        occurrence_id: OccurrenceId::from_suffix("fixture").unwrap(),
+                        analyzer_id: AnalyzerId::new("gitleaks").unwrap(),
+                        rule_id: crate::domain::RuleId::new("generic-password").unwrap(),
+                        verification_state: CredentialVerificationState::Unverified,
+                        evidence_token: Some(Digest::sha256(b"opaque-hmac")),
+                    }],
+                )
+                .unwrap()],
+                PiTriageLimits::new(10, 1, 128 * 1024, 128 * 1024, 10).unwrap(),
             )
             .unwrap(),
         );
-        analyzer
-            .analyze(
-                Arc::clone(&fixture.manifest),
-                assignments,
-                Arc::clone(&fixture.workspace),
-                prior,
-            )
-            .await
-    }
-
-    #[tokio::test]
-    async fn terminal_progress_close_does_not_fail_runner_activity_channel() {
-        let (progress_tx, progress_rx) = watch::channel(proxy::ProxyProgress::default());
-        let mut bridge = ProxySignalBridge::start(progress_rx);
-        let mut signals = bridge.take_signals();
-        progress_tx.send_replace(proxy::ProxyProgress {
-            authenticated_requests: 6,
-            runtime_ready: true,
-            terminal_submitted: true,
-        });
-        drop(progress_tx);
-
-        signals.runtime_ready.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while *signals.activity.borrow() != 6 {
-                signals.activity.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-        signals.activity.borrow_and_update();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), signals.activity.changed())
-                .await
-                .is_err(),
-            "the analyzer must keep activity open until the runner exits"
-        );
-        bridge.stop().await;
-        assert!(signals.activity.changed().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn fatal_proxy_progress_close_still_closes_runner_activity_channel() {
-        let (progress_tx, progress_rx) = watch::channel(proxy::ProxyProgress::default());
-        let mut bridge = ProxySignalBridge::start(progress_rx);
-        let mut signals = bridge.take_signals();
-        progress_tx.send_replace(proxy::ProxyProgress {
-            authenticated_requests: 1,
-            runtime_ready: true,
-            terminal_submitted: false,
-        });
-        drop(progress_tx);
-
-        signals.runtime_ready.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while *signals.activity.borrow() != 1 {
-                signals.activity.changed().await.unwrap();
-            }
-            signals.activity.borrow_and_update();
-            assert!(signals.activity.changed().await.is_err());
-        })
-        .await
-        .expect("fatal proxy closure must promptly stop runner activity");
-        bridge.stop().await;
-    }
-
-    #[tokio::test]
-    async fn runner_failure_remains_primary_when_proxy_has_no_terminal() {
-        let fixture = Fixture::new();
-        let analyzer = analyzer(&fixture, |invocation| {
-            Box::pin(async move {
-                let _ = exchange(
-                    &invocation.socket_path,
-                    bound(&invocation, 1, runtime_ready()),
-                )
-                .await;
-                Err(PiRunError::NonZeroExit)
-            })
-        });
-
-        assert!(matches!(
-            run_analyzer(&fixture, &analyzer).await,
-            Err(PiClassifierError::Runner(PiRunError::NonZeroExit))
-        ));
-    }
-
-    #[tokio::test]
-    async fn proxy_protocol_failure_remains_primary_when_runner_also_fails() {
-        let fixture = Fixture::new();
-        let analyzer = analyzer(&fixture, |invocation| {
-            Box::pin(async move {
-                let _ = exchange(
-                    &invocation.socket_path,
-                    bound(&invocation, 1, runtime_ready()),
-                )
-                .await;
-                let mut unauthorized =
-                    bound(&invocation, 2, json!({"type":"manifest_list","cursor":0}));
-                unauthorized["run_token"] = json!("wrong-token");
-                let response = exchange(&invocation.socket_path, unauthorized).await;
-                assert_eq!(response["status"], "error");
-                Err(PiRunError::RuntimeHandshake)
-            })
-        });
-
-        assert!(matches!(
-            run_analyzer(&fixture, &analyzer).await,
-            Err(PiClassifierError::Proxy(proxy::PiProxyError::Unauthorized))
-        ));
-    }
-
-    #[tokio::test]
-    async fn fake_pi_uses_real_proxy_and_completes_pipeline_without_mutation() {
-        let fixture = Fixture::with_files(&[
-            ("artifact.txt", b"immutable sensitive fixture"),
-            ("opaque.bin", b"opaque\0bytes"),
-        ]);
-        let artifact_id = fixture
-            .manifest
-            .artifacts()
-            .iter()
-            .find(|artifact| {
-                artifact.content_digest == Digest::sha256(b"immutable sensitive fixture")
-            })
-            .unwrap()
-            .id
-            .clone();
+        let expected_request = Arc::clone(&request);
         let analyzer = analyzer(&fixture, move |invocation| {
-            let artifact_id = artifact_id.clone();
+            let expected_request = Arc::clone(&expected_request);
             Box::pin(async move {
                 assert_eq!(
                     exchange(
@@ -799,312 +848,90 @@ mod tests {
                     .await["status"],
                     "ok"
                 );
-                assert_eq!(
-                    exchange(
-                        &invocation.socket_path,
-                        bound(&invocation, 2, json!({"type":"instruction"}))
-                    )
-                    .await["status"],
-                    "ok"
-                );
-                let manifest_list = exchange(
+                let response = exchange(
                     &invocation.socket_path,
-                    bound(&invocation, 3, json!({"type":"manifest_list","cursor":0})),
+                    bound(&invocation, 2, json!({"type":"triage_request"})),
                 )
                 .await;
-                assert_eq!(manifest_list["status"], "ok");
                 assert_eq!(
-                    manifest_list["result"]["schema"],
-                    "file-guardian-pi-manifest-page/1"
+                    response["result"]["request_identity"],
+                    json!(expected_request.request_identity)
                 );
                 assert_eq!(
-                    manifest_list["result"]["manifest_identity"],
-                    invocation.manifest_identity.to_string()
+                    response["result"]["findings"][0]["finding_id"],
+                    "fnd_fixture"
                 );
-                assert_eq!(manifest_list["result"]["cursor"], 0);
-                assert_eq!(manifest_list["result"]["total_count"], 1);
-                assert!(manifest_list["result"]["next_cursor"].is_null());
-                assert_eq!(
-                    manifest_list["result"]["entries"].as_array().unwrap().len(),
-                    1
-                );
-                let view_path = manifest_list["result"]["entries"][0]["view_path"]
-                    .as_str()
-                    .unwrap()
-                    .to_owned();
-                let bytes = tokio::fs::read(invocation.input_view.join(&view_path))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    exchange(
-                        &invocation.socket_path,
-                        bound(
-                            &invocation,
-                            4,
-                            json!({
-                                "type":"native_tool_begin",
-                                "tool_call_id":"read-1",
-                                "tool":"read",
-                                "path":view_path,
-                            })
-                        )
-                    )
-                    .await["status"],
-                    "ok"
-                );
-                assert_eq!(
-                    exchange(
-                        &invocation.socket_path,
-                        bound(
-                            &invocation,
-                            5,
-                            json!({
-                                "type":"native_tool_end",
-                                "tool_call_id":"read-1",
-                                "tool":"read",
-                                "path":view_path,
-                                "outcome":"completed",
-                                "error_code":null,
-                                "output_bytes":bytes.len(),
-                                "result_count":1,
-                            })
-                        )
-                    )
-                    .await["status"],
-                    "ok"
-                );
-                assert_eq!(
-                    exchange(
-                        &invocation.socket_path,
-                        bound(&invocation, 6, json!({"type":"prior_observations"}))
-                    )
-                    .await["status"],
-                    "ok"
-                );
+                assert!(response["result"].get("snippet").is_none());
                 let terminal = json!({
-                    "type":"submit_classification",
+                    "type":"submit_triage",
                     "payload": {
-                        "schema_version": protocol::OUTPUT_SCHEMA_VERSION,
+                        "schema_version": triage::TRIAGE_TERMINAL_SCHEMA,
+                        "invocation_id": expected_request.invocation_id,
+                        "phase": expected_request.phase,
+                        "manifest_identity": expected_request.manifest_identity,
+                        "request_identity": expected_request.request_identity,
+                        "prior_observations_identity": expected_request.prior_observations_identity,
                         "status":"complete",
-                        "manifest_identity":invocation.manifest_identity,
-                        "classification": {"code":"public","confidence":"high","reason_codes":["policy_review"],"subject_artifact_ids":[artifact_id]},
-                        "artifact_classifications":[],
-                        "coverage":{"assigned_artifact_count":1,"status":"complete"}
+                        "assessments":[{
+                            "finding_id":"fnd_fixture",
+                            "classification":"false_positive",
+                            "confidence":"high",
+                            "reason_codes":["documented_test_fixture"],
+                            "duplicate_of":null,
+                            "recommended_action":"none"
+                        }],
+                        "stage_attestation":"no_blocking_concerns_observed",
+                        "coverage":{
+                            "assigned_artifact_count":1,
+                            "completed_artifact_count":1,
+                            "not_applicable_artifact_count":0,
+                            "assigned_finding_count":1,
+                            "assessed_finding_count":1
+                        }
                     }
                 });
                 assert_eq!(
-                    exchange(&invocation.socket_path, bound(&invocation, 7, terminal)).await
+                    exchange(&invocation.socket_path, bound(&invocation, 3, terminal)).await
                         ["status"],
                     "ok"
                 );
                 Ok(())
             })
         });
-        let before_text = fs::read(fixture.input.join("artifact.txt")).unwrap();
-        let before_binary = fs::read(fixture.input.join("opaque.bin")).unwrap();
-        let result = PipelineExecutor::execute(
-            &pipeline(analyzer),
-            Arc::clone(&fixture.manifest),
-            Arc::clone(&fixture.workspace),
-        )
-        .await;
-        assert!(result.complete, "unexpected pipeline result: {result:?}");
-        assert_eq!(result.coverage[0].assigned, 2);
-        assert_eq!(result.coverage[0].completed, 1);
-        assert_eq!(result.coverage[0].not_applicable, 1);
-        assert_eq!(result.observations.len(), 1);
-        assert_eq!(
-            fs::read(fixture.input.join("artifact.txt")).unwrap(),
-            before_text
-        );
-        assert_eq!(
-            fs::read(fixture.input.join("opaque.bin")).unwrap(),
-            before_binary
-        );
-        assert!(fixture.analyzer_views_are_empty());
-    }
-
-    #[tokio::test]
-    async fn all_binary_assignments_skip_pi_and_are_complete_not_applicable() {
-        let fixture = Fixture::with_files(&[
-            ("first.bin", b"first\0opaque"),
-            ("second.bin", &[0xff, 0xfe, 0xfd]),
-        ]);
-        let invoked = Arc::new(AtomicBool::new(false));
-        let analyzer = analyzer(&fixture, {
-            let invoked = Arc::clone(&invoked);
-            move |_| -> FakePiFuture {
-                invoked.store(true, Ordering::SeqCst);
-                Box::pin(async { Ok(()) })
-            }
-        });
-        let before_first = fs::read(fixture.input.join("first.bin")).unwrap();
-        let before_second = fs::read(fixture.input.join("second.bin")).unwrap();
-
-        let result = PipelineExecutor::execute(
-            &pipeline(analyzer),
-            Arc::clone(&fixture.manifest),
-            Arc::clone(&fixture.workspace),
-        )
-        .await;
-
-        assert!(result.complete, "unexpected pipeline result: {result:?}");
-        assert!(!invoked.load(Ordering::SeqCst));
-        assert_eq!(result.coverage[0].assigned, 2);
-        assert_eq!(result.coverage[0].completed, 0);
-        assert_eq!(result.coverage[0].not_applicable, 2);
-        assert!(result.observations.is_empty());
-        assert_eq!(
-            fs::read(fixture.input.join("first.bin")).unwrap(),
-            before_first
-        );
-        assert_eq!(
-            fs::read(fixture.input.join("second.bin")).unwrap(),
-            before_second
-        );
-        assert!(fixture.analyzer_views_are_empty());
-    }
-
-    #[tokio::test]
-    async fn applicability_failures_are_typed_and_leave_exact_incomplete_coverage() {
-        let invoked = Arc::new(AtomicBool::new(false));
-        let fake = {
-            let invoked = Arc::clone(&invoked);
-            move |_| -> FakePiFuture {
-                invoked.store(true, Ordering::SeqCst);
-                Box::pin(async { Ok(()) })
-            }
-        };
-
-        let required_binary = Fixture::with_files(&[("required.txt", &[0xff, 0xfe])]);
-        let mut required_analyzer = analyzer(&required_binary, fake.clone());
-        required_analyzer.required_text =
-            RequiredTextMatcher::compile(&["**".to_string()]).unwrap();
-        let required_result = PipelineExecutor::execute(
-            &pipeline(required_analyzer),
-            Arc::clone(&required_binary.manifest),
-            Arc::clone(&required_binary.workspace),
-        )
-        .await;
-        assert_eq!(
-            required_result.issues[0].code,
-            IssueCode::InvalidAnalyzerOutput
-        );
-        assert!(!required_result.coverage[0].is_complete());
-        assert_eq!(required_result.coverage[0].not_applicable, 0);
-
-        let oversized = Fixture::with_files(&[("oversized.txt", b"five!")]);
-        let mut oversized_analyzer = analyzer(&oversized, fake.clone());
-        oversized_analyzer.max_text_bytes = 4;
-        let oversized_result = PipelineExecutor::execute(
-            &pipeline(oversized_analyzer),
-            Arc::clone(&oversized.manifest),
-            Arc::clone(&oversized.workspace),
-        )
-        .await;
-        assert_eq!(
-            oversized_result.issues[0].code,
-            IssueCode::SizeLimitExceeded
-        );
-        assert!(!oversized_result.coverage[0].is_complete());
-        assert_eq!(oversized_result.coverage[0].not_applicable, 0);
-
-        let mismatched = Fixture::with_files(&[("changed.txt", b"before")]);
-        let artifact = &mismatched.manifest.artifacts()[0];
-        let object_path = mismatched
-            .workspace_root
-            .join(mismatched.run_id.as_str())
-            .join("objects")
-            .join(artifact.object_id.as_str());
-        fs::set_permissions(&object_path, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(&object_path, b"change").unwrap();
-        let mismatched_result = PipelineExecutor::execute(
-            &pipeline(analyzer(&mismatched, fake)),
-            Arc::clone(&mismatched.manifest),
-            Arc::clone(&mismatched.workspace),
-        )
-        .await;
-        assert_eq!(mismatched_result.issues[0].code, IssueCode::AnalyzerFailure);
-        assert!(!mismatched_result.coverage[0].is_complete());
-        assert_eq!(mismatched_result.coverage[0].not_applicable, 0);
-        assert!(!invoked.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn zero_exit_without_terminal_returns_prompt_incomplete_coverage() {
-        let fixture = Fixture::new();
-        let analyzer = analyzer(&fixture, |invocation| {
-            Box::pin(async move {
-                let _ = exchange(
-                    &invocation.socket_path,
-                    bound(&invocation, 1, runtime_ready()),
-                )
-                .await;
-                Ok(())
-            })
-        });
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            PipelineExecutor::execute(
-                &pipeline(analyzer),
+        let assignments =
+            EligibilitySelector::compile(&["**".to_string()], &[], [ArtifactKind::PhysicalFile])
+                .unwrap()
+                .assign(&AnalyzerId::new("pi-triage").unwrap(), &fixture.manifest)
+                .unwrap()
+                .assignments;
+        let before = fs::read(fixture.input.join("fixture.txt")).unwrap();
+        let result = analyzer
+            .analyze_triage(
                 Arc::clone(&fixture.manifest),
+                assignments,
                 Arc::clone(&fixture.workspace),
-            ),
-        )
-        .await
-        .expect("missing terminal must not hang");
-        assert!(!result.complete);
-        assert!(!result.coverage[0].is_complete());
+                request,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.triage_result.assessments.len(), 1);
+        assert_eq!(result.triage_result.assessments[0].finding_id, finding_id);
         assert_eq!(
-            result.issues[0].code,
-            crate::domain::IssueCode::RequiredAnalyzerProtocolFailure
+            result.triage_result.assessments[0]
+                .assessment
+                .classification,
+            PiFindingClassification::FalsePositive
         );
-    }
-
-    #[tokio::test]
-    async fn cancelling_pipeline_drops_in_flight_pi_future() {
-        struct DropSignal(Arc<AtomicBool>);
-        impl Drop for DropSignal {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let fixture = Fixture::new();
-        let dropped = Arc::new(AtomicBool::new(false));
-        let (started_tx, started_rx) = oneshot::channel();
-        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
-        let analyzer = analyzer(&fixture, {
-            let dropped = Arc::clone(&dropped);
-            move |_| {
-                let guard = DropSignal(Arc::clone(&dropped));
-                let started_tx = Arc::clone(&started_tx);
-                Box::pin(async move {
-                    let _guard = guard;
-                    if let Some(sender) = started_tx.lock().unwrap().take() {
-                        let _ = sender.send(());
-                    }
-                    std::future::pending::<()>().await;
-                    Ok(())
-                })
-            }
-        });
-        let manifest = Arc::clone(&fixture.manifest);
-        let workspace = Arc::clone(&fixture.workspace);
-        let pipeline = pipeline(analyzer);
-        let task =
-            tokio::spawn(
-                async move { PipelineExecutor::execute(&pipeline, manifest, workspace).await },
-            );
-        started_rx.await.unwrap();
-        task.abort();
-        let _ = task.await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !dropped.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled Pi future must be dropped promptly");
+        assert_eq!(
+            result.triage_result.assessments[0]
+                .assessment
+                .recommended_action,
+            RecommendedAction::None
+        );
+        assert_eq!(
+            result.triage_result.stage_attestation,
+            PiStageAttestation::NoBlockingConcernsObserved
+        );
+        assert_eq!(fs::read(fixture.input.join("fixture.txt")).unwrap(), before);
     }
 }

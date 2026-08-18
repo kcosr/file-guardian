@@ -607,6 +607,30 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    fn pid_contained_command(script: &Path) -> PiProcessCommand {
+        PiProcessCommand {
+            program: PathBuf::from("/usr/bin/bwrap"),
+            arguments: vec![
+                "--unshare-pid".into(),
+                "--die-with-parent".into(),
+                "--bind".into(),
+                "/".into(),
+                "/".into(),
+                "--dev-bind".into(),
+                "/dev".into(),
+                "/dev".into(),
+                "--chdir".into(),
+                script.parent().unwrap().as_os_str().to_owned(),
+                "--".into(),
+                script.as_os_str().to_owned(),
+            ],
+            environment: vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+            current_directory: script.parent().unwrap().to_owned(),
+            inherited_proxy_fd: 0,
+        }
+    }
+
     fn limits() -> PiRunLimits {
         PiRunLimits {
             startup_timeout: Duration::from_secs(2),
@@ -671,8 +695,9 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn proxy_directory_descriptor_is_inherited_across_exec() {
+    async fn proxy_directory_descriptor_is_inherited_through_bubblewrap() {
         let directory = tempfile::tempdir().unwrap();
         let _listener = UnixListener::bind(directory.path().join("proxy.sock")).unwrap();
         let directory_fd = std::fs::File::open(directory.path()).unwrap();
@@ -680,16 +705,12 @@ mod tests {
             script("read _; test -S \"/proc/self/fd/${PROXY_FD}/proxy.sock\" || exit 9");
         let (signals, ready, _activity) = signals();
         ready.send(()).unwrap();
-        let plan = PiProcessCommand {
-            program: path.clone(),
-            arguments: Vec::new(),
-            environment: vec![(
-                OsString::from("PROXY_FD"),
-                OsString::from(directory_fd.as_raw_fd().to_string()),
-            )],
-            current_directory: path.parent().unwrap().to_owned(),
-            inherited_proxy_fd: directory_fd.as_raw_fd(),
-        };
+        let mut plan = pid_contained_command(&path);
+        plan.environment.push((
+            OsString::from("PROXY_FD"),
+            OsString::from(directory_fd.as_raw_fd().to_string()),
+        ));
+        plan.inherited_proxy_fd = directory_fd.as_raw_fd();
         assert!(run_command(
             plan,
             b"classify\n".to_vec(),
@@ -818,16 +839,20 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn escaped_process_group_cannot_hold_drain_open_forever() {
+    async fn pid_namespace_destroys_setsid_descendant_after_success() {
         let dir = tempfile::tempdir().unwrap();
-        let escaped_pid_file = dir.path().join("escaped-pid");
+        let started = dir.path().join("started");
+        let survived = dir.path().join("survived");
         let path = dir.path().join("launcher");
         std::fs::write(
             &path,
             format!(
-                "#!/bin/sh\nread _\nsetsid sh -c 'echo $$ > {}; sleep 60' &\nexit 0\n",
-                escaped_pid_file.display()
+                "#!/bin/sh\nread _\nsetsid sh -c 'touch {}; sleep 0.2; touch {}' &\nwhile test ! -f {}; do :; done\nexit 0\n",
+                started.display(),
+                survived.display(),
+                started.display(),
             ),
         )
         .unwrap();
@@ -837,7 +862,7 @@ mod tests {
         let result = timeout(
             Duration::from_secs(2),
             run_command(
-                fake_command(&path),
+                pid_contained_command(&path),
                 b"classify\n".to_vec(),
                 limits(),
                 signals,
@@ -845,14 +870,104 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(result.unwrap(), Err(PiRunError::Supervision));
-        if let Ok(raw_pid) = std::fs::read_to_string(escaped_pid_file) {
-            if let Ok(raw_pid) = raw_pid.trim().parse::<i32>() {
-                if let Some(pid) = rustix::process::Pid::from_raw(raw_pid) {
-                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-                }
+        assert!(result.unwrap().is_ok());
+        assert!(started.exists(), "the escaped descendant must have started");
+        sleep(Duration::from_millis(400)).await;
+        assert!(
+            !survived.exists(),
+            "the escaped descendant survived successful Pi completion"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pid_namespace_destroys_setsid_descendant_after_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let survived = dir.path().join("survived");
+        let path = dir.path().join("launcher");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nread _\nsetsid sh -c 'touch {}; sleep 0.2; touch {}' &\nwhile test ! -f {}; do :; done\nwhile :; do :; done\n",
+                started.display(),
+                survived.display(),
+                started.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (signals, ready, _activity) = signals();
+        ready.send(()).unwrap();
+        let mut short = limits();
+        short.idle_timeout = Duration::from_millis(30);
+        assert_eq!(
+            run_command(
+                pid_contained_command(&path),
+                b"classify\n".to_vec(),
+                short,
+                signals,
+                never_cancel(),
+            )
+            .await,
+            Err(PiRunError::Timeout(PiTimeoutKind::Idle))
+        );
+        assert!(started.exists(), "the escaped descendant must have started");
+        sleep(Duration::from_millis(400)).await;
+        assert!(
+            !survived.exists(),
+            "the escaped descendant survived Pi timeout"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pid_namespace_destroys_setsid_descendant_after_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = dir.path().join("started");
+        let survived = dir.path().join("survived");
+        let path = dir.path().join("launcher");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nread _\nsetsid sh -c 'touch {}; sleep 0.2; touch {}' &\nwhile test ! -f {}; do :; done\nwhile :; do :; done\n",
+                started.display(),
+                survived.display(),
+                started.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (signals, ready, _activity) = signals();
+        ready.send(()).unwrap();
+        let (cancel, cancelled) = oneshot::channel();
+        let supervisor = tokio::spawn(run_command(
+            pid_contained_command(&path),
+            b"classify\n".to_vec(),
+            limits(),
+            signals,
+            cancelled,
+        ));
+        timeout(Duration::from_secs(1), async {
+            while !started.exists() {
+                tokio::task::yield_now().await;
             }
-        }
+        })
+        .await
+        .unwrap();
+        cancel.send(()).unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(1), supervisor)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(PiRunError::Supervision)
+        );
+        sleep(Duration::from_millis(400)).await;
+        assert!(
+            !survived.exists(),
+            "the escaped descendant survived Pi cancellation"
+        );
     }
 
     #[tokio::test]

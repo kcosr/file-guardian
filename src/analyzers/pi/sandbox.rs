@@ -16,7 +16,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 pub(crate) const PI_TOOLS: &str =
-    "bash,read,grep,find,ls,manifest_list,prior_observations,submit_classification";
+    "bash,read,grep,find,ls,manifest_list,triage_request,submit_triage";
 /// Pi's `--mode` controls serialized stdout, independently of the extension
 /// context mode selected by `--print`.
 pub(crate) const PI_CLI_OUTPUT_MODE: &str = "text";
@@ -78,7 +78,7 @@ struct RuntimeManifestEntry {
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(crate) enum PiSandboxError {
     #[cfg(not(target_os = "linux"))]
-    #[error("Pi classification is unsupported on this platform")]
+    #[error("Pi triage is unsupported on this platform")]
     UnsupportedPlatform,
     #[error("Pi runtime bundle failed immutable preflight")]
     InvalidRuntime,
@@ -304,8 +304,9 @@ pub(crate) fn compile_pi_process_command(
     environment.sort_by(|left, right| left.0.cmp(&right.0));
 
     let spec = &runtime.spec;
-    let mut arguments = vec![spec.runtime_root.join(&spec.pi_entrypoint).into_os_string()];
-    arguments.extend(os_args(&[
+    let launcher = spec.runtime_root.join(&spec.launcher);
+    let mut pi_arguments = vec![spec.runtime_root.join(&spec.pi_entrypoint).into_os_string()];
+    pi_arguments.extend(os_args(&[
         "--print",
         "--mode",
         PI_CLI_OUTPUT_MODE,
@@ -316,8 +317,8 @@ pub(crate) fn compile_pi_process_command(
         "--no-extensions",
         "--extension",
     ]));
-    arguments.push(spec.trusted_extension.as_os_str().to_owned());
-    arguments.extend(os_args(&[
+    pi_arguments.push(spec.trusted_extension.as_os_str().to_owned());
+    pi_arguments.extend(os_args(&[
         "--no-skills",
         "--no-prompt-templates",
         "--no-themes",
@@ -330,8 +331,31 @@ pub(crate) fn compile_pi_process_command(
         "--thinking",
         invocation.thinking,
     ]));
+    // Pi itself retains the host network and filesystem namespaces: provider
+    // requests and the ordinary runtime must behave exactly as they do for a
+    // regular process. The dedicated PID namespace is only a lifetime
+    // boundary. Bubblewrap remains PID 1/reaper in that namespace, so when the
+    // Pi command exits (or bwrap is killed), the kernel also destroys every
+    // descendant even if it called setsid(2) and escaped Pi's process group.
+    // Re-bind /dev after the root bind because bwrap's mount namespace is
+    // created with nodev; Pi must retain the same device access as its parent.
+    let mut arguments = os_args(&[
+        "--unshare-pid",
+        "--die-with-parent",
+        "--bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--chdir",
+    ]);
+    arguments.push(spec.isolated_agent_dir.as_os_str().to_owned());
+    arguments.push(OsString::from("--"));
+    arguments.push(launcher.into_os_string());
+    arguments.extend(pi_arguments);
     Ok(PiProcessCommand {
-        program: spec.runtime_root.join(&spec.launcher),
+        program: spec.bubblewrap_executable.clone(),
         arguments,
         environment,
         current_directory: spec.isolated_agent_dir.clone(),
@@ -1049,6 +1073,34 @@ mod tests {
             .trusted_extension
             .to_string_lossy()
             .into_owned();
+        let agent_dir = fixture
+            .spec
+            .isolated_agent_dir
+            .to_string_lossy()
+            .into_owned();
+        let launcher = fixture
+            .spec
+            .runtime_root
+            .join("bin/node")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            &args[..12],
+            &[
+                "--unshare-pid",
+                "--die-with-parent",
+                "--bind",
+                "/",
+                "/",
+                "--dev-bind",
+                "/dev",
+                "/dev",
+                "--chdir",
+                agent_dir.as_str(),
+                "--",
+                launcher.as_str(),
+            ]
+        );
         for required in [
             entrypoint.as_str(),
             "--print",
@@ -1071,13 +1123,20 @@ mod tests {
             );
         }
         assert!(!args.iter().any(|value| value == "--system-prompt"));
-        assert!(!args.iter().any(|value| value.starts_with("--unshare")));
+        assert!(args.iter().any(|value| value == "--unshare-pid"));
+        assert!(args.iter().any(|value| value == "--die-with-parent"));
+        assert!(!args.iter().any(|value| value == "--unshare-net"));
+        assert!(!args.iter().any(|value| value == "--unshare-all"));
         assert!(!args.iter().any(|value| value == "--ro-bind"));
+        assert!(args.windows(3).any(|values| values == ["--bind", "/", "/"]));
+        assert!(args
+            .windows(3)
+            .any(|values| values == ["--dev-bind", "/dev", "/dev"]));
         assert!(args
             .windows(2)
             .any(|values| values == ["--mode", PI_CLI_OUTPUT_MODE]));
         assert_eq!(PI_RUNTIME_CONTEXT_MODE, "print");
-        assert_eq!(command.program, fixture.spec.runtime_root.join("bin/node"));
+        assert_eq!(command.program, fixture.spec.bubblewrap_executable);
         assert_eq!(command.current_directory, fixture.spec.isolated_agent_dir);
         assert_eq!(command.inherited_proxy_fd, 7);
         let debug = format!("{command:?}");

@@ -322,6 +322,16 @@ discard cannot complete. It stays private, cannot be handed off, and requires
 operator recovery. `cancelled` is a durable internal/report reason whose public
 processing outcome and exit remain `error`/`30`.
 
+After an action transaction has committed a stage mutation, or recovery cannot
+prove that a possibly started mutation left or restored the stage unchanged,
+an error/cancelled job overrides its effective disposition to whole-job
+`quarantined`. The report and private decision retain the profile's configured
+`retain`/`discard` value and separately bind effective `quarantined`; recovery
+must execute that effective intent. This is the only configured/effective
+disposition mismatch. It never applies to allow/allow-modified/deny, never
+weakens configured quarantine, and still falls back to `retained_error` if the
+quarantine operation itself cannot complete.
+
 Each transition writes a canonical temporary state file, fsyncs it, renames it,
 and fsyncs the parent. Every mutating command holds the job lock. The job stores
 a process/boot nonce and heartbeat; recovery does not rely on PID reuse-prone
@@ -1253,7 +1263,10 @@ unavailable stage, outcome error, and one acquisition issue.
 null), `configured_disposition`, `effective_disposition`, `handoff_status`,
 `sealed`, `initial_manifest_identity`, `final_manifest_identity`,
 `current_manifest_identity`, and expiry/quarantine opaque IDs where applicable.
-It contains no stage path. Outcome and disposition are independent.
+These identities bind only the publication-stage tree and its publication-mode
+semantics. They do not include Git history. A history-only report-only job has
+`stage = null`, including for allow and deny, because it has no publication
+tree. It contains no stage path. Outcome and disposition are independent.
 
 Each non-null phase contains exactly:
 
@@ -1262,6 +1275,12 @@ phase, manifest_identity, source_scope_identity, pipeline_identity,
 artifacts[], analyzer_runs[], coverage[], occurrences[], findings[],
 correlations[], resolutions[], statistics
 ```
+
+`phase.manifest_identity` binds the complete immutable analysis snapshot: the
+working-tree catalog when selected plus every selected frozen Git history
+surface. It is deliberately independent of the publication-stage identities.
+For `working_tree + history` it therefore differs from the stage identity; for
+history-only processing it remains present while `stage` is null.
 
 Artifact rows contain opaque IDs, kind, raw-byte segment-encoded logical path,
 byte length, publication type/mode, and safe Git provenance; no raw content

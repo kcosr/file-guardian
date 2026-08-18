@@ -1,0 +1,41 @@
+{
+  "schema_version": "2",
+  "run_id": "run_modified",
+  "request_id": "upload-42",
+  "outcome": "allow_modified",
+  "exit_code": 10,
+  "modified": true,
+  "started_at": "2026-08-17T12:00:00+00:00",
+  "finished_at": "2026-08-17T12:00:02+00:00",
+  "persistence": {"status": "durable", "report_digest": "sha256:815ce372e995ac4136e531c95472fbcfa4561aadf75e26d42bc12faaa4b15376"},
+  "source": {"kind": "path", "input_kind": "directory"},
+  "acquisition": {"status": "complete", "implementation_id": "local-copy", "implementation_version": "1", "started_at": "2026-08-17T12:00:00+00:00", "finished_at": "2026-08-17T12:00:00+00:00", "duration_ms": 10, "source_identity": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "issue_codes": []},
+  "stage": {"reference": "run_modified", "configured_disposition": "retain", "effective_disposition": "retained", "handoff_status": "available", "sealed": true, "initial_manifest_identity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "final_manifest_identity": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "current_manifest_identity": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "expires_at": "2026-08-18T12:00:00+00:00", "quarantine_id": null},
+  "policy": {"profile_id": "upload", "policy_identity": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "pipeline_id": "publication", "pipeline_identity": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "effective_action_mode": "apply"},
+  "phases": {
+    "initial": {
+      "phase": "initial", "manifest_identity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "source_scope_identity": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "pipeline_identity": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "artifacts": [{"artifact_id": "artifact_bad", "subject_id": "subject_bad", "kind": "physical_file", "logical_path": {"segments": [{"encoding": "utf8", "value": "bad.txt"}]}, "byte_len": 12, "publication_type": "regular_file", "publication_mode": 420, "git": null}],
+      "analyzer_runs": [{"analyzer_id": "gitleaks", "adapter_id": "gitleaks", "executable_basename": "gitleaks", "version": "8.28.1", "executable_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "rules_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "required": true, "status": "complete", "duration_ms": 5}],
+      "coverage": [{"analyzer_id": "gitleaks", "eligible": 1, "assigned": 1, "completed": 1, "not_applicable": 0, "status": "complete"}],
+      "occurrences": [{"occurrence_id": "occurrence_1", "finding_id": "finding_1", "analyzer_id": "gitleaks", "rule_id": "generic-password", "artifact_id": "artifact_bad", "location": {"line": 1, "column": 1}, "verification_state": "unverified", "evidence_token": "sha256:3333333333333333333333333333333333333333333333333333333333333333"}],
+      "findings": [{"finding_id": "finding_1", "artifact_id": "artifact_bad", "category": "credential", "severity": "medium", "occurrence_ids": ["occurrence_1"]}],
+      "correlations": [{"correlation_id": "correlation_1", "finding_ids": ["finding_1"]}],
+      "resolutions": [{"finding_id": "finding_1", "binding_id": "delete-password", "directive": "delete", "state": "active", "reason_code": "policy_delete"}],
+      "statistics": {"artifacts": 1, "analyzer_runs": 1, "occurrences": 1, "findings": 1, "correlations": 1, "resolutions": 1, "duration_ms": 7}
+    },
+    "verification": {
+      "phase": "verification", "manifest_identity": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "source_scope_identity": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "pipeline_identity": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "artifacts": [],
+      "analyzer_runs": [{"analyzer_id": "gitleaks", "adapter_id": "gitleaks", "executable_basename": "gitleaks", "version": "8.28.1", "executable_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111", "rules_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222", "required": true, "status": "complete", "duration_ms": 4}],
+      "coverage": [{"analyzer_id": "gitleaks", "eligible": 0, "assigned": 0, "completed": 0, "not_applicable": 0, "status": "complete"}],
+      "occurrences": [], "findings": [], "correlations": [], "resolutions": [],
+      "statistics": {"artifacts": 0, "analyzer_runs": 1, "occurrences": 0, "findings": 0, "correlations": 0, "resolutions": 0, "duration_ms": 5}
+    }
+  },
+  "pi_invocations": [], "adjudications": [],
+  "actions": [{"action_id": "action_1", "kind": "delete", "subject_id": "subject_bad", "finding_ids": ["finding_1"], "binding_ids": ["delete-password"], "state": "committed", "artifact_quarantine_id": null}],
+  "issues": [], "degradations": [],
+  "statistics": {"initial_artifacts": 1, "verification_artifacts": 0, "total_findings": 1, "total_actions": 1, "duration_ms": 2000},
+  "omissions": {"details_omitted": false, "reason": null}
+}

@@ -1,14 +1,15 @@
+//! Authenticated host/extension wire protocol for Pi triage.
+
+use crate::analyzers::pi::triage::PiTriageTerminalSubmission;
 use crate::domain::{
-    AnalyzerId, ArtifactId, Classification, ClassificationCode, ClassificationScope,
-    ConfiguredConfidence, Digest, InspectionPhase, NormalizedObservation, ObservationId,
-    ReasonCode, RunId,
+    AnalyzerId, ClassificationCode, ConfiguredConfidence, Digest, ReasonCode, RunId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeSet;
 use thiserror::Error;
 
-pub const PROTOCOL_VERSION: &str = "file-guardian-pi-proxy/2";
-pub const OUTPUT_SCHEMA_VERSION: &str = "file-guardian-pi-classifier/1";
+pub const PROTOCOL_VERSION: &str = "file-guardian-pi-proxy/3";
+pub const OUTPUT_SCHEMA_VERSION: &str = "file-guardian-pi-triage/1";
 
 pub const REQUIRED_TOOLS: &[&str] = &[
     "bash",
@@ -17,8 +18,8 @@ pub const REQUIRED_TOOLS: &[&str] = &[
     "find",
     "ls",
     "manifest_list",
-    "prior_observations",
-    "submit_classification",
+    "triage_request",
+    "submit_triage",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -56,7 +57,7 @@ impl<'de> Deserialize<'de> for ProxyRequest {
                 "model_in_catalog",
                 "active_tools",
             ],
-            "instruction" | "prior_observations" => &[],
+            "instruction" | "triage_request" => &[],
             "manifest_list" => &["cursor"],
             "native_tool_begin" => &["tool_call_id", "tool", "path"],
             "native_tool_end" => &[
@@ -68,7 +69,7 @@ impl<'de> Deserialize<'de> for ProxyRequest {
                 "output_bytes",
                 "result_count",
             ],
-            "submit_classification" => &["payload"],
+            "submit_triage" => &["payload"],
             _ => return Err(serde::de::Error::custom("unknown proxy request type")),
         };
         const COMMON_FIELDS: &[&str] = &[
@@ -97,9 +98,8 @@ impl<'de> Deserialize<'de> for ProxyRequest {
             analyzer_id: AnalyzerId,
             manifest_identity: Digest,
         }
-        let common: Common = serde_json::from_value(value.clone()).map_err(|error| {
-            serde::de::Error::custom(format!("invalid proxy request envelope: {error}"))
-        })?;
+        let common: Common = serde_json::from_value(value.clone())
+            .map_err(|_| serde::de::Error::custom("invalid proxy request envelope"))?;
         let mut operation_object = serde_json::Map::new();
         operation_object.insert(
             "type".into(),
@@ -111,9 +111,7 @@ impl<'de> Deserialize<'de> for ProxyRequest {
             }
         }
         let operation = serde_json::from_value(serde_json::Value::Object(operation_object))
-            .map_err(|error| {
-                serde::de::Error::custom(format!("invalid proxy request operation: {error}"))
-            })?;
+            .map_err(|_| serde::de::Error::custom("invalid proxy request operation"))?;
         Ok(Self {
             protocol: common.protocol,
             run_token: common.run_token,
@@ -156,9 +154,9 @@ pub enum ProxyOperation {
         output_bytes: u64,
         result_count: u64,
     },
-    PriorObservations {},
-    SubmitClassification {
-        payload: TerminalSubmission,
+    TriageRequest {},
+    SubmitTriage {
+        payload: PiTriageTerminalSubmission,
     },
 }
 
@@ -219,48 +217,8 @@ pub enum ProxyErrorCode {
     InternalError,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TerminalSubmission {
-    pub schema_version: String,
-    pub status: SubmissionStatus,
-    pub manifest_identity: Digest,
-    pub classification: TreeClassification,
-    pub artifact_classifications: Vec<ArtifactClassification>,
-    pub coverage: SubmissionCoverage,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubmissionStatus {
-    Complete,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct TreeClassification {
-    pub code: ClassificationCode,
-    pub confidence: ConfiguredConfidence,
-    pub reason_codes: Vec<ReasonCode>,
-    pub subject_artifact_ids: Vec<ArtifactId>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ArtifactClassification {
-    pub artifact_id: ArtifactId,
-    pub code: ClassificationCode,
-    pub confidence: ConfiguredConfidence,
-    pub reason_codes: Vec<ReasonCode>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SubmissionCoverage {
-    pub assigned_artifact_count: u64,
-    pub status: SubmissionStatus,
-}
-
+/// Compile-time closed vocabulary retained by the analyzer configuration.
+/// Triage uses only its reason-code set; classifications are protocol-fixed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassificationVocabulary {
     classifications: BTreeSet<ClassificationCode>,
@@ -287,6 +245,10 @@ impl ClassificationVocabulary {
         }
         Ok(vocabulary)
     }
+
+    pub fn reason_codes(&self) -> impl Iterator<Item = ReasonCode> + '_ {
+        self.reason_codes.iter().cloned()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -295,6 +257,7 @@ pub enum VocabularyError {
     Empty,
 }
 
+/// Host-side list ceilings used to derive the triage terminal limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerminalValidationLimits {
     pub max_subject_artifact_ids: usize,
@@ -307,12 +270,12 @@ impl TerminalValidationLimits {
         max_subject_artifact_ids: usize,
         max_artifact_classifications: usize,
         max_reason_codes_per_classification: usize,
-    ) -> Result<Self, TerminalValidationError> {
+    ) -> Result<Self, TerminalLimitError> {
         if max_subject_artifact_ids == 0
             || max_artifact_classifications == 0
             || max_reason_codes_per_classification == 0
         {
-            return Err(TerminalValidationError::InvalidLimits);
+            return Err(TerminalLimitError);
         }
         Ok(Self {
             max_subject_artifact_ids,
@@ -322,604 +285,58 @@ impl TerminalValidationLimits {
     }
 }
 
-pub struct TerminalValidationContext<'a> {
-    pub manifest_identity: Digest,
-    pub assigned_artifact_ids: &'a [ArtifactId],
-    pub scope: ClassificationScope,
-    pub vocabulary: &'a ClassificationVocabulary,
-    pub limits: TerminalValidationLimits,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidatedSubmission {
-    observations: Vec<NormalizedObservation>,
-}
-
-impl ValidatedSubmission {
-    pub fn observations(&self) -> &[NormalizedObservation] {
-        &self.observations
-    }
-
-    pub fn into_observations(self) -> Vec<NormalizedObservation> {
-        self.observations
-    }
-}
-
-impl TerminalSubmission {
-    pub fn validate(
-        &self,
-        context: &TerminalValidationContext<'_>,
-        analyzer_id: &AnalyzerId,
-        phase: InspectionPhase,
-    ) -> Result<ValidatedSubmission, TerminalValidationError> {
-        if self.schema_version != OUTPUT_SCHEMA_VERSION {
-            return Err(TerminalValidationError::SchemaVersion);
-        }
-        if self.manifest_identity != context.manifest_identity {
-            return Err(TerminalValidationError::ManifestIdentity);
-        }
-        if context.scope != ClassificationScope::Tree {
-            return Err(TerminalValidationError::UnsupportedScope);
-        }
-
-        let assigned: BTreeSet<_> = context.assigned_artifact_ids.iter().cloned().collect();
-        if assigned.len() != context.assigned_artifact_ids.len() {
-            return Err(TerminalValidationError::HostAssignment);
-        }
-        let assigned_count =
-            u64::try_from(assigned.len()).map_err(|_| TerminalValidationError::AssignedCount)?;
-        if self.coverage.assigned_artifact_count != assigned_count {
-            return Err(TerminalValidationError::AssignedCount);
-        }
-        if self.classification.subject_artifact_ids.len() > context.limits.max_subject_artifact_ids
-            || self.artifact_classifications.len() > context.limits.max_artifact_classifications
-        {
-            return Err(TerminalValidationError::ListLimit);
-        }
-
-        validate_classification(
-            &self.classification.code,
-            self.classification.confidence,
-            &self.classification.reason_codes,
-            context,
-        )?;
-        validate_canonical_ids(
-            &self.classification.subject_artifact_ids,
-            &assigned,
-            TerminalValidationError::SubjectArtifacts,
-        )?;
-
-        if !self
-            .artifact_classifications
-            .windows(2)
-            .all(|pair| pair[0].artifact_id < pair[1].artifact_id)
-        {
-            return Err(TerminalValidationError::ArtifactClassifications);
-        }
-        for classification in &self.artifact_classifications {
-            if !assigned.contains(&classification.artifact_id) {
-                return Err(TerminalValidationError::UnassignedArtifact);
-            }
-            validate_classification(
-                &classification.code,
-                classification.confidence,
-                &classification.reason_codes,
-                context,
-            )?;
-        }
-
-        let phase_key = match phase {
-            InspectionPhase::Initial => "initial",
-            InspectionPhase::Verification => "verification",
-        };
-        let digest = Digest::sha256(analyzer_id.as_str()).to_string();
-        let analyzer_key = &digest["sha256:".len().."sha256:".len() + 16];
-        let mut observations = Vec::with_capacity(self.artifact_classifications.len() + 1);
-        observations.push(NormalizedObservation::Classification(Classification {
-            id: generated_observation_id(analyzer_key, phase_key, 1),
-            analyzer_id: analyzer_id.clone(),
-            code: self.classification.code.clone(),
-            scope: ClassificationScope::Tree,
-            subject_artifacts: self.classification.subject_artifact_ids.clone(),
-            confidence: Some(self.classification.confidence),
-            reason_codes: self.classification.reason_codes.clone(),
-        }));
-        observations.extend(self.artifact_classifications.iter().enumerate().map(
-            |(index, classification)| {
-                NormalizedObservation::Classification(Classification {
-                    id: generated_observation_id(analyzer_key, phase_key, index + 2),
-                    analyzer_id: analyzer_id.clone(),
-                    code: classification.code.clone(),
-                    scope: ClassificationScope::Artifact,
-                    subject_artifacts: vec![classification.artifact_id.clone()],
-                    confidence: Some(classification.confidence),
-                    reason_codes: classification.reason_codes.clone(),
-                })
-            },
-        ));
-        Ok(ValidatedSubmission { observations })
-    }
-}
-
-fn generated_observation_id(analyzer_key: &str, phase_key: &str, index: usize) -> ObservationId {
-    ObservationId::from_suffix(format!("pi-{analyzer_key}-{phase_key}-{index:08}"))
-        .expect("bounded canonical Pi observation identifier")
-}
-
-fn validate_classification(
-    code: &ClassificationCode,
-    confidence: ConfiguredConfidence,
-    reason_codes: &[ReasonCode],
-    context: &TerminalValidationContext<'_>,
-) -> Result<(), TerminalValidationError> {
-    if !context.vocabulary.classifications.contains(code) {
-        return Err(TerminalValidationError::ClassificationCode);
-    }
-    if !context.vocabulary.confidences.contains(&confidence) {
-        return Err(TerminalValidationError::Confidence);
-    }
-    if reason_codes.len() > context.limits.max_reason_codes_per_classification {
-        return Err(TerminalValidationError::ListLimit);
-    }
-    if !reason_codes.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err(TerminalValidationError::ReasonCodes);
-    }
-    if reason_codes
-        .iter()
-        .any(|reason| !context.vocabulary.reason_codes.contains(reason))
-    {
-        return Err(TerminalValidationError::ReasonCode);
-    }
-    Ok(())
-}
-
-fn validate_canonical_ids(
-    ids: &[ArtifactId],
-    assigned: &BTreeSet<ArtifactId>,
-    canonical_error: TerminalValidationError,
-) -> Result<(), TerminalValidationError> {
-    if !ids.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err(canonical_error);
-    }
-    if ids.iter().any(|id| !assigned.contains(id)) {
-        return Err(TerminalValidationError::UnassignedArtifact);
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum TerminalValidationError {
-    #[error("terminal validation limits must be greater than zero")]
-    InvalidLimits,
-    #[error("terminal schema version does not match the configured protocol")]
-    SchemaVersion,
-    #[error("terminal manifest identity does not match the immutable manifest")]
-    ManifestIdentity,
-    #[error("only tree-scope Pi classification is supported")]
-    UnsupportedScope,
-    #[error("host assignment contains duplicate artifact identifiers")]
-    HostAssignment,
-    #[error("terminal assigned artifact count does not match the host assignment")]
-    AssignedCount,
-    #[error("terminal output exceeds a configured list limit")]
-    ListLimit,
-    #[error("classification code is outside the configured vocabulary")]
-    ClassificationCode,
-    #[error("confidence is outside the configured vocabulary")]
-    Confidence,
-    #[error("reason code is outside the configured vocabulary")]
-    ReasonCode,
-    #[error("reason codes must be unique and in canonical order")]
-    ReasonCodes,
-    #[error("subject artifact identifiers must be unique and in canonical order")]
-    SubjectArtifacts,
-    #[error("artifact classifications must be unique and in canonical order")]
-    ArtifactClassifications,
-    #[error("terminal output refers to an unassigned artifact")]
-    UnassignedArtifact,
-}
+#[error("terminal validation limits must be greater than zero")]
+pub struct TerminalLimitError;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{json, Value};
+    use serde_json::json;
 
-    fn artifact(suffix: &str) -> ArtifactId {
-        ArtifactId::from_suffix(suffix).unwrap()
-    }
-
-    fn code(value: &str) -> ClassificationCode {
-        ClassificationCode::new(value).unwrap()
-    }
-
-    fn reason(value: &str) -> ReasonCode {
-        ReasonCode::new(value).unwrap()
-    }
-
-    fn vocabulary() -> ClassificationVocabulary {
-        ClassificationVocabulary::new(
-            [code("public"), code("sensitive"), code("uncertain")],
-            [
-                ConfiguredConfidence::Low,
-                ConfiguredConfidence::Medium,
-                ConfiguredConfidence::High,
-            ],
-            [
-                reason("internal_material"),
-                reason("no_sensitive_material"),
-                reason("review_required"),
-            ],
-        )
-        .unwrap()
-    }
-
-    fn limits() -> TerminalValidationLimits {
-        TerminalValidationLimits::new(8, 8, 8).unwrap()
-    }
-
-    fn manifest_identity() -> Digest {
-        Digest::sha256(b"manifest")
-    }
-
-    fn valid_json(classification: &str, confidence: &str, reason_code: &str) -> Value {
-        json!({
-            "schema_version": OUTPUT_SCHEMA_VERSION,
-            "status": "complete",
-            "manifest_identity": manifest_identity(),
-            "classification": {
-                "code": classification,
-                "confidence": confidence,
-                "reason_codes": [reason_code],
-                "subject_artifact_ids": ["a_01", "a_07"]
-            },
-            "artifact_classifications": [{
-                "artifact_id": "a_07",
-                "code": classification,
-                "confidence": confidence,
-                "reason_codes": [reason_code]
-            }],
-            "coverage": {
-                "assigned_artifact_count": 2,
-                "status": "complete"
-            }
-        })
-    }
-
-    fn parse(value: Value) -> TerminalSubmission {
-        serde_json::from_value(value).unwrap()
-    }
-
-    fn validate(
-        submission: &TerminalSubmission,
-    ) -> Result<ValidatedSubmission, TerminalValidationError> {
-        let assigned = [artifact("01"), artifact("07")];
-        let vocabulary = vocabulary();
-        submission.validate(
-            &TerminalValidationContext {
-                manifest_identity: manifest_identity(),
-                assigned_artifact_ids: &assigned,
-                scope: ClassificationScope::Tree,
-                vocabulary: &vocabulary,
-                limits: limits(),
-            },
-            &AnalyzerId::new("pi-review").unwrap(),
-            InspectionPhase::Initial,
-        )
-    }
-
-    #[test]
-    fn valid_public_sensitive_and_uncertain_outputs_normalize_deterministically() {
-        for (value, confidence, reason_code) in [
-            ("public", "high", "no_sensitive_material"),
-            ("sensitive", "high", "internal_material"),
-            ("uncertain", "low", "review_required"),
-        ] {
-            let accepted = validate(&parse(valid_json(value, confidence, reason_code))).unwrap();
-            assert_eq!(accepted.observations().len(), 2);
-            let NormalizedObservation::Classification(tree) = &accepted.observations()[0] else {
-                panic!("expected tree classification")
-            };
-            assert_eq!(tree.code, code(value));
-            assert_eq!(tree.scope, ClassificationScope::Tree);
-            assert_eq!(tree.subject_artifacts, [artifact("01"), artifact("07")]);
-            assert!(tree.id.as_str().contains("-initial-00000001"));
-            let NormalizedObservation::Classification(per_artifact) = &accepted.observations()[1]
-            else {
-                panic!("expected artifact classification")
-            };
-            assert_eq!(per_artifact.scope, ClassificationScope::Artifact);
-            assert_eq!(per_artifact.subject_artifacts, [artifact("07")]);
-            assert!(per_artifact.id.as_str().contains("-initial-00000002"));
-        }
-    }
-
-    #[test]
-    fn strict_deserialization_rejects_unknown_fields_at_every_object_level() {
-        for pointer in [
-            "",
-            "/classification",
-            "/artifact_classifications/0",
-            "/coverage",
-        ] {
-            let mut value = valid_json("sensitive", "high", "internal_material");
-            value
-                .pointer_mut(pointer)
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .insert("snippet".into(), json!("secret bytes"));
-            assert!(serde_json::from_value::<TerminalSubmission>(value).is_err());
-        }
-    }
-
-    #[test]
-    fn schema_manifest_and_coverage_are_host_bound() {
-        let mut wrong_schema = valid_json("public", "high", "no_sensitive_material");
-        wrong_schema["schema_version"] = json!("file-guardian-pi-classifier/2");
-        assert_eq!(
-            validate(&parse(wrong_schema)),
-            Err(TerminalValidationError::SchemaVersion)
-        );
-
-        let mut wrong_manifest = valid_json("public", "high", "no_sensitive_material");
-        wrong_manifest["manifest_identity"] = json!(Digest::sha256(b"other"));
-        assert_eq!(
-            validate(&parse(wrong_manifest)),
-            Err(TerminalValidationError::ManifestIdentity)
-        );
-
-        let mut wrong_count = valid_json("public", "high", "no_sensitive_material");
-        wrong_count["coverage"]["assigned_artifact_count"] = json!(1);
-        assert_eq!(
-            validate(&parse(wrong_count)),
-            Err(TerminalValidationError::AssignedCount)
-        );
-
-        let mut incomplete = valid_json("public", "high", "no_sensitive_material");
-        incomplete["status"] = json!("incomplete");
-        assert!(serde_json::from_value::<TerminalSubmission>(incomplete).is_err());
-        let mut incomplete_coverage = valid_json("public", "high", "no_sensitive_material");
-        incomplete_coverage["coverage"]["status"] = json!("incomplete");
-        assert!(serde_json::from_value::<TerminalSubmission>(incomplete_coverage).is_err());
-    }
-
-    #[test]
-    fn subject_ids_must_be_assigned_unique_and_canonical() {
-        for ids in [json!(["a_07", "a_01"]), json!(["a_01", "a_01"])] {
-            let mut value = valid_json("sensitive", "high", "internal_material");
-            value["classification"]["subject_artifact_ids"] = ids;
-            assert_eq!(
-                validate(&parse(value)),
-                Err(TerminalValidationError::SubjectArtifacts)
-            );
-        }
-        let mut unassigned = valid_json("sensitive", "high", "internal_material");
-        unassigned["classification"]["subject_artifact_ids"] = json!(["a_99"]);
-        assert_eq!(
-            validate(&parse(unassigned)),
-            Err(TerminalValidationError::UnassignedArtifact)
-        );
-    }
-
-    #[test]
-    fn artifact_classifications_must_be_assigned_unique_and_canonical() {
-        let mut duplicate = valid_json("sensitive", "high", "internal_material");
-        let row = duplicate["artifact_classifications"][0].clone();
-        duplicate["artifact_classifications"] = json!([row.clone(), row]);
-        assert_eq!(
-            validate(&parse(duplicate)),
-            Err(TerminalValidationError::ArtifactClassifications)
-        );
-
-        let mut unassigned = valid_json("sensitive", "high", "internal_material");
-        unassigned["artifact_classifications"][0]["artifact_id"] = json!("a_99");
-        assert_eq!(
-            validate(&parse(unassigned)),
-            Err(TerminalValidationError::UnassignedArtifact)
-        );
-    }
-
-    #[test]
-    fn every_semantic_value_must_be_in_the_closed_vocabulary() {
-        let mut unknown_code = valid_json("outside", "high", "internal_material");
-        assert_eq!(
-            validate(&parse(unknown_code.take())),
-            Err(TerminalValidationError::ClassificationCode)
-        );
-        let mut unknown_confidence = valid_json("sensitive", "high", "internal_material");
-        unknown_confidence["classification"]["confidence"] = json!("medium");
-        let restricted = ClassificationVocabulary::new(
-            [code("sensitive")],
-            [ConfiguredConfidence::High],
-            [reason("internal_material")],
-        )
-        .unwrap();
-        let assigned = [artifact("01"), artifact("07")];
-        assert_eq!(
-            parse(unknown_confidence).validate(
-                &TerminalValidationContext {
-                    manifest_identity: manifest_identity(),
-                    assigned_artifact_ids: &assigned,
-                    scope: ClassificationScope::Tree,
-                    vocabulary: &restricted,
-                    limits: limits(),
-                },
-                &AnalyzerId::new("pi-review").unwrap(),
-                InspectionPhase::Initial,
-            ),
-            Err(TerminalValidationError::Confidence)
-        );
-        let unknown_reason = valid_json("sensitive", "high", "outside_reason");
-        assert_eq!(
-            validate(&parse(unknown_reason)),
-            Err(TerminalValidationError::ReasonCode)
-        );
-    }
-
-    #[test]
-    fn duplicate_noncanonical_and_oversized_values_are_rejected() {
-        for reasons in [
-            json!(["review_required", "internal_material"]),
-            json!(["internal_material", "internal_material"]),
-        ] {
-            let mut value = valid_json("sensitive", "high", "internal_material");
-            value["classification"]["reason_codes"] = reasons;
-            assert_eq!(
-                validate(&parse(value)),
-                Err(TerminalValidationError::ReasonCodes)
-            );
-        }
-
-        let mut oversized_list = valid_json("sensitive", "high", "internal_material");
-        oversized_list["classification"]["subject_artifact_ids"] = json!(["a_01", "a_07"]);
-        let submission = parse(oversized_list);
-        let assigned = [artifact("01"), artifact("07")];
-        let vocabulary = vocabulary();
-        assert_eq!(
-            submission.validate(
-                &TerminalValidationContext {
-                    manifest_identity: manifest_identity(),
-                    assigned_artifact_ids: &assigned,
-                    scope: ClassificationScope::Tree,
-                    vocabulary: &vocabulary,
-                    limits: TerminalValidationLimits::new(1, 8, 8).unwrap(),
-                },
-                &AnalyzerId::new("pi-review").unwrap(),
-                InspectionPhase::Initial,
-            ),
-            Err(TerminalValidationError::ListLimit)
-        );
-
-        let mut oversized_string = valid_json("sensitive", "high", "internal_material");
-        oversized_string["classification"]["code"] = json!("x".repeat(129));
-        assert!(serde_json::from_value::<TerminalSubmission>(oversized_string).is_err());
-    }
-
-    #[test]
-    fn proxy_envelope_and_native_tool_operations_are_strict() {
-        let request = json!({
+    fn envelope(operation: serde_json::Value) -> serde_json::Value {
+        let mut value = json!({
             "protocol": PROTOCOL_VERSION,
-            "run_token": "opaque",
+            "run_token": "token",
             "request_id": 1,
-            "run_id": "run_01",
-            "analyzer_id": "pi-review",
-            "manifest_identity": manifest_identity(),
-            "type": "instruction"
+            "run_id": "run_one",
+            "analyzer_id": "pi-triage",
+            "manifest_identity": Digest::sha256(b"manifest"),
         });
-        assert!(serde_json::from_value::<ProxyRequest>(request.clone()).is_ok());
-        let mut with_unknown = request;
-        with_unknown["path"] = json!("/secret");
-        assert!(serde_json::from_value::<ProxyRequest>(with_unknown).is_err());
-        let begin = json!({
-            "protocol": PROTOCOL_VERSION,
-            "run_token": "opaque",
-            "request_id": 2,
-            "run_id": "run_01",
-            "analyzer_id": "pi-review",
-            "manifest_identity": manifest_identity(),
-            "type": "native_tool_begin",
-            "tool_call_id": "call_01",
-            "tool": "read",
-            "path": "src/lib.rs"
-        });
-        let parsed: ProxyRequest = serde_json::from_value(begin.clone()).unwrap();
-        assert!(matches!(
-            parsed.operation,
-            ProxyOperation::NativeToolBegin {
-                tool: NativeTool::Read,
-                ..
-            }
-        ));
-        let mut obsolete = begin;
-        obsolete["artifact_id"] = json!("a_01");
-        assert!(serde_json::from_value::<ProxyRequest>(obsolete).is_err());
-        let bash = json!({
-            "protocol": PROTOCOL_VERSION,
-            "run_token": "opaque",
-            "request_id": 3,
-            "run_id": "run_01",
-            "analyzer_id": "pi-review",
-            "manifest_identity": manifest_identity(),
-            "type": "native_tool_begin",
-            "tool_call_id": "call_02",
-            "tool": "bash",
-            "path": "."
-        });
-        assert!(matches!(
-            serde_json::from_value::<ProxyRequest>(bash)
-                .unwrap()
-                .operation,
-            ProxyOperation::NativeToolBegin {
-                tool: NativeTool::Bash,
-                ..
-            }
-        ));
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(operation.as_object().unwrap().clone());
+        value
+    }
 
-        let manifest = json!({
-            "protocol": PROTOCOL_VERSION,
-            "run_token": "opaque",
-            "request_id": 4,
-            "run_id": "run_01",
-            "analyzer_id": "pi-review",
-            "manifest_identity": manifest_identity(),
-            "type": "manifest_list",
-            "cursor": 0
-        });
-        assert!(matches!(
-            serde_json::from_value::<ProxyRequest>(manifest.clone())
-                .unwrap()
-                .operation,
-            ProxyOperation::ManifestList { cursor: 0 }
-        ));
-        let mut missing_cursor = manifest.clone();
-        missing_cursor.as_object_mut().unwrap().remove("cursor");
-        assert!(serde_json::from_value::<ProxyRequest>(missing_cursor).is_err());
-        let mut negative_cursor = manifest;
-        negative_cursor["cursor"] = json!(-1);
-        assert!(serde_json::from_value::<ProxyRequest>(negative_cursor).is_err());
+    #[test]
+    fn only_end_state_triage_operations_parse() {
+        assert!(serde_json::from_value::<ProxyRequest>(envelope(json!({
+            "type": "triage_request"
+        })))
+        .is_ok());
+        assert!(serde_json::from_value::<ProxyRequest>(envelope(json!({
+            "type": "prior_observations"
+        })))
+        .is_err());
+        assert!(serde_json::from_value::<ProxyRequest>(envelope(json!({
+            "type": "submit_classification",
+            "payload": {}
+        })))
+        .is_err());
+    }
 
-        let end = json!({
-            "protocol": PROTOCOL_VERSION,
-            "run_token": "opaque",
-            "request_id": 4,
-            "run_id": "run_01",
-            "analyzer_id": "pi-review",
-            "manifest_identity": manifest_identity(),
-            "type": "native_tool_end",
-            "tool_call_id": "call_01",
-            "tool": "read",
-            "path": "src/lib.rs",
-            "outcome": "recoverable_error",
-            "error_code": "invalid_arguments",
-            "output_bytes": 0,
-            "result_count": 0
-        });
-        assert!(matches!(
-            serde_json::from_value::<ProxyRequest>(end.clone())
-                .unwrap()
-                .operation,
-            ProxyOperation::NativeToolEnd {
-                outcome: NativeToolOutcome::RecoverableError,
-                error_code: Some(NativeToolErrorCode::InvalidArguments),
-                ..
-            }
-        ));
-        let mut obsolete_success = end;
-        obsolete_success["success"] = json!(false);
-        assert!(serde_json::from_value::<ProxyRequest>(obsolete_success).is_err());
-        assert_eq!(
-            REQUIRED_TOOLS,
-            [
-                "bash",
-                "read",
-                "grep",
-                "find",
-                "ls",
-                "manifest_list",
-                "prior_observations",
-                "submit_classification"
-            ]
-        );
-        assert!(!REQUIRED_TOOLS.contains(&"instruction"));
+    #[test]
+    fn envelope_and_operations_deny_unknown_fields() {
+        assert!(serde_json::from_value::<ProxyRequest>(envelope(json!({
+            "type": "triage_request",
+            "extra": true
+        })))
+        .is_err());
+        assert!(serde_json::from_value::<ProxyRequest>(envelope(json!({
+            "type": "manifest_list"
+        })))
+        .is_err());
     }
 }

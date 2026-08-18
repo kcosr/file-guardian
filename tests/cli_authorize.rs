@@ -1,72 +1,144 @@
 use std::path::PathBuf;
+use std::process::{Command, Output};
 
-use clap::Parser;
-use file_guardian::cli::{ActionMode, Args, AuthorizeArgs, Command, DaemonArgs};
+use file_guardian::processing::report::{ProcessingOutcome, ProcessingReport};
+
+fn binary() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_file-guardian"))
+}
+
+fn config() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/examples/processing-v3.toml")
+}
+
+fn report(output: &Output) -> ProcessingReport {
+    assert_eq!(output.stdout.last(), Some(&b'\n'));
+    assert_eq!(
+        output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+        1
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
 
 #[test]
-fn public_parser_exposes_explicit_authorize_contract() {
-    let args = Args::try_parse_from([
-        "file-guardian",
-        "authorize",
-        "--profile",
-        "publication",
-        "--request-id",
-        "upload-42",
-        "--action-mode",
-        "evaluate",
-        "/staging/upload-42",
-    ])
-    .unwrap();
+fn process_reports_schema_three_runtime_compilation_failure_without_private_inputs() {
+    let output = binary()
+        .arg("--config")
+        .arg(config())
+        .args([
+            "process",
+            "--request-id",
+            "upload-42",
+            "path",
+            "/private/source-that-must-not-be-reported",
+        ])
+        .output()
+        .unwrap();
 
+    assert_eq!(output.status.code(), Some(30));
+    assert!(output.stderr.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("source-that-must-not-be-reported"));
+    let report = report(&output);
+    assert_eq!(report.schema_version(), "2");
+    assert_eq!(report.outcome, ProcessingOutcome::Error);
+    assert_eq!(report.exit_code, 30);
+    assert_eq!(report.request_id.unwrap().as_str(), "upload-42");
     assert_eq!(
-        args.command,
-        Command::Authorize(AuthorizeArgs {
-            profile: Some("publication".to_string()),
-            request_id: Some("upload-42".to_string()),
-            action_mode: Some(ActionMode::Evaluate),
-            path: PathBuf::from("/staging/upload-42"),
-        })
+        report.issues[0].code.as_str(),
+        "runtime_compilation_failure"
     );
 }
 
 #[test]
-fn public_parser_exposes_explicit_daemon_contract() {
-    let args = Args::try_parse_from([
-        "file-guardian",
-        "--config",
-        "/etc/file-guardian/config.toml",
-        "daemon",
-        "--job",
-        "uploads",
-        "--job",
-        "scheduled-policy-scan",
-    ])
-    .unwrap();
+fn unavailable_administrative_operations_emit_one_versioned_result() {
+    let cases = [
+        (
+            vec!["artifact", "inspect", "run_artifact", "quarantine_1"],
+            "artifact_inspect",
+            Some("run_artifact"),
+        ),
+        (
+            vec![
+                "artifact",
+                "recover",
+                "run_artifact",
+                "quarantine_1",
+                "--destination",
+                "/recovered/item",
+            ],
+            "artifact_recover",
+            Some("run_artifact"),
+        ),
+        (
+            vec!["artifact", "discard", "run_artifact", "quarantine_1"],
+            "artifact_discard",
+            Some("run_artifact"),
+        ),
+    ];
 
-    assert_eq!(
-        args.command,
-        Command::Daemon(DaemonArgs {
-            jobs: vec!["uploads".to_string(), "scheduled-policy-scan".to_string()],
-        })
-    );
-}
-
-#[test]
-fn obsolete_implicit_modes_are_not_accepted() {
-    for invocation in [
-        vec!["file-guardian", "--once"],
-        vec!["file-guardian", "--dry-run"],
-        vec!["file-guardian", "/tmp/input"],
-    ] {
-        assert!(Args::try_parse_from(invocation).is_err());
+    for (arguments, operation, selected_run_id) in cases {
+        let output = binary()
+            .arg("--config")
+            .arg(config())
+            .args(&arguments)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(30), "{arguments:?}");
+        assert_eq!(
+            output.stdout.iter().filter(|byte| **byte == b'\n').count(),
+            1
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["schema_version"], "file-guardian-auxiliary-result/1");
+        assert_eq!(result["operation"], operation, "{arguments:?}");
+        assert_eq!(result["status"], "error", "{arguments:?}");
+        assert_eq!(result["issue_code"], "capability_unavailable");
+        if let Some(run_id) = selected_run_id {
+            assert_eq!(result["run_id"], run_id, "{arguments:?}");
+        } else {
+            assert!(result["run_id"].as_str().unwrap().starts_with("run_"));
+        }
     }
 }
 
 #[test]
-fn authorize_operand_cardinality_is_enforced_by_clap() {
-    assert!(Args::try_parse_from(["file-guardian", "authorize"]).is_err());
-    assert!(
-        Args::try_parse_from(["file-guardian", "authorize", "/tmp/input-a", "/tmp/input-b"])
-            .is_err()
+fn unsafe_auxiliary_operand_is_never_echoed() {
+    let unsafe_run_id = "../../private/customer";
+    let output = binary()
+        .arg("--config")
+        .arg(config())
+        .args(["stage", "discard", unsafe_run_id])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(30));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(unsafe_run_id));
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result["run_id"].as_str().unwrap().starts_with("run_"));
+}
+
+#[test]
+fn configuration_failure_is_a_typed_processing_report() {
+    let output = binary()
+        .args([
+            "--config",
+            "/definitely/missing/file-guardian.toml",
+            "process",
+            "path",
+            "/private/source",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(30));
+    assert_eq!(
+        report(&output).issues[0].code.as_str(),
+        "configuration_failure"
     );
+}
+
+#[test]
+fn obsolete_authorize_is_a_clap_error_without_machine_stdout() {
+    let output = binary().args(["authorize", "/tmp/input"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
 }

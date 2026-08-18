@@ -1,488 +1,704 @@
-use std::collections::BTreeSet;
-use std::future::Future;
+use std::env;
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use clap::Parser;
-use file_guardian::cli::{ActionMode, Args, AuthorizeArgs, Command, DaemonArgs};
-use file_guardian::config::{
-    ActionMode as ConfigActionMode, Config, DaemonJobConfig, DaemonJobKind, DaemonTarget,
+use file_guardian::cli::{
+    ActionMode, Args, ArtifactCommand, Command, JobCommand, ProcessArgs, ProcessSource,
+    StageCommand,
 };
-use file_guardian::domain::{IssueCode, RunId};
-use file_guardian::logging::LoggingSettings;
-use file_guardian::report::{AuthorizationOutcome, AuthorizationReport, ReportIdentifier};
-use file_guardian::runtime::{
-    compile_invocation, completed_run_internal_failure_report, report_from_result, secure_run_id,
-    startup_error_report, ReportContext,
+use file_guardian::domain::RunId;
+use file_guardian::processing::acquisition::local::AcquisitionCancellation;
+use file_guardian::processing::completion::{
+    discard_retained_stage, handoff_stage, inspect_job, recover_job,
+    HandoffMode as CompletionHandoffMode,
 };
-use file_guardian::service::AuthorizationService;
-use tokio::signal;
-use tokio::sync::{mpsc, watch};
+use file_guardian::processing::config::ProcessingConfigFile;
+use file_guardian::processing::engine::{ProcessingEngine, ProcessingEngineRequest};
+use file_guardian::processing::job::{
+    system_time_unix_millis, JobStore, JobStorePaths, LeaseIdentity,
+};
+use file_guardian::processing::report::{
+    IssueSummary, OmissionSummary, PersistenceStatus, PhasesSummary, ProcessingOutcome,
+    ProcessingReport, ProcessingReportData, ProcessingStatistics, Rfc3339Timestamp, SafeId,
+};
+use file_guardian::processing::runtime::{
+    compile_processing_runtime, ProcessingCompileRequest, ProcessingSourceRequest,
+    RequestedActionMode,
+};
+use file_guardian::runtime::secure_run_id;
+use serde::Serialize;
+
+const DEFAULT_CONFIG_PATH: &str = "/etc/file-guardian/config.toml";
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
-    match args.command {
-        Command::Authorize(authorize) => {
-            run_authorize_command(args.config.as_deref(), authorize).await
-        }
-        Command::Daemon(daemon) => run_daemon_command(args.config.as_deref(), daemon).await,
-    }
+    run(args).await
 }
 
-async fn run_authorize_command(config_path: Option<&Path>, args: AuthorizeArgs) -> ExitCode {
-    let run_id = match secure_run_id() {
+async fn run(args: Args) -> ExitCode {
+    // A syntactically valid command always receives an in-memory host identity
+    // before configuration is opened. Auxiliary commands may replace it with a
+    // caller-supplied, report-safe durable run ID, but unsafe operands are never
+    // reflected into machine output.
+    let generated_run_id = match secure_run_id() {
         Ok(run_id) => run_id,
-        Err(error) => {
-            eprintln!("failed to obtain secure randomness: {error}");
-            return emit_report(&startup_error_report(
-                fallback_report_id(),
-                request_id(&args),
-                IssueCode::InternalFailure,
-                "secure run identity could not be generated",
-            ));
-        }
+        Err(_) => match RunId::from_suffix("startup-error") {
+            Ok(run_id) => run_id,
+            Err(_) => return report_construction_failure(),
+        },
     };
-    let config = match Config::load_from_sources(config_path) {
+    let generated_safe_id = match SafeId::new(generated_run_id.as_str().to_owned()) {
+        Ok(run_id) => run_id,
+        Err(_) => return report_construction_failure(),
+    };
+    let run_id = command_run_id(&args.command)
+        .and_then(|value| RunId::new(value.to_owned()).ok())
+        .and_then(|value| SafeId::new(value.as_str().to_owned()).ok())
+        .unwrap_or(generated_safe_id);
+    let request_id = command_request_id(&args.command);
+
+    let config = match load_config(args.config.as_deref()) {
         Ok(config) => config,
-        Err(error) => {
-            eprintln!("failed to load authorization configuration: {error}");
-            return emit_report(&startup_error_report(
-                run_id,
-                request_id(&args),
-                IssueCode::ConfigurationFailure,
-                "authorization configuration could not be loaded",
-            ));
+        Err(()) => {
+            return match &args.command {
+                Command::Process(_) | Command::Daemon(_) => {
+                    emit_error_report(run_id, request_id, "configuration_failure")
+                }
+                _ => emit_auxiliary_error(&args.command, run_id, "configuration_failure"),
+            }
         }
     };
-    let _logging = match init_logging(&config) {
-        Ok(guards) => guards,
-        Err(error) => {
-            eprintln!("failed to initialize logging: {error}");
-            return emit_report(&startup_error_report(
-                run_id,
-                request_id(&args),
-                IssueCode::ConfigurationFailure,
-                "authorization logging could not be initialized",
-            ));
+
+    match args.command {
+        Command::Process(process) => {
+            run_process(&config, generated_run_id, run_id, request_id, process).await
+        }
+        Command::Stage(stage) => match stage.command {
+            StageCommand::Discard(arguments) => {
+                run_stage_discard(&config, run_id, &arguments.run_id)
+            }
+            StageCommand::Handoff(arguments) => run_stage_handoff(&config, run_id, arguments),
+        },
+        Command::Job(job) => match job.command {
+            JobCommand::Inspect(arguments) => run_job_inspect(&config, run_id, &arguments.run_id),
+            JobCommand::Recover => run_job_recover(&config, run_id),
+        },
+        Command::Artifact(artifact) => {
+            let operation = match artifact.command {
+                ArtifactCommand::Inspect(_) => "artifact_inspect",
+                ArtifactCommand::Recover(_) => "artifact_recover",
+                ArtifactCommand::Discard(_) => "artifact_discard",
+            };
+            emit_auxiliary_error_name(operation, run_id, "capability_unavailable")
+        }
+        Command::Daemon(_) => emit_error_report(run_id, None, "capability_unavailable"),
+    }
+}
+
+fn run_stage_handoff(
+    config: &ProcessingConfigFile,
+    report_run_id: SafeId,
+    arguments: file_guardian::cli::StageHandoffArgs,
+) -> ExitCode {
+    let Some(run_id) = parse_run_id(&arguments.run_id) else {
+        return emit_auxiliary_error_name("stage_handoff", report_run_id, "invalid_run_id");
+    };
+    let store = match open_job_store(config) {
+        Ok(store) => store,
+        Err(()) => {
+            return emit_auxiliary_error_name(
+                "stage_handoff",
+                report_run_id,
+                "job_store_unavailable",
+            )
         }
     };
-    match wait_for_authorization_or_shutdown(
-        authorize_with_config(&config, &args, run_id.clone()),
-        wait_for_shutdown_signal(),
-    )
-    .await
+    let mode = match arguments.mode {
+        file_guardian::cli::HandoffMode::Move => CompletionHandoffMode::Move,
+        file_guardian::cli::HandoffMode::Copy => CompletionHandoffMode::Copy,
+    };
+    match handoff_stage(
+        &store,
+        &run_id,
+        &arguments.destination,
+        mode,
+        &AcquisitionCancellation::default(),
+    ) {
+        Ok(receipt) => write_auxiliary(
+            &AuxiliaryResult::completed("stage_handoff", report_run_id, Some(receipt)),
+            0,
+        ),
+        Err(
+            file_guardian::processing::completion::CompletionError::HandoffUnavailable
+            | file_guardian::processing::completion::CompletionError::DestinationExists
+            | file_guardian::processing::completion::CompletionError::HandoffIntentMismatch
+            | file_guardian::processing::completion::CompletionError::CrossFilesystemMove,
+        ) => write_auxiliary(
+            &AuxiliaryResult::<serde_json::Value>::inapplicable(
+                "stage_handoff",
+                report_run_id,
+                "handoff_unavailable",
+            ),
+            20,
+        ),
+        Err(_) => emit_auxiliary_error_name("stage_handoff", report_run_id, "operation_failure"),
+    }
+}
+
+async fn run_process(
+    config: &ProcessingConfigFile,
+    domain_run_id: RunId,
+    report_run_id: SafeId,
+    request_id: Option<SafeId>,
+    arguments: ProcessArgs,
+) -> ExitCode {
+    let engine_request_id = arguments.request_id.clone();
+    let source = match arguments.source {
+        ProcessSource::Path(arguments) => ProcessingSourceRequest::Path {
+            path: arguments.path,
+        },
+        ProcessSource::Repo(arguments) => ProcessingSourceRequest::Repo {
+            path: arguments.path,
+            reference: arguments.checkout_ref,
+        },
+        ProcessSource::Git(arguments) => ProcessingSourceRequest::Git {
+            remote: arguments.remote,
+            reference: arguments.checkout_ref,
+        },
+    };
+    let action_mode = arguments.action_mode.map(|mode| match mode {
+        ActionMode::Evaluate => RequestedActionMode::Evaluate,
+        ActionMode::Apply => RequestedActionMode::Apply,
+    });
+    let request = ProcessingCompileRequest {
+        run_id: domain_run_id,
+        profile_id: arguments.profile,
+        action_mode,
+        source,
+    };
+    let runtime = match compile_processing_runtime(config, request) {
+        Ok(runtime) => Arc::new(runtime),
+        Err(_) => {
+            return emit_error_report(report_run_id, request_id, "runtime_compilation_failure")
+        }
+    };
+    let store = match JobStore::open(JobStorePaths {
+        jobs_root: runtime.jobs.jobs_root.clone(),
+        reports_root: runtime.jobs.reports_root.clone(),
+        quarantine_root: runtime.jobs.quarantine_root.clone(),
+    }) {
+        Ok(store) => Arc::new(store),
+        Err(_) => return emit_error_report(report_run_id, request_id, "job_store_unavailable"),
+    };
+    let lease_identity = match recovery_lease_identity() {
+        Ok(identity) => identity,
+        Err(()) => {
+            return emit_error_report(report_run_id, request_id, "processing_identity_failure")
+        }
+    };
+    let engine = match ProcessingEngine::new(
+        runtime,
+        store,
+        lease_identity,
+        AcquisitionCancellation::default(),
+    ) {
+        Ok(engine) => engine,
+        Err(_) => return emit_error_report(report_run_id, request_id, "engine_setup_failure"),
+    };
+    match engine
+        .process(ProcessingEngineRequest {
+            request_id: engine_request_id,
+        })
+        .await
     {
-        AuthorizationWait::Completed(Ok(report)) => emit_report(&report),
-        AuthorizationWait::Completed(Err((run_id, message))) => {
-            eprintln!("authorization could not start: {message}");
-            emit_report(&startup_error_report(
-                run_id,
-                request_id(&args),
-                IssueCode::ConfigurationFailure,
-                "authorization request could not be compiled",
-            ))
-        }
-        AuthorizationWait::Shutdown(Ok(())) => {
-            tracing::warn!("authorization interrupted by shutdown signal");
-            emit_report(&startup_error_report(
-                run_id,
-                request_id(&args),
-                IssueCode::InternalFailure,
-                "authorization was interrupted before completion",
-            ))
-        }
-        AuthorizationWait::Shutdown(Err(error)) => {
-            tracing::error!("failed to listen for authorization shutdown signal: {error}");
-            emit_report(&startup_error_report(
-                run_id,
-                request_id(&args),
-                IssueCode::InternalFailure,
-                "authorization shutdown handling failed",
-            ))
-        }
+        Ok(report) => write_report(&mut io::stdout().lock(), &report),
+        Err(_) => emit_error_report(report_run_id, request_id, "processing_execution_failure"),
     }
 }
 
-enum AuthorizationWait<T> {
-    Completed(T),
-    Shutdown(io::Result<()>),
-}
-
-async fn wait_for_authorization_or_shutdown<Authorization, Shutdown, T>(
-    authorization: Authorization,
-    shutdown: Shutdown,
-) -> AuthorizationWait<T>
-where
-    Authorization: Future<Output = T>,
-    Shutdown: Future<Output = io::Result<()>>,
-{
-    tokio::select! {
-        result = authorization => AuthorizationWait::Completed(result),
-        result = shutdown => AuthorizationWait::Shutdown(result),
+fn run_job_inspect(
+    config: &ProcessingConfigFile,
+    report_run_id: SafeId,
+    operand: &str,
+) -> ExitCode {
+    let Some(run_id) = parse_run_id(operand) else {
+        return emit_auxiliary_error_name("job_inspect", report_run_id, "invalid_run_id");
+    };
+    let store = match open_job_store(config) {
+        Ok(store) => store,
+        Err(()) => {
+            return emit_auxiliary_error_name("job_inspect", report_run_id, "job_store_unavailable")
+        }
+    };
+    match inspect_job(&store, &run_id) {
+        Ok(completion) => write_auxiliary(
+            &AuxiliaryResult::completed("job_inspect", report_run_id, Some(completion)),
+            0,
+        ),
+        Err(_) => emit_auxiliary_error_name("job_inspect", report_run_id, "status_unavailable"),
     }
 }
 
-async fn authorize_with_config(
-    config: &Config,
-    args: &AuthorizeArgs,
-    run_id: RunId,
-) -> Result<AuthorizationReport, (RunId, String)> {
-    let started = Instant::now();
-    let config = config.clone();
-    let profile = args.profile.clone();
-    let action_mode = args.action_mode;
-    let input = args.path.clone();
-    let compile_run_id = run_id.clone();
-    let compiled = tokio::task::spawn_blocking(move || {
-        compile_invocation(
-            &config,
-            profile.as_deref(),
-            action_mode.map(|mode| match mode {
-                ActionMode::Evaluate => ConfigActionMode::Evaluate,
-                ActionMode::Apply => ConfigActionMode::Apply,
-            }),
-            compile_run_id,
-            input,
+fn run_job_recover(config: &ProcessingConfigFile, report_run_id: SafeId) -> ExitCode {
+    let store = match open_job_store(config) {
+        Ok(store) => store,
+        Err(()) => {
+            return emit_auxiliary_error_name("job_recover", report_run_id, "job_store_unavailable")
+        }
+    };
+    let run_ids = match store.list_recoverable_run_ids() {
+        Ok(run_ids) => run_ids,
+        Err(_) => {
+            return emit_auxiliary_error_name("job_recover", report_run_id, "job_listing_failure")
+        }
+    };
+    let now = match system_time_unix_millis() {
+        Ok(now) => now,
+        Err(_) => return emit_auxiliary_error_name("job_recover", report_run_id, "clock_failure"),
+    };
+    let stale_after_millis = match config.processing.jobs.stale_after_secs.checked_mul(1_000) {
+        Some(value) => value,
+        None => {
+            return emit_auxiliary_error_name("job_recover", report_run_id, "configuration_failure")
+        }
+    };
+    let recovery_lease = match recovery_lease_identity() {
+        Ok(identity) => identity,
+        Err(()) => {
+            return emit_auxiliary_error_name(
+                "job_recover",
+                report_run_id,
+                "recovery_identity_failure",
+            )
+        }
+    };
+    let mut recovered = Vec::new();
+    let mut untouched = Vec::new();
+    let mut failed = Vec::new();
+    for run_id in run_ids {
+        match recover_job(
+            &store,
+            &run_id,
+            now,
+            stale_after_millis,
+            recovery_lease.clone(),
+        ) {
+            Ok(status) => recovered.push(status),
+            Err(file_guardian::processing::completion::CompletionError::JobNotStale) => {
+                if let Ok(id) = SafeId::new(run_id.as_str().to_owned()) {
+                    untouched.push(id);
+                }
+            }
+            Err(_) => {
+                if let Ok(id) = SafeId::new(run_id.as_str().to_owned()) {
+                    failed.push(JobRecoveryFailure {
+                        run_id: id,
+                        issue_code: "recovery_failed",
+                    });
+                }
+            }
+        }
+    }
+    let batch = JobRecoveryBatch {
+        recovered,
+        untouched,
+        failed,
+    };
+    if batch.failed.is_empty() {
+        write_auxiliary(
+            &AuxiliaryResult::completed("job_recover", report_run_id, Some(batch)),
+            0,
         )
+    } else {
+        write_auxiliary(
+            &AuxiliaryResult::error_with_result(
+                "job_recover",
+                report_run_id,
+                "partial_recovery_failure",
+                batch,
+            ),
+            30,
+        )
+    }
+}
+
+fn recovery_lease_identity() -> Result<LeaseIdentity, ()> {
+    let random = secure_run_id().map_err(|_| ())?;
+    let suffix = random.as_str().strip_prefix("run_").ok_or(())?;
+    let process_nonce = format!("recovery-{}-{suffix}", std::process::id());
+    let boot_nonce = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("boot-{suffix}"));
+    LeaseIdentity::new(process_nonce, boot_nonce).map_err(|_| ())
+}
+
+fn run_stage_discard(
+    config: &ProcessingConfigFile,
+    report_run_id: SafeId,
+    operand: &str,
+) -> ExitCode {
+    let Some(run_id) = parse_run_id(operand) else {
+        return emit_auxiliary_error_name("stage_discard", report_run_id, "invalid_run_id");
+    };
+    let store = match open_job_store(config) {
+        Ok(store) => store,
+        Err(()) => {
+            return emit_auxiliary_error_name(
+                "stage_discard",
+                report_run_id,
+                "job_store_unavailable",
+            )
+        }
+    };
+    match inspect_job(&store, &run_id) {
+        Ok(status)
+            if status.disposition == file_guardian::processing::domain::Disposition::Discarded =>
+        {
+            return write_auxiliary(
+                &AuxiliaryResult::completed("stage_discard", report_run_id, Some(status)),
+                0,
+            );
+        }
+        Ok(status) if !status.stage_available() => {
+            return write_auxiliary(
+                &AuxiliaryResult::inapplicable_with_result(
+                    "stage_discard",
+                    report_run_id,
+                    "stage_unavailable",
+                    status,
+                ),
+                20,
+            );
+        }
+        Ok(_) => {}
+        Err(_) => {
+            return emit_auxiliary_error_name("stage_discard", report_run_id, "status_unavailable");
+        }
+    }
+    match discard_retained_stage(&store, &run_id) {
+        Ok(()) => match inspect_job(&store, &run_id) {
+            Ok(status) => write_auxiliary(
+                &AuxiliaryResult::completed("stage_discard", report_run_id, Some(status)),
+                0,
+            ),
+            Err(_) => {
+                emit_auxiliary_error_name("stage_discard", report_run_id, "status_unavailable")
+            }
+        },
+        Err(file_guardian::processing::completion::CompletionError::HandoffUnavailable) => {
+            match inspect_job(&store, &run_id) {
+                Ok(status)
+                    if status.disposition
+                        == file_guardian::processing::domain::Disposition::Discarded =>
+                {
+                    write_auxiliary(
+                        &AuxiliaryResult::completed("stage_discard", report_run_id, Some(status)),
+                        0,
+                    )
+                }
+                _ => write_auxiliary(
+                    &AuxiliaryResult::<serde_json::Value>::inapplicable(
+                        "stage_discard",
+                        report_run_id,
+                        "stage_unavailable",
+                    ),
+                    20,
+                ),
+            }
+        }
+        Err(_) => emit_auxiliary_error_name("stage_discard", report_run_id, "operation_failure"),
+    }
+}
+
+fn parse_run_id(value: &str) -> Option<RunId> {
+    RunId::new(value.to_owned()).ok()
+}
+
+fn open_job_store(config: &ProcessingConfigFile) -> Result<JobStore, ()> {
+    JobStore::open(JobStorePaths {
+        jobs_root: config.processing.jobs.root.clone(),
+        reports_root: config.processing.jobs.reports_root.clone(),
+        quarantine_root: config.processing.jobs.quarantine_root.clone(),
     })
-    .await
-    .map_err(|_| {
-        (
-            run_id.clone(),
-            "authorization compilation task failed".to_string(),
-        )
-    })?
-    .map_err(|error| (run_id.clone(), error.to_string()))?;
-    let result = AuthorizationService::authorize(compiled.request).await;
-    let context = ReportContext {
-        run_id: run_id.clone(),
-        request_id: request_id(args),
-        policy: Some(compiled.policy),
-        duration_ms: elapsed_millis(started),
-    };
-    match report_from_result(context.clone(), result.clone()) {
-        Ok(report) => Ok(report),
-        Err(error) => {
-            tracing::error!("completed authorization report could not be constructed: {error}");
-            Ok(completed_run_internal_failure_report(context, result))
+    .map_err(|_| ())
+}
+
+fn load_config(explicit: Option<&Path>) -> Result<ProcessingConfigFile, ()> {
+    let path = explicit.map(Path::to_path_buf).unwrap_or_else(|| {
+        env::var_os("FILE_GUARDIAN_CONFIG")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+    });
+    let raw = fs::read_to_string(path).map_err(|_| ())?;
+    ProcessingConfigFile::parse(&raw).map_err(|_| ())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AuxiliaryStatus {
+    Completed,
+    Inapplicable,
+    Error,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct AuxiliaryResult<T: Serialize> {
+    schema_version: &'static str,
+    operation: &'static str,
+    run_id: SafeId,
+    status: AuxiliaryStatus,
+    result: Option<T>,
+    issue_code: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct JobRecoveryBatch {
+    recovered: Vec<file_guardian::processing::completion::CompletionStatus>,
+    untouched: Vec<SafeId>,
+    failed: Vec<JobRecoveryFailure>,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct JobRecoveryFailure {
+    run_id: SafeId,
+    issue_code: &'static str,
+}
+
+impl<T: Serialize> AuxiliaryResult<T> {
+    fn completed(operation: &'static str, run_id: SafeId, result: Option<T>) -> Self {
+        Self {
+            schema_version: "file-guardian-auxiliary-result/1",
+            operation,
+            run_id,
+            status: AuxiliaryStatus::Completed,
+            result,
+            issue_code: None,
+        }
+    }
+
+    fn inapplicable(operation: &'static str, run_id: SafeId, issue_code: &'static str) -> Self {
+        Self {
+            schema_version: "file-guardian-auxiliary-result/1",
+            operation,
+            run_id,
+            status: AuxiliaryStatus::Inapplicable,
+            result: None,
+            issue_code: Some(issue_code),
+        }
+    }
+
+    fn inapplicable_with_result(
+        operation: &'static str,
+        run_id: SafeId,
+        issue_code: &'static str,
+        result: T,
+    ) -> Self {
+        Self {
+            schema_version: "file-guardian-auxiliary-result/1",
+            operation,
+            run_id,
+            status: AuxiliaryStatus::Inapplicable,
+            result: Some(result),
+            issue_code: Some(issue_code),
+        }
+    }
+
+    fn error_with_result(
+        operation: &'static str,
+        run_id: SafeId,
+        issue_code: &'static str,
+        result: T,
+    ) -> Self {
+        Self {
+            schema_version: "file-guardian-auxiliary-result/1",
+            operation,
+            run_id,
+            status: AuxiliaryStatus::Error,
+            result: Some(result),
+            issue_code: Some(issue_code),
         }
     }
 }
 
-fn emit_report(report: &AuthorizationReport) -> ExitCode {
+fn emit_auxiliary_error(command: &Command, run_id: SafeId, issue_code: &'static str) -> ExitCode {
+    let operation = match command {
+        Command::Stage(stage) => match stage.command {
+            StageCommand::Handoff(_) => "stage_handoff",
+            StageCommand::Discard(_) => "stage_discard",
+        },
+        Command::Artifact(artifact) => match artifact.command {
+            ArtifactCommand::Inspect(_) => "artifact_inspect",
+            ArtifactCommand::Recover(_) => "artifact_recover",
+            ArtifactCommand::Discard(_) => "artifact_discard",
+        },
+        Command::Job(job) => match job.command {
+            JobCommand::Inspect(_) => "job_inspect",
+            JobCommand::Recover => "job_recover",
+        },
+        Command::Process(_) => "process",
+        Command::Daemon(_) => "daemon",
+    };
+    emit_auxiliary_error_name(operation, run_id, issue_code)
+}
+
+fn emit_auxiliary_error_name(
+    operation: &'static str,
+    run_id: SafeId,
+    issue_code: &'static str,
+) -> ExitCode {
+    let result = AuxiliaryResult::<serde_json::Value> {
+        schema_version: "file-guardian-auxiliary-result/1",
+        operation,
+        run_id,
+        status: AuxiliaryStatus::Error,
+        result: None,
+        issue_code: Some(issue_code),
+    };
+    write_auxiliary(&result, 30)
+}
+
+fn write_auxiliary<T: Serialize>(result: &AuxiliaryResult<T>, exit_code: u8) -> ExitCode {
+    let mut bytes = match serde_json::to_vec(result) {
+        Ok(bytes) => bytes,
+        Err(_) => return report_construction_failure(),
+    };
+    bytes.push(b'\n');
     let mut stdout = io::stdout().lock();
-    match write_report(&mut stdout, report) {
-        Ok(code) => ExitCode::from(code),
-        Err(error) => {
-            eprintln!("failed to write authorization report: {error}");
-            ExitCode::from(30)
-        }
-    }
-}
-
-fn write_report(
-    writer: &mut impl Write,
-    report: &AuthorizationReport,
-) -> Result<u8, file_guardian::report::ReportWriteError> {
-    report.write_json_line(writer)?;
-    writer.flush()?;
-    Ok(report.exit_code as u8)
-}
-
-async fn run_daemon_command(config_path: Option<&Path>, args: DaemonArgs) -> ExitCode {
-    let config = match Config::load_from_sources(config_path) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("failed to load daemon configuration: {error}");
-            return ExitCode::from(30);
-        }
-    };
-    let _logging = match init_logging(&config) {
-        Ok(guards) => guards,
-        Err(error) => {
-            eprintln!("failed to initialize logging: {error}");
-            return ExitCode::from(30);
-        }
-    };
-    let jobs = match config.validate_for_daemon(&args.jobs) {
-        Ok(jobs) => jobs.into_iter().cloned().collect::<Vec<_>>(),
-        Err(error) => {
-            tracing::error!("daemon configuration is invalid: {error}");
-            return ExitCode::from(30);
-        }
-    };
-    if let Err(error) = preflight_daemon_jobs(&config, &jobs).await {
-        tracing::error!("daemon job preflight failed: {error}");
+    if stdout
+        .write_all(&bytes)
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        eprintln!("auxiliary result could not be written");
         return ExitCode::from(30);
     }
-    let config = Arc::new(config);
-    let (failed_tx, mut failed_rx) = mpsc::channel::<String>(jobs.len());
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut handles = Vec::with_capacity(jobs.len());
-    for job in jobs {
-        let config = Arc::clone(&config);
-        let failed_tx = failed_tx.clone();
-        let shutdown_rx = shutdown_rx.clone();
-        handles.push(tokio::spawn(async move {
-            run_daemon_loop(config, job, failed_tx, shutdown_rx).await;
-        }));
-    }
-    drop(failed_tx);
+    ExitCode::from(exit_code)
+}
 
-    let status = tokio::select! {
-        result = wait_for_shutdown_signal() => {
-            match result {
-                Ok(()) => {
-                    tracing::info!("received shutdown signal");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    tracing::error!("failed to listen for shutdown signal: {error}");
-                    ExitCode::from(30)
-                }
-            }
-        }
-        failed = failed_rx.recv() => {
-            if let Some(job_id) = failed {
-                tracing::error!(job_id, "daemon policy scan became unhealthy");
-            } else {
-                tracing::error!("all daemon jobs stopped unexpectedly");
-            }
-            ExitCode::from(30)
-        }
+fn command_run_id(command: &Command) -> Option<&str> {
+    match command {
+        Command::Stage(stage) => match &stage.command {
+            StageCommand::Handoff(args) => Some(&args.run_id),
+            StageCommand::Discard(args) => Some(&args.run_id),
+        },
+        Command::Artifact(artifact) => match &artifact.command {
+            ArtifactCommand::Inspect(args) => Some(&args.run_id),
+            ArtifactCommand::Recover(args) => Some(&args.run_id),
+            ArtifactCommand::Discard(args) => Some(&args.run_id),
+        },
+        Command::Job(job) => match &job.command {
+            JobCommand::Inspect(args) => Some(&args.run_id),
+            JobCommand::Recover => None,
+        },
+        Command::Process(_) | Command::Daemon(_) => None,
+    }
+}
+
+fn command_request_id(command: &Command) -> Option<SafeId> {
+    let Command::Process(ProcessArgs { request_id, .. }) = command else {
+        return None;
     };
-    let _ = shutdown_tx.send(true);
-    for handle in handles {
-        if let Err(error) = handle.await {
-            tracing::error!("daemon job task failed during shutdown: {error}");
-            return ExitCode::from(30);
-        }
-    }
-    status
-}
-
-async fn preflight_daemon_jobs(config: &Config, jobs: &[DaemonJobConfig]) -> Result<(), String> {
-    let config = config.clone();
-    let jobs = jobs.to_vec();
-    tokio::task::spawn_blocking(move || {
-        for job in jobs {
-            let DaemonJobKind::PolicyScan { profile, .. } = &job.kind;
-            let run_id = secure_run_id()
-                .map_err(|_| format!("job '{}' secure run identity failed", job.id))?;
-            compile_invocation(
-                &config,
-                Some(profile),
-                Some(ConfigActionMode::Evaluate),
-                run_id,
-                PathBuf::from("/daemon-preflight"),
-            )
-            .map_err(|error| format!("job '{}' could not be compiled: {error}", job.id))?;
-        }
-        Ok(())
-    })
-    .await
-    .map_err(|_| "daemon preflight task failed".to_string())?
-}
-
-#[cfg(unix)]
-async fn wait_for_shutdown_signal() -> io::Result<()> {
-    let mut terminate = signal::unix::signal(signal::unix::SignalKind::terminate())?;
-    wait_for_unix_shutdown(signal::ctrl_c(), terminate.recv()).await
-}
-
-#[cfg(not(unix))]
-async fn wait_for_shutdown_signal() -> io::Result<()> {
-    signal::ctrl_c().await
-}
-
-#[cfg(unix)]
-async fn wait_for_unix_shutdown<Interrupt, Terminate>(
-    interrupt: Interrupt,
-    terminate: Terminate,
-) -> io::Result<()>
-where
-    Interrupt: Future<Output = io::Result<()>>,
-    Terminate: Future<Output = Option<()>>,
-{
-    tokio::select! {
-        result = interrupt => result,
-        result = terminate => result.ok_or_else(|| {
-            io::Error::new(io::ErrorKind::UnexpectedEof, "SIGTERM listener closed")
-        }),
-    }
-}
-
-async fn run_daemon_loop(
-    config: Arc<Config>,
-    job: DaemonJobConfig,
-    failed: mpsc::Sender<String>,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let DaemonJobKind::PolicyScan {
-        profile,
-        target,
-        every_secs,
-        run_on_start,
-    } = &job.kind;
-    if *shutdown.borrow() {
-        return;
-    }
-    if *run_on_start && !run_daemon_scan(&config, &job.id, profile, target).await {
-        let _ = failed.send(job.id).await;
-        return;
-    }
-    let mut interval = daemon_interval(Duration::from_secs(*every_secs));
-    interval.tick().await;
-    loop {
-        tokio::select! {
-            biased;
-            result = shutdown.changed() => {
-                if result.is_err() || *shutdown.borrow() {
-                    return;
-                }
-                continue;
-            }
-            _ = interval.tick() => {}
-        }
-        if *shutdown.borrow() {
-            return;
-        }
-        if !run_daemon_scan(&config, &job.id, profile, target).await {
-            let _ = failed.send(job.id).await;
-            return;
-        }
-    }
-}
-
-fn daemon_interval(period: Duration) -> tokio::time::Interval {
-    let mut interval = tokio::time::interval(period);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    interval
-}
-
-async fn run_daemon_scan(
-    config: &Config,
-    job_id: &str,
-    profile: &str,
-    target: &DaemonTarget,
-) -> bool {
-    let targets = match resolve_targets(target) {
-        Ok(targets) if !targets.is_empty() => targets,
-        Ok(_) => {
-            tracing::error!(job_id, "daemon target matched no inputs");
-            return false;
-        }
-        Err(error) => {
-            tracing::error!(job_id, "daemon targets could not be resolved: {error}");
-            return false;
-        }
-    };
-    for path in targets {
-        let run_id = match secure_run_id() {
-            Ok(run_id) => run_id,
-            Err(error) => {
-                tracing::error!(
-                    job_id,
-                    "secure run identity could not be generated: {error}"
-                );
-                return false;
-            }
-        };
-        let args = AuthorizeArgs {
-            profile: Some(profile.to_string()),
-            request_id: None,
-            action_mode: Some(ActionMode::Evaluate),
-            path,
-        };
-        let report = match authorize_with_config(config, &args, run_id).await {
-            Ok(report) => report,
-            Err((_, error)) => {
-                tracing::error!(job_id, "daemon authorization could not start: {error}");
-                return false;
-            }
-        };
-        match report.to_json_line() {
-            Ok(line) => {
-                let report_json = String::from_utf8_lossy(&line);
-                tracing::info!(
-                    job_id,
-                    authorization_report = %report_json.trim_end(),
-                    "daemon authorization decision"
-                );
-                if let Err(error) = io::stderr().lock().write_all(&line) {
-                    tracing::error!(job_id, "daemon report could not be written: {error}");
-                    return false;
-                }
-            }
-            Err(error) => {
-                tracing::error!(job_id, "daemon report could not be serialized: {error}");
-                return false;
-            }
-        }
-        if report.outcome == AuthorizationOutcome::Error {
-            return false;
-        }
-    }
-    true
-}
-
-fn resolve_targets(target: &DaemonTarget) -> Result<Vec<PathBuf>, String> {
-    match target {
-        DaemonTarget::Literal { path } => Ok(vec![path.clone()]),
-        DaemonTarget::Patterns { patterns } => {
-            let mut paths = BTreeSet::new();
-            for pattern in patterns {
-                for entry in glob::glob(pattern).map_err(|error| error.to_string())? {
-                    let path = entry.map_err(|error| error.to_string())?;
-                    paths.insert(path);
-                }
-            }
-            Ok(paths.into_iter().collect())
-        }
-    }
-}
-
-fn request_id(args: &AuthorizeArgs) -> Option<ReportIdentifier> {
-    args.request_id
+    request_id
         .as_ref()
-        .map(|value| ReportIdentifier::new(value.clone()).expect("Clap validated request ID"))
+        .and_then(|value| SafeId::new(value.clone()).ok())
 }
 
-fn init_logging(config: &Config) -> Result<file_guardian::logging::LoggingGuards, String> {
-    LoggingSettings::from_config(&config.logging)
-        .map_err(|error| error.to_string())?
-        .init_tracing()
-        .map_err(|error| error.to_string())
+fn emit_error_report(
+    run_id: SafeId,
+    request_id: Option<SafeId>,
+    issue_code: &'static str,
+) -> ExitCode {
+    let timestamp = Utc::now().to_rfc3339();
+    let report = ProcessingReport::new(ProcessingReportData {
+        run_id,
+        request_id,
+        outcome: ProcessingOutcome::Error,
+        modified: false,
+        started_at: match Rfc3339Timestamp::new(timestamp.clone()) {
+            Ok(value) => value,
+            Err(_) => return report_construction_failure(),
+        },
+        finished_at: match Rfc3339Timestamp::new(timestamp) {
+            Ok(value) => value,
+            Err(_) => return report_construction_failure(),
+        },
+        persistence_status: PersistenceStatus::Unavailable,
+        source: None,
+        acquisition: None,
+        stage: None,
+        policy: None,
+        phases: PhasesSummary {
+            initial: None,
+            verification: None,
+        },
+        pi_invocations: Vec::new(),
+        adjudications: Vec::new(),
+        actions: Vec::new(),
+        issues: vec![IssueSummary {
+            code: match SafeId::new(issue_code) {
+                Ok(value) => value,
+                Err(_) => return report_construction_failure(),
+            },
+            phase: None,
+            component_id: None,
+        }],
+        degradations: Vec::new(),
+        statistics: ProcessingStatistics {
+            initial_artifacts: 0,
+            verification_artifacts: 0,
+            total_findings: 0,
+            total_actions: 0,
+            duration_ms: 0,
+        },
+        omissions: OmissionSummary {
+            details_omitted: false,
+            reason: None,
+        },
+    });
+    let report = match report {
+        Ok(report) => report,
+        Err(_) => return report_construction_failure(),
+    };
+    write_report(&mut io::stdout().lock(), &report)
 }
 
-fn fallback_report_id() -> RunId {
-    RunId::from_suffix("startup-error").expect("static fallback report ID is valid")
+fn write_report(writer: &mut impl Write, report: &ProcessingReport) -> ExitCode {
+    let bytes = match report.to_json_line() {
+        Ok(bytes) => bytes,
+        Err(_) => return report_construction_failure(),
+    };
+    if writer
+        .write_all(&bytes)
+        .and_then(|()| writer.flush())
+        .is_err()
+    {
+        eprintln!("processing report could not be written");
+        return ExitCode::from(ProcessingOutcome::Error.exit_code() as u8);
+    }
+    ExitCode::from(report.exit_code as u8)
 }
 
-fn elapsed_millis(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+fn report_construction_failure() -> ExitCode {
+    eprintln!("processing report could not be constructed");
+    ExitCode::from(ProcessingOutcome::Error.exit_code() as u8)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use file_guardian::report::ReportIdentifier;
-    use std::future;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct FailingWriter;
-
-    struct DropFlag(Arc<AtomicBool>);
-
-    impl Drop for DropFlag {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
 
     impl Write for FailingWriter {
         fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
@@ -495,86 +711,74 @@ mod tests {
     }
 
     #[test]
-    fn target_resolution_is_sorted_and_deduplicated() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("b.txt"), b"b").unwrap();
-        std::fs::write(temp.path().join("a.txt"), b"a").unwrap();
-        let target = DaemonTarget::Patterns {
-            patterns: vec![
-                format!("{}/*.txt", temp.path().display()),
-                format!("{}/a.*", temp.path().display()),
-            ],
-        };
-        assert_eq!(
-            resolve_targets(&target).unwrap(),
-            vec![temp.path().join("a.txt"), temp.path().join("b.txt")]
-        );
+    fn unsafe_auxiliary_run_id_is_not_reflected() {
+        let args =
+            Args::try_parse_from(["file-guardian", "stage", "discard", "../../private/source"])
+                .unwrap();
+        let generated = SafeId::new("run_generated").unwrap();
+        let selected = command_run_id(&args.command)
+            .and_then(|value| SafeId::new(value.to_owned()).ok())
+            .unwrap_or_else(|| generated.clone());
+        assert_eq!(selected, generated);
     }
 
     #[test]
-    fn report_writer_failure_is_detectable_before_success_exit() {
-        let report = startup_error_report(
-            RunId::from_suffix("write-error").unwrap(),
-            Some(ReportIdentifier::new("request").unwrap()),
-            IssueCode::InternalFailure,
-            "test report",
-        );
-        assert!(write_report(&mut FailingWriter, &report).is_err());
+    fn valid_auxiliary_run_id_is_reused_for_the_error_report() {
+        let args = Args::try_parse_from([
+            "file-guardian",
+            "artifact",
+            "inspect",
+            "run_abc",
+            "quarantine_7",
+        ])
+        .unwrap();
+        assert_eq!(command_run_id(&args.command), Some("run_abc"));
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn sigterm_completes_the_daemon_shutdown_future() {
-        wait_for_unix_shutdown(future::pending(), future::ready(Some(())))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_and_drops_inflight_authorization() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let guard = DropFlag(Arc::clone(&dropped));
-        let authorization = async move {
-            let _guard = guard;
-            future::pending::<()>().await;
-        };
-        let result = wait_for_authorization_or_shutdown(authorization, future::ready(Ok(()))).await;
-        assert!(matches!(result, AuthorizationWait::Shutdown(Ok(()))));
-        assert!(dropped.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn daemon_schedule_delays_instead_of_bursting_missed_ticks() {
-        let interval = daemon_interval(Duration::from_secs(30));
-        assert_eq!(
-            interval.missed_tick_behavior(),
-            tokio::time::MissedTickBehavior::Delay
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_preflights_jobs_even_when_run_on_start_is_false() {
-        let temporary = tempfile::tempdir().unwrap();
-        let mut config: Config = toml::from_str(include_str!("../../config/config.toml")).unwrap();
-        let file_guardian::config::AnalyzerKind::BuiltinRules { rule_files, .. } =
-            &mut config.analyzers[0].kind
-        else {
-            panic!("checked-in config must use built-in rules")
-        };
-        *rule_files = vec![temporary.path().join("missing-rules.toml")];
-        let job = DaemonJobConfig {
-            id: "preflight".to_string(),
-            enabled: true,
-            kind: DaemonJobKind::PolicyScan {
-                profile: "publication".to_string(),
-                target: DaemonTarget::Literal {
-                    path: PathBuf::from("/srv/uploads"),
-                },
-                every_secs: 300,
-                run_on_start: false,
+    #[test]
+    fn failing_stdout_writer_returns_error_exit() {
+        let timestamp = Rfc3339Timestamp::new("2026-08-17T12:00:00+00:00").unwrap();
+        let report = ProcessingReport::new(ProcessingReportData {
+            run_id: SafeId::new("run_test").unwrap(),
+            request_id: None,
+            outcome: ProcessingOutcome::Error,
+            modified: false,
+            started_at: timestamp.clone(),
+            finished_at: timestamp,
+            persistence_status: PersistenceStatus::Unavailable,
+            source: None,
+            acquisition: None,
+            stage: None,
+            policy: None,
+            phases: PhasesSummary {
+                initial: None,
+                verification: None,
             },
-        };
-        let error = preflight_daemon_jobs(&config, &[job]).await.unwrap_err();
-        assert!(error.contains("could not be compiled"));
+            pi_invocations: Vec::new(),
+            adjudications: Vec::new(),
+            actions: Vec::new(),
+            issues: vec![IssueSummary {
+                code: SafeId::new("test_failure").unwrap(),
+                phase: None,
+                component_id: None,
+            }],
+            degradations: Vec::new(),
+            statistics: ProcessingStatistics {
+                initial_artifacts: 0,
+                verification_artifacts: 0,
+                total_findings: 0,
+                total_actions: 0,
+                duration_ms: 0,
+            },
+            omissions: OmissionSummary {
+                details_omitted: false,
+                reason: None,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            write_report(&mut FailingWriter, &report),
+            ExitCode::from(30)
+        );
     }
 }

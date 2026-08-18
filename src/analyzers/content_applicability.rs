@@ -58,10 +58,12 @@ impl RequiredTextMatcher {
     }
 
     pub fn is_required(&self, artifact: &Artifact) -> bool {
+        self.is_required_path(logical_path(artifact))
+    }
+
+    pub(crate) fn is_required_path(&self, logical_path: &LogicalPath) -> bool {
         self.patterns
-            .is_match_candidate(&Candidate::from_bytes(&logical_path_bytes(logical_path(
-                artifact,
-            ))))
+            .is_match_candidate(&Candidate::from_bytes(&logical_path_bytes(logical_path)))
     }
 }
 
@@ -140,13 +142,31 @@ pub fn assess_text_artifact(
     max_text_bytes: u64,
     required_text: &RequiredTextMatcher,
 ) -> Result<TextArtifactDisposition, TextApplicabilityError> {
-    let mut input = reader
+    let input = reader
         .open_object(&artifact.object_id)
         .map_err(|error| match error {
             ArtifactReadError::Unavailable => TextApplicabilityError::ObjectUnavailable,
             ArtifactReadError::ReadFailed => TextApplicabilityError::ObjectReadFailed,
         })?;
-    let mut retained = (artifact.byte_len <= max_text_bytes).then(Vec::new);
+    assess_text_reader(
+        logical_path(artifact),
+        artifact.byte_len,
+        artifact.content_digest,
+        input,
+        max_text_bytes,
+        required_text,
+    )
+}
+
+pub(crate) fn assess_text_reader(
+    logical_path: &LogicalPath,
+    expected_byte_len: u64,
+    expected_digest: Digest,
+    mut input: Box<dyn Read + '_>,
+    max_text_bytes: u64,
+    required_text: &RequiredTextMatcher,
+) -> Result<TextArtifactDisposition, TextApplicabilityError> {
+    let mut retained = (expected_byte_len <= max_text_bytes).then(Vec::new);
     let mut hasher = Sha256::new();
     let mut byte_len = 0_u64;
     let mut utf8 = StreamingUtf8::default();
@@ -183,12 +203,12 @@ pub fn assess_text_artifact(
     }
 
     let digest = Digest::from_array(hasher.finalize().into());
-    if byte_len != artifact.byte_len || digest != artifact.content_digest {
+    if byte_len != expected_byte_len || digest != expected_digest {
         return Err(TextApplicabilityError::ObjectIdentityMismatch);
     }
 
     if !utf8.is_text() {
-        return if required_text.is_required(artifact) {
+        return if required_text.is_required_path(logical_path) {
             Err(TextApplicabilityError::RequiredTextBinaryContent)
         } else {
             Ok(TextArtifactDisposition::NotApplicableBinary)

@@ -117,12 +117,6 @@ impl InvocationWorkspace {
         Arc::clone(&self.objects)
     }
 
-    #[cfg(test)]
-    pub(crate) fn analyzer_views_are_empty(&self) -> bool {
-        std::fs::read_dir(self.run_path.join("analyzer-views"))
-            .is_ok_and(|mut entries| entries.next().is_none())
-    }
-
     /// Creates an invocation-scoped private directory for one analyzer endpoint.
     ///
     /// `name` is deliberately restricted to an opaque, host-generated suffix;

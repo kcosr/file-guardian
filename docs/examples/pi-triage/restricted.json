@@ -1,0 +1,27 @@
+{
+  "schema_version": "file-guardian-pi-triage/1",
+  "invocation_id": "pii_example",
+  "phase": "initial",
+  "manifest_identity": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "request_identity": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+  "prior_observations_identity": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+  "status": "complete",
+  "assessments": [
+    {
+      "finding_id": "fnd_example",
+      "classification": "confirmed",
+      "confidence": "high",
+      "reason_codes": ["credential_in_live_configuration"],
+      "duplicate_of": null,
+      "recommended_action": "quarantine"
+    }
+  ],
+  "stage_attestation": "blocking_concerns_observed",
+  "coverage": {
+    "assigned_artifact_count": 1,
+    "completed_artifact_count": 1,
+    "not_applicable_artifact_count": 0,
+    "assigned_finding_count": 1,
+    "assessed_finding_count": 1
+  }
+}

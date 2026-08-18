@@ -1,0 +1,4 @@
+# File Guardian example Gitleaks ignore file.
+#
+# This intentionally contains no finding suppressions. Copy it to an
+# administrator-owned policy directory and add reviewed fingerprints only.

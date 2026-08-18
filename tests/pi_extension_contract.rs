@@ -20,9 +20,9 @@ const EXPECTED_TOOLS: [&str; 8] = [
     "grep",
     "ls",
     "manifest_list",
-    "prior_observations",
+    "triage_request",
     "read",
-    "submit_classification",
+    "submit_triage",
 ];
 
 #[test]
@@ -40,7 +40,7 @@ fn trusted_extension_registers_only_the_closed_tool_grant() {
         8
     );
     assert!(EXTENSION.contains("terminate: true"));
-    assert!(EXTENSION.contains("await proxyRequest(\"submit_classification\""));
+    assert!(EXTENSION.contains("await proxyRequest(\"submit_triage\""));
     assert!(EXTENSION.contains("terminalState = \"accepted\""));
 
     for forbidden in [
@@ -60,12 +60,12 @@ fn trusted_extension_registers_only_the_closed_tool_grant() {
 
 #[test]
 fn extension_and_host_use_distinct_matching_wire_and_terminal_versions() {
-    assert!(EXTENSION.contains("const PROTOCOL = \"file-guardian-pi-proxy/2\""));
+    assert!(EXTENSION.contains("const PROTOCOL = \"file-guardian-pi-proxy/3\""));
     assert!(
-        RUST_PROTOCOL.contains("pub const PROTOCOL_VERSION: &str = \"file-guardian-pi-proxy/2\"")
+        RUST_PROTOCOL.contains("pub const PROTOCOL_VERSION: &str = \"file-guardian-pi-proxy/3\"")
     );
-    assert!(EXTENSION.contains("Type.Literal(\"file-guardian-pi-classifier/1\")"));
-    assert!(RUST_PROTOCOL.contains("file-guardian-pi-classifier/1"));
+    assert!(EXTENSION.contains("Type.Literal(\"file-guardian-pi-triage/1\")"));
+    assert!(RUST_PROTOCOL.contains("file-guardian-pi-triage/1"));
 
     for field in [
         "run_token",
@@ -80,6 +80,32 @@ fn extension_and_host_use_distinct_matching_wire_and_terminal_versions() {
 
     assert!(EXTENSION.contains("proxyRequest(\"instruction\")"));
     assert!(RUST_PROTOCOL.contains("Instruction {}"));
+}
+
+#[test]
+fn terminal_tool_is_candidate_free_and_identity_bound() {
+    for required in [
+        "const TerminalTriage = strictObject({",
+        "invocation_id: InvocationId",
+        "request_identity: Digest",
+        "prior_observations_identity: Digest",
+        "finding_id: FindingId",
+        "Type.Literal(\"false_positive\")",
+        "stage_attestation:",
+        "assigned_finding_count:",
+        "assessed_finding_count:",
+    ] {
+        assert!(
+            EXTENSION.contains(required),
+            "missing triage field: {required}"
+        );
+    }
+    for forbidden in ["candidates:", "rationale:", "matched_value:", "snippet:"] {
+        assert!(
+            !EXTENSION.contains(forbidden),
+            "terminal schema exposes forbidden field: {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -337,7 +363,7 @@ fn caller_fields_cannot_override_authenticated_proxy_envelope() {
         !EXTENSION[fields + "\t\t...fields,".len()..fields + request_end].contains("...fields")
     );
     assert!(EXTENSION.contains(
-        "async execute(_toolCallId, _params, signal) {\n\t\t\treturn proxyToolResult(await proxyRequest(\"prior_observations\", {}, signal));"
+        "async execute(_toolCallId, _params, signal) {\n\t\t\treturn proxyToolResult(await proxyRequest(\"triage_request\", {}, signal));"
     ));
 }
 
@@ -357,7 +383,8 @@ fn every_tool_parameter_object_is_closed_and_bounded() {
     assert!(EXTENSION.contains("maxItems:"));
     assert!(EXTENSION.contains("maxLength:"));
     assert!(EXTENSION.contains("uniqueItems: true"));
-    assert!(EXTENSION.contains("^a_[A-Za-z0-9_.:-]{1,126}$"));
+    assert!(EXTENSION.contains("^fnd_[A-Za-z0-9_-]{1,96}$"));
+    assert!(EXTENSION.contains("^pii_[A-Za-z0-9_-]{1,96}$"));
     assert!(EXTENSION.contains("hasExactKeys(response"));
 }
 

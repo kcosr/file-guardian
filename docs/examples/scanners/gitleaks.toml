@@ -1,0 +1,10 @@
+title = "File Guardian Gitleaks policy"
+
+# Extend the rules compiled into the discovered, version-checked Gitleaks
+# executable. This file is administrator-owned and mounted read-only; a staged
+# repository's .gitleaks.toml is never allowed to replace authorization policy.
+[extend]
+useDefault = true
+
+# Add organization-owned [[rules]], [[rules.allowlists]], or [[allowlists]]
+# entries below. Keep suppressions narrow and review them as policy changes.

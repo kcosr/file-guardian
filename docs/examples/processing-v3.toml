@@ -1,0 +1,202 @@
+# Strict schema-3 processing-job example. File Guardian owns the acquired
+# stage, runs both required scanners, and retains only allowed handoff stages.
+schema_version = "3"
+
+[processing]
+default_profile = "upload"
+
+[processing.jobs]
+root = "/var/lib/file-guardian/jobs"
+reports_root = "/var/lib/file-guardian/reports"
+quarantine_root = "/var/lib/file-guardian/quarantine"
+artifact_quarantine_root = "/var/lib/file-guardian/artifact-quarantine"
+stale_after_secs = 900
+max_report_bytes = 67108864
+
+[processing.jobs.capture]
+max_entries = 200000
+max_files = 100000
+max_file_bytes = 1073741824
+max_total_bytes = 10737418240
+max_depth = 64
+
+[processing.jobs.retention]
+available_ttl_secs = 86400
+available_max_bytes = 107374182400
+quarantine_ttl_secs = 2592000
+quarantine_max_bytes = 536870912000
+artifact_quarantine_ttl_secs = 2592000
+artifact_quarantine_max_bytes = 53687091200
+
+[processing.acquisition]
+git_executable = "/usr/bin/git"
+git_timeout_secs = 600
+max_stdout_bytes = 1048576
+max_stderr_bytes = 1048576
+max_refs = 10000
+max_commits = 1000000
+max_unique_blobs = 1000000
+max_provenance_occurrences = 5000000
+max_git_bytes = 10737418240
+
+[processing.external_scanners]
+bubblewrap_executable = "/usr/bin/bwrap"
+expected_bubblewrap_version = "0.11.1"
+
+[[processing.profiles]]
+id = "upload"
+pipeline = "publication-review"
+action_mode = "apply"
+purpose = "handoff"
+default_unbound_observation = "deny"
+
+[processing.profiles.source_scope]
+working_tree = true
+history = "none"
+history_ref_patterns = []
+
+[processing.profiles.git]
+allowed_checkout_ref_patterns = ["refs/heads/*", "refs/tags/*"]
+submodules = "reject"
+lfs = "reject_pointer"
+symlinks = "preserve"
+
+[processing.profiles.local]
+symlinks = "reject"
+
+[processing.profiles.completion]
+allow = "retain"
+allow_modified = "retain"
+deny = "discard"
+error = "quarantine"
+cancelled = "quarantine"
+
+[[processing.profiles.bindings]]
+id = "quarantine-unverified-credentials"
+priority = 100
+directive = "quarantine"
+
+[processing.profiles.bindings.selector]
+category = "credential"
+verification_state = "unverified"
+
+[[processing.profiles]]
+id = "repository-review"
+pipeline = "publication-review"
+action_mode = "evaluate"
+purpose = "report_only"
+default_unbound_observation = "deny"
+
+[processing.profiles.source_scope]
+working_tree = true
+history = "reachable"
+history_ref_patterns = ["refs/heads/*", "refs/tags/release-*"]
+
+[processing.profiles.git]
+allowed_checkout_ref_patterns = ["refs/heads/*", "refs/tags/*"]
+submodules = "reject"
+lfs = "reject_pointer"
+symlinks = "preserve"
+
+[processing.profiles.local]
+symlinks = "reject"
+
+[processing.profiles.completion]
+allow = "discard"
+allow_modified = "discard"
+deny = "discard"
+error = "quarantine"
+cancelled = "quarantine"
+
+[[processing.profiles.bindings]]
+id = "deny-verified-credentials"
+priority = 100
+directive = "deny"
+
+[processing.profiles.bindings.selector]
+category = "credential"
+verification_state = "verified"
+
+[[pipelines]]
+id = "publication-review"
+
+[[pipelines.stages]]
+id = "deterministic-secrets"
+execution = "parallel"
+max_concurrency = 2
+analyzers = ["gitleaks", "trufflehog"]
+prior_observations = "none"
+
+[pipelines.stages.prior_limits]
+max_observations = 10000
+max_serialized_bytes = 1048576
+
+[[analyzers]]
+id = "gitleaks"
+kind = "gitleaks"
+executable = "gitleaks"
+version_requirement = ">=8.28,<9"
+config_file = "/etc/file-guardian/scanners/gitleaks.toml"
+ignore_file = "/etc/file-guardian/scanners/gitleaks.ignore"
+
+[analyzers.execution]
+initial = "required"
+verification = "required"
+
+[analyzers.selection]
+include = ["**"]
+exclude = []
+artifact_kinds = ["physical_file", "repository_blob"]
+
+[analyzers.limits]
+wall_timeout_secs = 90
+max_file_bytes = 10485760
+max_output_bytes = 10485760
+max_findings = 10000
+
+[[analyzers]]
+id = "trufflehog"
+kind = "trufflehog"
+executable = "trufflehog"
+version_requirement = ">=3.90,<4"
+credential_verification = "disabled"
+
+[analyzers.execution]
+initial = "required"
+verification = "required"
+
+[analyzers.selection]
+include = ["**"]
+exclude = []
+artifact_kinds = ["physical_file", "repository_blob"]
+
+[analyzers.limits]
+wall_timeout_secs = 180
+max_file_bytes = 10485760
+max_output_bytes = 33554432
+max_findings = 10000
+
+[[daemon.jobs]]
+id = "incoming-upload"
+enabled = true
+profile = "upload"
+schedule = "0 */5 * * * *"
+run_on_start = false
+overlap = "reject"
+
+[daemon.jobs.source]
+kind = "path"
+path = "/srv/incoming/batch"
+
+[[daemon.jobs]]
+id = "repository-audit"
+enabled = false
+profile = "repository-review"
+schedule = "0 0 * * * *"
+run_on_start = false
+overlap = "queue_one"
+
+[daemon.jobs.source]
+kind = "git"
+remote = "git@example.com:organization/repository.git"
+reference = "refs/heads/main"

@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use super::content_applicability::{
-    assess_text_artifact, ArtifactReader, RequiredTextMatcher, TextApplicabilityError,
-    TextArtifactDisposition,
+    assess_text_artifact, assess_text_reader, ArtifactReadError, ArtifactReader,
+    RequiredTextMatcher, TextApplicabilityError, TextArtifactDisposition,
 };
 
 use crate::domain::{
@@ -77,6 +77,55 @@ pub struct BuiltinRulesResult {
     pub observations: Vec<NormalizedObservation>,
     pub issues: Vec<InspectionIssue>,
     pub coverage: AnalyzerCoverage,
+    /// Canonical outcomes for assignments which completed successfully. An
+    /// incomplete result deliberately omits failed and unvisited artifacts so
+    /// callers cannot mistake aggregate coverage for per-artifact success.
+    pub assignment_outcomes: Vec<BuiltinAssignmentOutcome>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BuiltinAssignmentOutcome {
+    pub artifact_id: ArtifactId,
+    pub disposition: BuiltinAssignmentDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BuiltinAssignmentDisposition {
+    Completed,
+    NotApplicable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BuiltinProcessingAssignment {
+    pub artifact_id: ArtifactId,
+    pub logical_path: LogicalPath,
+    pub byte_len: u64,
+    pub content_digest: crate::domain::Digest,
+}
+
+pub(crate) trait BuiltinProcessingReader {
+    fn open_artifact(
+        &self,
+        artifact_id: &ArtifactId,
+    ) -> Result<Box<dyn std::io::Read + '_>, ArtifactReadError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BuiltinProcessingResult {
+    pub observations: Vec<NormalizedObservation>,
+    pub assignment_outcomes: Vec<BuiltinAssignmentOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub(crate) enum BuiltinProcessingError {
+    #[error("built-in processing assignment is not canonical")]
+    Assignment,
+    #[error("immutable processing content is unavailable")]
+    Unavailable,
+    #[error("immutable processing content is invalid")]
+    InvalidContent,
+    #[error("built-in processing budget was exceeded")]
+    BudgetExceeded,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -130,6 +179,107 @@ impl BuiltinRulesAnalyzer {
         &self.id
     }
 
+    pub(crate) fn analyze_processing(
+        &self,
+        phase: InspectionPhase,
+        assignments: &[BuiltinProcessingAssignment],
+        reader: &impl BuiltinProcessingReader,
+    ) -> Result<BuiltinProcessingResult, BuiltinProcessingError> {
+        if assignments
+            .windows(2)
+            .any(|pair| pair[0].artifact_id >= pair[1].artifact_id)
+        {
+            return Err(BuiltinProcessingError::Assignment);
+        }
+        let content_required = self.rules.iter().any(|rule| rule.content_regex.is_some());
+        let filename_required = self.rules.iter().any(|rule| rule.filename_glob.is_some());
+        let mut findings = Vec::new();
+        let mut assignment_outcomes = Vec::with_capacity(assignments.len());
+        for assignment in assignments {
+            let mut not_applicable = false;
+            if filename_required {
+                let filename = assignment
+                    .logical_path
+                    .segments()
+                    .last()
+                    .and_then(|segment| std::str::from_utf8(segment.as_slice()).ok())
+                    .ok_or(BuiltinProcessingError::InvalidContent)?;
+                for rule in &self.rules {
+                    if rule
+                        .filename_glob
+                        .as_ref()
+                        .is_some_and(|pattern| pattern.matches(filename))
+                    {
+                        push_processing_finding(
+                            &mut findings,
+                            self.limits.max_findings,
+                            PendingFinding {
+                                logical_path: assignment.logical_path.clone(),
+                                artifact_id: assignment.artifact_id.clone(),
+                                rule_id: rule.id.clone(),
+                                category: FindingCategory::Filename,
+                                location: None,
+                                reason_code: reason("filename_glob_match"),
+                            },
+                        )?;
+                    }
+                }
+            }
+            if content_required {
+                let input = reader
+                    .open_artifact(&assignment.artifact_id)
+                    .map_err(|_| BuiltinProcessingError::Unavailable)?;
+                match assess_text_reader(
+                    &assignment.logical_path,
+                    assignment.byte_len,
+                    assignment.content_digest,
+                    input,
+                    self.limits.max_content_bytes,
+                    &self.limits.content_applicability.required_text,
+                ) {
+                    Ok(TextArtifactDisposition::NotApplicableBinary) => not_applicable = true,
+                    Ok(TextArtifactDisposition::Text(content)) => {
+                        for rule in &self.rules {
+                            let Some(pattern) = &rule.content_regex else {
+                                continue;
+                            };
+                            for matched in pattern.find_iter(content.as_str()) {
+                                push_processing_finding(
+                                    &mut findings,
+                                    self.limits.max_findings,
+                                    PendingFinding {
+                                        logical_path: assignment.logical_path.clone(),
+                                        artifact_id: assignment.artifact_id.clone(),
+                                        rule_id: rule.id.clone(),
+                                        category: FindingCategory::ContentPattern,
+                                        location: match_location(&matched),
+                                        reason_code: reason("content_regex_match"),
+                                    },
+                                )?;
+                            }
+                        }
+                    }
+                    Err(TextApplicabilityError::TextLimitExceeded) => {
+                        return Err(BuiltinProcessingError::BudgetExceeded)
+                    }
+                    Err(_) => return Err(BuiltinProcessingError::InvalidContent),
+                }
+            }
+            assignment_outcomes.push(BuiltinAssignmentOutcome {
+                artifact_id: assignment.artifact_id.clone(),
+                disposition: if not_applicable {
+                    BuiltinAssignmentDisposition::NotApplicable
+                } else {
+                    BuiltinAssignmentDisposition::Completed
+                },
+            });
+        }
+        Ok(BuiltinProcessingResult {
+            observations: finalize_findings(&self.id, phase, findings),
+            assignment_outcomes,
+        })
+    }
+
     /// Inspects exactly the assigned artifacts.
     ///
     /// Assignments are an executor-owned contract and must contain known
@@ -160,6 +310,7 @@ impl BuiltinRulesAnalyzer {
         let mut issues = Vec::new();
         let mut completed = 0_u64;
         let mut not_applicable = 0_u64;
+        let mut assignment_outcomes = Vec::with_capacity(artifacts.len());
         let mut limit_reached = false;
 
         for artifact in artifacts {
@@ -273,41 +424,21 @@ impl BuiltinRulesAnalyzer {
             if artifact_complete {
                 if artifact_not_applicable {
                     not_applicable += 1;
+                    assignment_outcomes.push(BuiltinAssignmentOutcome {
+                        artifact_id: artifact.id.clone(),
+                        disposition: BuiltinAssignmentDisposition::NotApplicable,
+                    });
                 } else {
                     completed += 1;
+                    assignment_outcomes.push(BuiltinAssignmentOutcome {
+                        artifact_id: artifact.id.clone(),
+                        disposition: BuiltinAssignmentDisposition::Completed,
+                    });
                 }
             }
         }
 
-        findings.sort();
-        let analyzer_digest = crate::domain::Digest::sha256(self.id.as_str()).to_string();
-        let analyzer_key = &analyzer_digest["sha256:".len().."sha256:".len() + 16];
-        let phase_key = match phase {
-            InspectionPhase::Initial => "initial",
-            InspectionPhase::Verification => "verification",
-        };
-        let observations = findings
-            .into_iter()
-            .enumerate()
-            .map(|(index, pending)| {
-                NormalizedObservation::Finding(Finding {
-                    id: ObservationId::from_suffix(format!(
-                        "builtin-{analyzer_key}-{phase_key}-{:08}",
-                        index + 1
-                    ))
-                    .expect("bounded canonical observation id"),
-                    analyzer_id: self.id.clone(),
-                    rule_id: pending.rule_id,
-                    artifact_id: pending.artifact_id,
-                    category: pending.category,
-                    severity: Severity::High,
-                    location: pending.location,
-                    evidence: SafeEvidence {
-                        reason_codes: vec![pending.reason_code],
-                    },
-                })
-            })
-            .collect();
+        let observations = finalize_findings(&self.id, phase, findings);
         let status = if completed + not_applicable == assigned {
             CoverageStatus::Complete
         } else {
@@ -328,8 +459,57 @@ impl BuiltinRulesAnalyzer {
             observations,
             issues,
             coverage,
+            assignment_outcomes,
         })
     }
+}
+
+fn push_processing_finding(
+    findings: &mut Vec<PendingFinding>,
+    limit: usize,
+    finding: PendingFinding,
+) -> Result<(), BuiltinProcessingError> {
+    if push_finding(findings, limit, finding) {
+        Ok(())
+    } else {
+        Err(BuiltinProcessingError::BudgetExceeded)
+    }
+}
+
+fn finalize_findings(
+    analyzer_id: &AnalyzerId,
+    phase: InspectionPhase,
+    mut findings: Vec<PendingFinding>,
+) -> Vec<NormalizedObservation> {
+    findings.sort();
+    let analyzer_digest = crate::domain::Digest::sha256(analyzer_id.as_str()).to_string();
+    let analyzer_key = &analyzer_digest["sha256:".len().."sha256:".len() + 16];
+    let phase_key = match phase {
+        InspectionPhase::Initial => "initial",
+        InspectionPhase::Verification => "verification",
+    };
+    findings
+        .into_iter()
+        .enumerate()
+        .map(|(index, pending)| {
+            NormalizedObservation::Finding(Finding {
+                id: ObservationId::from_suffix(format!(
+                    "builtin-{analyzer_key}-{phase_key}-{:08}",
+                    index + 1
+                ))
+                .expect("bounded canonical observation id"),
+                analyzer_id: analyzer_id.clone(),
+                rule_id: pending.rule_id,
+                artifact_id: pending.artifact_id,
+                category: pending.category,
+                severity: Severity::High,
+                location: pending.location,
+                evidence: SafeEvidence {
+                    reason_codes: vec![pending.reason_code],
+                },
+            })
+        })
+        .collect()
 }
 
 fn logical_path(artifact: &Artifact) -> &LogicalPath {
@@ -756,6 +936,39 @@ mod tests {
         assert_eq!(limited.observations.len(), 1);
         assert!(!limited.coverage.is_complete());
         assert_eq!(limited.issues[0].code, IssueCode::SizeLimitExceeded);
+    }
+
+    #[test]
+    fn reports_exact_canonical_dispositions_for_mixed_text_and_binary_assignments() {
+        let analyzer = analyzer(vec![rule("content", None, Some("needle"))]);
+        let (manifest, reader) = manifest(&[
+            ("binary.bin", &[0xff]),
+            ("clean.txt", b"clean text"),
+            ("match.txt", b"needle"),
+        ]);
+
+        let result = analyze_all(&analyzer, InspectionPhase::Initial, &manifest, &reader);
+
+        assert!(result.coverage.is_complete());
+        assert_eq!(result.coverage.completed, 2);
+        assert_eq!(result.coverage.not_applicable, 1);
+        assert_eq!(result.assignment_outcomes.len(), 3);
+        assert!(result
+            .assignment_outcomes
+            .windows(2)
+            .all(|pair| pair[0].artifact_id < pair[1].artifact_id));
+        assert_eq!(
+            result
+                .assignment_outcomes
+                .iter()
+                .map(|outcome| outcome.disposition)
+                .collect::<Vec<_>>(),
+            vec![
+                BuiltinAssignmentDisposition::NotApplicable,
+                BuiltinAssignmentDisposition::Completed,
+                BuiltinAssignmentDisposition::Completed,
+            ]
+        );
     }
 
     #[test]

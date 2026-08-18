@@ -1,0 +1,94 @@
+{
+  "schema_version": "2",
+  "run_id": "run_allow",
+  "request_id": null,
+  "outcome": "allow",
+  "exit_code": 0,
+  "modified": false,
+  "started_at": "2026-08-17T12:00:00+00:00",
+  "finished_at": "2026-08-17T12:00:01+00:00",
+  "persistence": {
+    "status": "durable",
+    "report_digest": "sha256:d940385de64645ac0c508ad4642b08cb7f91fb7b3310a10c159b722ccf615fcb"
+  },
+  "source": {"kind": "path", "input_kind": "directory"},
+  "acquisition": {
+    "status": "complete",
+    "implementation_id": "local-copy",
+    "implementation_version": "1",
+    "started_at": "2026-08-17T12:00:00+00:00",
+    "finished_at": "2026-08-17T12:00:00+00:00",
+    "duration_ms": 10,
+    "source_identity": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "issue_codes": []
+  },
+  "stage": {
+    "reference": "run_allow",
+    "configured_disposition": "retain",
+    "effective_disposition": "retained",
+    "handoff_status": "available",
+    "sealed": true,
+    "initial_manifest_identity": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "final_manifest_identity": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "current_manifest_identity": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "expires_at": "2026-08-18T12:00:00+00:00",
+    "quarantine_id": null
+  },
+  "policy": {
+    "profile_id": "upload",
+    "policy_identity": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "pipeline_id": "publication",
+    "pipeline_identity": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "effective_action_mode": "apply"
+  },
+  "phases": {
+    "initial": {
+      "phase": "initial",
+      "manifest_identity": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "source_scope_identity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "pipeline_identity": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "artifacts": [{
+        "artifact_id": "artifact_clean",
+        "subject_id": "subject_clean",
+        "kind": "physical_file",
+        "logical_path": {"segments": [{"encoding": "utf8", "value": "clean.txt"}]},
+        "byte_len": 5,
+        "publication_type": "regular_file",
+        "publication_mode": 420,
+        "git": null
+      }],
+      "analyzer_runs": [{
+        "analyzer_id": "builtin",
+        "adapter_id": null,
+        "executable_basename": null,
+        "version": null,
+        "executable_identity": null,
+        "rules_identity": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "required": true,
+        "status": "complete",
+        "duration_ms": 2
+      }],
+      "coverage": [{
+        "analyzer_id": "builtin",
+        "eligible": 1,
+        "assigned": 1,
+        "completed": 1,
+        "not_applicable": 0,
+        "status": "complete"
+      }],
+      "occurrences": [],
+      "findings": [],
+      "correlations": [],
+      "resolutions": [],
+      "statistics": {"artifacts": 1, "analyzer_runs": 1, "occurrences": 0, "findings": 0, "correlations": 0, "resolutions": 0, "duration_ms": 3}
+    },
+    "verification": null
+  },
+  "pi_invocations": [],
+  "adjudications": [],
+  "actions": [],
+  "issues": [],
+  "degradations": [],
+  "statistics": {"initial_artifacts": 1, "verification_artifacts": 0, "total_findings": 0, "total_actions": 0, "duration_ms": 1000},
+  "omissions": {"details_omitted": false, "reason": null}
+}

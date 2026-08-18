@@ -1,14 +1,14 @@
-# Trusted Pi classifier extension
+# Trusted Pi triage extension
 
 `file_guardian_extension.js` is the reviewed extension for the pinned Pi 0.83.0
-classifier runtime. File Guardian hashes this exact file into pipeline identity
+triage runtime. File Guardian hashes this exact file into pipeline identity
 and loads it into a normally networked Pi process with an explicit `--extension`
 argument while extension discovery and Pi built-ins remain disabled.
 
 The extension registers exactly eight sequential tools:
 
 ```text
-bash,find,grep,ls,manifest_list,prior_observations,read,submit_classification
+bash,find,grep,ls,manifest_list,read,submit_triage,triage_request
 ```
 
 The extension starts one persistent Bubblewrap sidecar at session startup and
@@ -48,10 +48,11 @@ proxy protocol's monotonically increasing request order.
 
 `manifest_list` supplies the authoritative presentation-path to immutable
 artifact-ID mapping in bounded cursor pages. Callers begin at cursor `0` and
-follow `next_cursor` until it is `null`. `prior_observations` returns only bounded normalized
-observations; it never supplies file contents, matched values, snippets, or raw
-scanner output. `submit_classification` remains artifact-ID based and terminates
-the agent only after the host validates and accepts the structured payload.
+follow `next_cursor` until it is `null`. `triage_request` returns only bounded,
+identity-bound normalized prior findings; it never supplies file contents,
+matched values, snippets, or raw scanner output. `submit_triage` is
+candidate-free and finding-ID based, and terminates the agent only after the
+host validates and accepts the structured payload.
 
 The extension itself imports only pinned Pi/TypeBox APIs and the Node path,
 Unix-socket, readline, crypto, and child-process modules needed for the closed

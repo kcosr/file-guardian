@@ -1,4 +1,4 @@
-// Trusted File Guardian classifier extension for Pi 0.83.0.
+// Trusted File Guardian triage extension for Pi 0.83.0.
 //
 // Pi's built-ins remain disabled. This extension exposes sandboxed analysis
 // tools over the immutable analyzer view mounted at /input.
@@ -11,7 +11,7 @@ import { createInterface } from "node:readline";
 import { VERSION } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
-const PROTOCOL = "file-guardian-pi-proxy/2";
+const PROTOCOL = "file-guardian-pi-proxy/3";
 const SIDECAR_PROTOCOL = "file-guardian-tool-sidecar/1";
 const SIDECAR_RUNNER_TARGET = "/policy/tool-sidecar-runner.mjs";
 const MAX_PROXY_RESPONSE_BYTES = 2 * 1024 * 1024;
@@ -28,9 +28,9 @@ const REQUIRED_TOOLS = Object.freeze([
 	"grep",
 	"ls",
 	"manifest_list",
-	"prior_observations",
+	"triage_request",
 	"read",
-	"submit_classification",
+	"submit_triage",
 ]);
 const NATIVE_TOOLS = new Set(["bash", "read", "grep", "find", "ls"]);
 
@@ -102,8 +102,8 @@ function requireAccepted(result) {
 
 function proxyRequest(type, fields = {}, signal) {
 	if (integrityFailure) return Promise.reject(integrityFailure);
-	if (terminalState !== "open" && type !== "submit_classification") {
-		return Promise.reject(new Error("classification has already been submitted"));
+	if (terminalState !== "open" && type !== "submit_triage") {
+		return Promise.reject(new Error("triage has already been submitted"));
 	}
 
 	const requestId = nextRequestId++;
@@ -653,34 +653,53 @@ const LsParameters = strictObject({
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: maxSearchResults })),
 });
 
-const ArtifactId = Type.String({ minLength: 3, maxLength: 128, pattern: "^a_[A-Za-z0-9_.:-]{1,126}$" });
 const SafeCode = Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_.:/-]+$" });
 const ReasonCodes = Type.Array(SafeCode, { maxItems: 256, uniqueItems: true });
-const SubjectArtifactIds = Type.Array(ArtifactId, { maxItems: 100000, uniqueItems: true });
+const FindingId = Type.String({ minLength: 5, maxLength: 100, pattern: "^fnd_[A-Za-z0-9_-]{1,96}$" });
+const Digest = Type.String({ minLength: 71, maxLength: 71, pattern: "^sha256:[0-9a-f]{64}$" });
+const InvocationId = Type.String({ minLength: 5, maxLength: 100, pattern: "^pii_[A-Za-z0-9_-]{1,96}$" });
 
-const Classification = strictObject({
-	code: SafeCode,
-	confidence: SafeCode,
+const FindingAssessment = strictObject({
+	finding_id: FindingId,
+	classification: Type.Union([
+		Type.Literal("confirmed"),
+		Type.Literal("likely_true_positive"),
+		Type.Literal("likely_false_positive"),
+		Type.Literal("false_positive"),
+		Type.Literal("uncertain"),
+		Type.Literal("unable_to_assess"),
+	]),
+	confidence: Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")]),
 	reason_codes: ReasonCodes,
-	subject_artifact_ids: SubjectArtifactIds,
+	duplicate_of: Type.Union([FindingId, Type.Null()]),
+	recommended_action: Type.Union([
+		Type.Literal("none"),
+		Type.Literal("audit"),
+		Type.Literal("delete"),
+		Type.Literal("quarantine"),
+	]),
 });
 
-const ArtifactClassification = strictObject({
-	artifact_id: ArtifactId,
-	code: SafeCode,
-	confidence: SafeCode,
-	reason_codes: ReasonCodes,
-});
-
-const TerminalClassification = strictObject({
-	schema_version: Type.Literal("file-guardian-pi-classifier/1"),
+const TerminalTriage = strictObject({
+	schema_version: Type.Literal("file-guardian-pi-triage/1"),
+	invocation_id: InvocationId,
+	phase: Type.Union([Type.Literal("initial"), Type.Literal("verification")]),
+	manifest_identity: Digest,
+	request_identity: Digest,
+	prior_observations_identity: Digest,
 	status: Type.Literal("complete"),
-	manifest_identity: Type.String({ minLength: 71, maxLength: 71, pattern: "^sha256:[0-9a-f]{64}$" }),
-	classification: Classification,
-	artifact_classifications: Type.Array(ArtifactClassification, { maxItems: 100000 }),
+	assessments: Type.Array(FindingAssessment, { maxItems: 100000 }),
+	stage_attestation: Type.Union([
+		Type.Literal("no_blocking_concerns_observed"),
+		Type.Literal("blocking_concerns_observed"),
+		Type.Literal("unable_to_assert"),
+	]),
 	coverage: strictObject({
 		assigned_artifact_count: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
-		status: Type.Literal("complete"),
+		completed_artifact_count: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+		not_applicable_artifact_count: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+		assigned_finding_count: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+		assessed_finding_count: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 	}),
 });
 
@@ -804,25 +823,25 @@ export default function fileGuardianClassifierExtension(pi) {
 	});
 
 	pi.registerTool({
-		name: "prior_observations",
-		label: "Read prior observations",
-		description: "Read bounded normalized prior observations; file contents and matched values are never included.",
+		name: "triage_request",
+		label: "Read triage request",
+		description: "Read the bounded, identity-bound prior-finding triage request; content and matched values are never included.",
 		parameters: strictObject({}),
 		executionMode: "sequential",
 		async execute(_toolCallId, _params, signal) {
-			return proxyToolResult(await proxyRequest("prior_observations", {}, signal));
+			return proxyToolResult(await proxyRequest("triage_request", {}, signal));
 		},
 	});
 
 	pi.registerTool({
-		name: "submit_classification",
-		label: "Submit classification",
-		description: "Submit the one final structured artifact-ID classification and end the run.",
-		parameters: TerminalClassification,
+		name: "submit_triage",
+		label: "Submit triage",
+		description: "Submit one candidate-free, finding-ID-bound triage result and end the run.",
+		parameters: TerminalTriage,
 		executionMode: "sequential",
 		async execute(_toolCallId, params, signal) {
 			if (integrityFailure) throw integrityFailure;
-			if (terminalState !== "open") throw new Error("classification has already been submitted");
+			if (terminalState !== "open") throw new Error("triage has already been submitted");
 			terminalState = "submitting";
 			try {
 				await stopToolSidecar();
@@ -830,11 +849,11 @@ export default function fileGuardianClassifierExtension(pi) {
 				latchIntegrityFailure();
 				throw integrityFailure;
 			}
-			const result = await proxyRequest("submit_classification", { payload: params }, signal);
+			const result = await proxyRequest("submit_triage", { payload: params }, signal);
 			requireAccepted(result);
 			terminalState = "accepted";
 			return {
-				content: [{ type: "text", text: "Classification accepted." }],
+				content: [{ type: "text", text: "Triage accepted." }],
 				details: {},
 				terminate: true,
 			};

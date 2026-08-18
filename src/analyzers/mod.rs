@@ -1,10 +1,15 @@
 mod builtin_rules;
 mod content_applicability;
+pub mod external;
 pub mod pi;
 
 pub use builtin_rules::{
-    BuiltinAnalyzerError, BuiltinAnalyzerLimits, BuiltinContentApplicability, BuiltinRulesAnalyzer,
+    BuiltinAnalyzerError, BuiltinAnalyzerLimits, BuiltinAssignmentDisposition,
+    BuiltinAssignmentOutcome, BuiltinContentApplicability, BuiltinRulesAnalyzer,
     BuiltinRulesResult,
+};
+pub(crate) use builtin_rules::{
+    BuiltinProcessingAssignment, BuiltinProcessingError, BuiltinProcessingReader,
 };
 pub use content_applicability::{
     assess_text_artifact, ArtifactReadError, ArtifactReader, RequiredTextMatcher,
